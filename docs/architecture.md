@@ -1,6 +1,5 @@
 # OpenWorkBot 架构
 
-本文描述当前 Web 代码，非目标架构或运行验收结论。参考脚本独立，不参与 Web 后端导入。
 
 ## 1. 组成与数据流
 
@@ -67,8 +66,7 @@ build/edit/yolo 模式与项目规则决定 allow/deny/ask；审批支持本次�
 
 ## 6. 配置与启动
 
-Python 3.12+、uv、Node.js/npm；命令工具需要 PowerShell。使用 uv.lock 和 package-lock.json，不复制旧环境或运行数据。
-后端在 backend/ 安装依赖，前端在 frontend/ 安装依赖；真实对话需要 backend/.env 的模型配置。
+Python 3.12+、uv、Node.js/npm；命令工具需要 PowerShell。使用 uv.lock 和 package-lock.json
+后端在 backend/ 安装依赖，前端在 frontend/ 安装依赖
 根目录 `uv run --no-project start.py` 启动前后端：127.0.0.1:8100 与 127.0.0.1:5173；/api 代理至后端。
 健康接口为 /api/health，不依赖真实模型配置。当前无鉴权，不直接暴露公网。
-本轮未执行安装、启动、构建或功能测试，详见 [reliability.md](reliability.md)。
