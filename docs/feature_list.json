@@ -2,20 +2,78 @@
   "project": "OpenWorkBot",
   "rules": {
     "passing_requires_evidence": true,
-    "do_not_skip_verification": true
+    "do_not_skip_verification": true,
+    "note": "passing仅代表条目注明的验收范围；planned不授予执行或费用权限。"
   },
   "status_legend": {
-    "planned": "功能还没开始做。",
-    "in_progress": "这个功能是当前唯一正在进行的任务。",
-    "blocked": "因为已记录的阻塞问题，当前无法继续推进。",
-    "passing": "要求的验证已经通过，并且证据已经记录。",
-    "deprecated": "功能已被废弃，或者已被替代"
+    "planned": "尚未开始实施或验收。",
+    "in_progress": "当前正在进行的工作。",
+    "blocked": "存在已记录阻塞。",
+    "passing": "条目要求的验证已有证据。",
+    "deprecated": "已废弃或替代。"
   },
   "features": [
     {
-      "id": "BE-001",
-      "name": "",
-      "description": "",
+      "id": "MAINT-001",
+      "name": "全量精简注释",
+      "description": "仅修改必要注释与说明性 docstring。",
+      "status": "passing",
+      "evidence": "32e4c30：30个Python AST排除docstring一致；前端25文件词法/规则一致；配置值与提示词不变。仅静态检查。",
+      "testedAt": "2026-10-31"
+    },
+    {
+      "id": "DOC-001",
+      "name": "补全当前文档",
+      "description": "目标、架构、验证要求、进度与功能状态。",
+      "status": "passing",
+      "evidence": "5份docs；JSON与相对链接检查通过，现有能力/规划/未验收边界分开记录。",
+      "testedAt": "2026-10-31"
+    },
+    {
+      "id": "BASE-001",
+      "name": "复制基线运行验收",
+      "description": "现有Web前后端已复制，安装、启动、构建及功能尚未在新项目验收。",
+      "status": "planned",
+      "evidence": "",
+      "testedAt": ""
+    },
+    {
+      "id": "CLEAN-001",
+      "name": "测试配置残留清理",
+      "description": "清理已删除测试对应的脚本、配置及依赖，保持锁文件一致。",
+      "status": "planned",
+      "evidence": "",
+      "testedAt": ""
+    },
+    {
+      "id": "HARNESS-001",
+      "name": "协作与执行可靠性",
+      "description": "在串行子助手基础上确认协作、权限、状态与恢复的增量范围。",
+      "status": "planned",
+      "evidence": "",
+      "testedAt": ""
+    },
+    {
+      "id": "MEM-001",
+      "name": "长期记忆",
+      "description": "跨任务信息的保存、检索、更新和删除；设计待确认。",
+      "status": "planned",
+      "evidence": "",
+      "testedAt": ""
+    },
+    {
+      "id": "AUTO-001",
+      "name": "主动执行与工作流",
+      "description": "已授权定时/事件任务、状态检查与反馈迭代；设计待确认。",
+      "status": "planned",
+      "evidence": "",
+      "testedAt": ""
+    },
+    {
+      "id": "MCP-001",
+      "name": "MCP外部能力接入",
+      "description": "通用工具接入边界待设计；当前不展开RAG内部功能。",
+      "status": "planned",
       "evidence": "",
       "testedAt": ""
     }
