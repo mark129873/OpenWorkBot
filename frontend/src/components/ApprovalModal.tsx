@@ -1,7 +1,4 @@
-/**
- * 审批由后端提供选项，前端只展示并提交决定。
- * 弹窗保留焦点，数字快捷键仅在未输入文字时有效，避免反馈中的数字误触授权。
- */
+/* 输入文字时禁用数字快捷键，避免误授权。 */
 import { ArrowRight, ShieldCheck } from '@phosphor-icons/react'
 import { useEffect, useRef, useState } from 'react'
 import { submitApproval } from '../api/client'
@@ -21,13 +18,13 @@ export interface ApprovalModalProps {
 }
 
 export function ApprovalModal({ sessionId, approval, onResolved }: ApprovalModalProps) {
-  // 只接受当前协议的三项，旧服务端残留选项也不能变成授权按钮或快捷键。
+  // 未知审批选项不得成为按钮或快捷键。
   const options = approval.options.filter((option) => ['allowOnce', 'allowSession', 'deny'].includes(option.option_id))
   const [submitting, setSubmitting] = useState(false)
   const [feedback, setFeedback] = useState('')
   const [error, setError] = useState<string | null>(null)
   const dialogRef = useRef<HTMLDivElement>(null)
-  // ref 在点击时立即上锁，连续数字键或双击也不会重复提交。
+  // 立即上锁，防止重渲染前重复提交。
   const submittingRef = useRef(false)
   const decide = async (optionId: ApprovalOptionId) => {
     if (submittingRef.current) return
@@ -40,7 +37,7 @@ export function ApprovalModal({ sessionId, approval, onResolved }: ApprovalModal
     } catch (e) { setError(e instanceof Error ? e.message : '提交失败，请重试') }
     finally { submittingRef.current = false; setSubmitting(false) }
   }
-  // 首次聚焦弹窗本身，不默认聚焦授权按钮；关闭后返回原先输入位置。
+  // 初始焦点避开授权按钮，关闭后恢复原焦点。
   useEffect(() => {
     const previous = document.activeElement as HTMLElement | null
     dialogRef.current?.focus()

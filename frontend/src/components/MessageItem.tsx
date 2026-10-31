@@ -1,31 +1,19 @@
-/**
- * 消息渲染：Markdown + 代码高亮 + 悬停复制。
- * 用于：工作块外的最终回复、中间过程文本、用户气泡（纯文本变体）。
- *
- * 分包说明：react-markdown + rehype-highlight 体积大，真实实现移到
- * Markdown.tsx，这里用 lazy+Suspense 包装转发——引用方（TurnGroup）
- * 无感知，首次渲染 markdown 时才加载异步分包。
- */
-
 import { Suspense, lazy, useState } from 'react'
 import { CaretRight, CheckCircle, Circle, CircleHalf, FileText, ListChecks, TerminalWindow } from '@phosphor-icons/react'
 
 import type { TodoItem, WorkItem } from '../types'
 
-// 懒加载 markdown 分包（default 导出 = MarkdownWithCopy）
 const LazyMarkdown = lazy(() => import('./Markdown'))
 
-/** 悬停复制的 Markdown 渲染：异步分包的转发壳（props 与原实现一致） */
 export function MarkdownWithCopy({ text, streaming = false, onRegenerate }: { text: string; streaming?: boolean; onRegenerate?: () => void }) {
   return (
-    /* fallback 用等高的占位行，避免流式首帧高度跳动 */
+    /* 等高占位避免首帧跳动。 */
     <Suspense fallback={<div role="status" className="text-[13px] leading-relaxed text-zinc-500">正在加载正文…</div>}>
       <LazyMarkdown text={text} streaming={streaming} onRegenerate={onRegenerate} />
     </Suspense>
   )
 }
 
-// 状态词映射（产品文档 §3.3）
 const TOOL_STATUS_WORD: Record<string, string> = {
   pending: '等待中',
   running: '执行中',
@@ -35,19 +23,16 @@ const TOOL_STATUS_WORD: Record<string, string> = {
   stopped: '已停止',
 }
 
-/** 工具输入摘要：一行内的参数预览 */
 function inputSummary(input: unknown): string {
   if (input == null) return ''
   if (typeof input === 'string') return input
   try {
-    // JSON.stringify 原生保留中文，不需要额外的逐字段转换函数。
     return JSON.stringify(input)
   } catch {
     return String(input)
   }
 }
 
-/** 用户消息气泡：右对齐浅灰底纯文本 */
 export function UserBubble({ text }: { text: string }) {
   return (
     <div className="flex justify-end">
@@ -58,7 +43,6 @@ export function UserBubble({ text }: { text: string }) {
   )
 }
 
-/** 任务板卡片：[ ] 待办 / [>] 进行中 / [x] 已完成（实时覆盖刷新） */
 export function TodoCard({ items }: { items: TodoItem[] }) {
   const icons = { pending: Circle, in_progress: CircleHalf, completed: CheckCircle }
   const words = { pending: '待办', in_progress: '进行中', completed: '已完成' }
@@ -85,7 +69,6 @@ export function TodoCard({ items }: { items: TodoItem[] }) {
   )
 }
 
-/** 错误卡片：红色内联 + 重试按钮（onRetry 由上层接 /regenerate，FE-4 接线） */
 export function ErrorCard({ message, onRetry }: { message: string; onRetry?: () => void }) {
   return (
     <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2">
@@ -103,7 +86,6 @@ export function ErrorCard({ message, onRetry }: { message: string; onRetry?: () 
   )
 }
 
-/** 工具调用卡片：二级折叠（默认收起），头部=名称+状态词，展开=参数与输出 */
 export function ToolCallCard({
   item,
 }: {
@@ -115,7 +97,6 @@ export function ToolCallCard({
 
   return (
     <div className="overflow-hidden rounded-xl border border-zinc-200/80 bg-white">
-      {/* 头部：名称 + 输入摘要 + 状态词；点击展开/收起 */}
       <button
         type="button"
         onClick={() => setOpen(!open)}
@@ -144,7 +125,6 @@ export function ToolCallCard({
         </span>
         <CaretRight size={14} className={`shrink-0 text-zinc-500 transition ${open ? 'rotate-90' : ''}`} />
       </button>
-      {/* 展开区：参数与输出 */}
       {open && (
         <div className="border-t border-zinc-100 px-3 py-2">
           <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-zinc-50 p-2 text-[12px] text-zinc-600">

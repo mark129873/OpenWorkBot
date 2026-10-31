@@ -1,14 +1,3 @@
-"""工具层：TOOLS（给模型的 schema 列表）+ TOOL_HANDLERS（名字→函数）双表。
-
-移植自 mini_harness §2/§5：
-- 加工具只改这两处；
-- 所有文件工具经 safe_path 限制在 data/workspace/ 沙箱内（产品决策：固定工作区）；
-- 工具出错一律返回 "Error: ..." 字符串，绝不抛异常打断主循环（mini_harness §2 哲学）；
-- bash 用 PowerShell 执行（产品决策），输出保留尾部 3 万字符（报错通常在末尾）；
-- delete_file 移入 workspace 内的 .rubbish/（可找回；rubbish 放沙箱内，
-  因为存储层已无顶层 rubbish 目录——见 ARCHITECTURE §2.4）。
-"""
-
 import shutil
 import subprocess
 from pathlib import Path, PurePosixPath, PureWindowsPath
@@ -17,20 +6,13 @@ from typing import Callable
 from app.agent.skills import tool_load_skill
 from app.config import settings
 
-# ---------- 沙箱 ----------
-
 
 def workspace_root() -> Path:
-    """工具沙箱根目录（data/workspace/），启动时已建好。"""
     return settings.data_dir / "workspace"
 
 
 def safe_path(relative: str) -> Path:
-    """把相对路径解析为沙箱内的绝对路径；越界直接拒绝。
-
-    为什么这么严：所有文件工具都过这一道，杜绝 "..\\" 或绝对路径逃出
-    workspace（mini_harness §5 safe_path 的同款防御）。
-    """
+    """解析真实路径，拒绝逃出工作区。"""
     root = workspace_root().resolve()
     target = (root / relative).resolve()
     if not (target == root or target.is_relative_to(root)):
@@ -39,8 +21,8 @@ def safe_path(relative: str) -> Path:
 
 
 def safe_glob_pattern(pattern: str) -> str:
-    """glob 只接受工作区相对模式；预检固定前缀，避免显式进入外部链接。"""
-    # 两个平台都识别斜杠/盘符，不能让 Windows 风格的越界模式在 Linux 漏检。
+    """仅接受工作区相对模式；固定前缀也须通过沙箱校验。"""
+    # 跨平台识别盘符与斜杠，防止异系统路径绕过校验。
     normalized = pattern.replace("\\", "/")
     parts = PurePosixPath(normalized).parts
     windows = PureWindowsPath(normalized)
@@ -55,20 +37,16 @@ def safe_glob_pattern(pattern: str) -> str:
     return normalized
 
 
-# ---------- 工具实现（全部同步函数，主循环用线程池调） ----------
-
-# 输出上限：与 mini_harness 一致，bash 输出保留尾部（报错通常在末尾）
+# 保留输出尾部，避免丢失末尾报错。
 _OUTPUT_LIMIT = 30000
 _READ_LIMIT = 60000
 
 
 def _tail(text: str, limit: int = _OUTPUT_LIMIT) -> str:
-    """保留尾部 limit 字符。"""
     return text if len(text) <= limit else f"...(前段已截断)...\n{text[-limit:]}"
 
 
 def tool_bash(command: str) -> str:
-    """在 workspace 内用 PowerShell 执行命令，返回 stdout+stderr 合并输出。"""
     try:
         completed = subprocess.run(
             ["powershell", "-NoProfile", "-Command", command],
@@ -82,17 +60,16 @@ def tool_bash(command: str) -> str:
         output = (completed.stdout or "") + (completed.stderr or "")
         output = _tail(output.rstrip())
         if completed.returncode != 0:
-            # 主/子循环统一识别 Error:；前缀放在截断之后，避免长输出丢失失败标识。
+            # 截断后再加 Error:，保留失败标识。
             return f"Error: 命令退出码 {completed.returncode}\n{output}\n[exit code: {completed.returncode}]"
         return output
     except subprocess.TimeoutExpired:
         return f"Error: 命令超时（>{settings.bash_timeout}s）"
-    except Exception as exc:  # 兜底：任何执行环境问题都转字符串喂回模型
+    except Exception as exc:
         return f"Error: 命令执行失败：{exc}"
 
 
 def tool_read_file(path: str) -> str:
-    """读文本文件，超长截断。"""
     try:
         target = safe_path(path)
         if not target.is_file():
@@ -104,7 +81,6 @@ def tool_read_file(path: str) -> str:
 
 
 def tool_write_file(path: str, content: str) -> str:
-    """写文本文件（覆盖式），自动建父目录。"""
     try:
         target = safe_path(path)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -115,7 +91,6 @@ def tool_write_file(path: str, content: str) -> str:
 
 
 def tool_edit_file(path: str, old_text: str, new_text: str) -> str:
-    """精确替换：old_text 必须在文件中恰好出现一次（mini_harness 规则，防误改）。"""
     try:
         target = safe_path(path)
         if not target.is_file():
@@ -133,16 +108,12 @@ def tool_edit_file(path: str, old_text: str, new_text: str) -> str:
 
 
 def tool_glob(pattern: str) -> str:
-    """在沙箱内按 glob 模式列文件（相对路径，每行一个）。
-
-    输出统一用正斜杠：模型更常写 / 风格路径，Windows 的 \\ 会误导它。
-    """
     try:
         pattern = safe_glob_pattern(pattern)
         root = workspace_root().resolve()
         matches = []
         for path in root.glob(pattern):
-            # 通配符也可能命中符号链接；输出前再验真实目标，不能泄漏外部文件名。
+            # 通配结果须复验真实路径，防止符号链接泄漏外部文件名。
             if not path.resolve().is_relative_to(root):
                 raise ValueError("glob 匹配越出工作区，请缩小匹配范围")
             if path.is_file():
@@ -156,7 +127,7 @@ def tool_glob(pattern: str) -> str:
 
 
 def tool_delete_file(path: str) -> str:
-    """删除文件 = 移入沙箱内 .rubbish/<时间戳>_<名>/（可人工找回）。"""
+    """删除改为移入工作区 .rubbish，可人工恢复。"""
     try:
         target = safe_path(path)
         if not target.is_file():
@@ -172,8 +143,6 @@ def tool_delete_file(path: str) -> str:
         return f"Error: 删除失败：{exc}"
 
 
-# ---------- 双表注册 ----------
-
 TOOL_HANDLERS: dict[str, Callable[..., str]] = {
     "bash": tool_bash,
     "read_file": tool_read_file,
@@ -186,7 +155,6 @@ TOOL_HANDLERS: dict[str, Callable[..., str]] = {
 
 
 def _schema(name: str, description: str, properties: dict, required: list[str]) -> dict:
-    """构造 Anthropic 工具 schema（mini_harness 同款形态）。"""
     return {
         "name": name,
         "description": description,
@@ -254,7 +222,6 @@ TOOLS: list[dict] = [
 
 
 def execute_tool(name: str, tool_input: dict) -> str:
-    """统一执行入口：查表分发 + 异常兜底为 Error 字符串（mini_harness §2）。"""
     handler = TOOL_HANDLERS.get(name)
     if handler is None:
         return f"Error: 未知工具 {name}"

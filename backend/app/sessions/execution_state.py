@@ -1,4 +1,3 @@
-"""项目权限配置：ZCode local_setting 结构；不读取/迁移旧 JSON 文件。"""
 import re
 import json
 import os
@@ -15,12 +14,11 @@ _RULE_LOCK = threading.Lock()
 
 
 def project_directory(data_dir) -> str:
-    """当前固定工作区的规范路径；未来多工作区可传入各自项目标识。"""
     return os.path.normcase(str((Path(data_dir) / "workspace").resolve()))
 
 
 def project_id(data_dir) -> str:
-    """采用 ZCode projectIdFromDirectory 的小写目录 slug（最多 80 字符）。"""
+    """项目键使用小写路径 slug，最多 80 字符。"""
     return re.sub(r"[^a-z0-9._-]+", "-", project_directory(data_dir).lower()).strip("-")[:80] or "default"
 
 
@@ -32,7 +30,7 @@ def _read(data_dir, key: str, scope_id: str | None = None) -> dict:
             value = json.loads(row.value) if row else {}
             return value if isinstance(value, dict) else {}
         except (ValueError, TypeError):
-            return {}  # 配置内容损坏时回到安全默认；数据库故障不静默吞掉。
+            return {}  # 坏配置回退安全默认，数据库故障仍上抛。
 
 
 def _write(data_dir, key: str, value: dict, scope_id: str | None = None) -> None:
@@ -42,7 +40,7 @@ def _write(data_dir, key: str, value: dict, scope_id: str | None = None) -> None
                   key=key, value=json.dumps(value, ensure_ascii=False), schema_version=1,
                   time_created=now, time_updated=now)
     statement = insert(LocalSetting).values(**values)
-    # 原子 upsert 保留创建时间，避免并行首次保存造成联合主键冲突。
+    # 原子更新，避免首次并发保存的主键冲突。
     statement = statement.on_conflict_do_update(
         index_elements=["scope", "scope_id", "namespace", "key"],
         set_={name: values[name] for name in ("value", "schema_version", "time_updated")})
@@ -74,15 +72,14 @@ def load_permission_rules(data_dir, *, project_id: str | None = None) -> dict:
 
 
 def save_permission_rules(data_dir, ruleset: dict, *, project_id: str | None = None) -> None:
-    """项目规则存 SQLite；会话授权从不调用此函数。"""
+    """仅保存项目规则，不保存会话授权。"""
     _write(data_dir, "ruleset", ruleset, project_id)
 
 
 def add_permission_rule(data_dir, behavior: str, tool: str, content: str | None, *, project_id: str | None = None) -> dict:
-    """保留项目规则管理兼容；交互审批不调用，同工具/内容去重。"""
     if behavior not in ("allow", "deny"):
         raise ValueError(f"非法规则行为：{behavior}")
-    # 同进程规则管理可能并行执行，串行追加避免读改写丢失另一条规则。
+    # 串行追加，避免并发读改写丢失规则。
     with _RULE_LOCK:
         ruleset = load_permission_rules(data_dir, project_id=project_id)
         rule = {"toolName": tool}

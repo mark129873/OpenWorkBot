@@ -1,11 +1,3 @@
-"""任务板：mini_harness §6 todo_write 的移植。
-
-- 全量替换语义：每次调用用新列表覆盖任务板；
-- 校验：≤20 条、status 三态、进行中最多 1 条；
-- Web 版差异：合法更新会全量替换 todo 表（保存最新状态）并推
-  todo_updated 事件；非法输入返回 Error 字符串（不落盘）。
-"""
-
 VALID_STATUS = ("pending", "in_progress", "completed")
 MAX_ITEMS = 20
 
@@ -13,9 +5,7 @@ _STATUS_MARK = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
 
 
 def parse_items(raw) -> tuple[list[dict] | None, str]:
-    """解析并校验任务列表。返回 (items|None, 错误信息)。"""
     if isinstance(raw, str):
-        # 容错：模型可能传 JSON 字符串
         import json
 
         try:
@@ -50,7 +40,6 @@ def parse_items(raw) -> tuple[list[dict] | None, str]:
 
 
 def render_panel(items: list[dict]) -> str:
-    """渲染任务板文本（[ ] 待办 / [>] 进行中 / [x] 已完成）。"""
     if not items:
         return "(任务板为空)"
     lines = [f"{_STATUS_MARK[it['status']]} {it['content']}" for it in items]
@@ -58,11 +47,6 @@ def render_panel(items: list[dict]) -> str:
 
 
 async def handle_todo_write(deps, message_id: str, tool_input: dict) -> tuple[str, list[dict]]:
-    """loop 专用入口：校验 → 落盘 → 返回事件（由循环统一转发，保证事件顺序）。
-
-    返回 (输出文本, 附加事件)。与 subtask 不同：这里没有长等待，
-    不需要直推队列，走循环的标准事件通道即可。
-    """
     items, error = parse_items(tool_input.get("items"))
     if items is None:
         return error, []

@@ -1,7 +1,4 @@
-/**
- * 输入卡：先写目标，再选择执行方式。权限选择只改变本地草稿，随发送生效。
- * Enter 发送、Shift+Enter 换行；中文输入法正在组字时，Enter 不能误发。
- */
+/* 模式随发送生效；输入法组字时 Enter 不发送。 */
 import { ArrowUp, CaretDown, Check, Hand, ShieldCheck, ShieldWarning, Square } from '@phosphor-icons/react'
 import { useEffect, useRef, useState } from 'react'
 import type { ExecutionDraft, PermissionState } from '../api/client'
@@ -27,11 +24,10 @@ export function Composer({ disabled, streaming, permission, onSend, onStop }: Co
   const areaRef = useRef<HTMLTextAreaElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const modeButtonRef = useRef<HTMLButtonElement>(null)
-  // 每次编辑递增；旧请求的确认不能清空用户在等待期间写下的新草稿。
+  // 编辑版本防止旧请求确认清空新草稿。
   const editRevisionRef = useRef(0)
 
-  // 仅服务端模式变化时重置草稿；渲染提交前同步，避免 effect 触发额外更新。
-  // 正文单独保存，审批回显不会清空用户正在输入的内容。
+  // 仅服务端模式变化时重置模式草稿，保留正文。
   if (previousMode !== permission.mode) {
     setPreviousMode(permission.mode)
     setDraftMode(permission.mode)
@@ -44,7 +40,6 @@ export function Composer({ disabled, streaming, permission, onSend, onStop }: Co
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
   }, [menuOpen])
-  // 高度随正文增长，到 200px 后内部滚动，保证发送按钮一直留在视野中。
   useEffect(() => {
     const area = areaRef.current
     if (!area) return

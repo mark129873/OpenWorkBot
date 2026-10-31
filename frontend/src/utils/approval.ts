@@ -1,7 +1,7 @@
 import type { SessionDetail } from '../types'
 import type { PendingApproval } from '../components/ApprovalModal'
 
-/** 刷新后同样读取后端的未决请求，不凭前端缓存推断授权状态。 */
+/* 审批以服务端未决请求为准，不信任前端缓存。 */
 export function pendingFromDetail(detail: SessionDetail | null): PendingApproval | null {
   const p = detail?.pending_approval
   if (!p || p.status !== 'requested') return null

@@ -1,5 +1,3 @@
-"""交互审批：绑定会话的进程内等待槽，三选项决定，不修改项目权限配置。"""
-
 import asyncio
 from copy import deepcopy
 import logging
@@ -10,7 +8,7 @@ from app.sessions import session_permissions
 
 logger = logging.getLogger(__name__)
 
-# 槽位与审批事实均只在进程内；刷新可恢复，重启即失效。
+# 槽位和审批事实仅存内存，重启失效。
 _pending: dict[str, dict] = {}
 _events: dict[str, dict[str, dict]] = {}
 
@@ -20,7 +18,7 @@ def approval_events(session_id):
 
 
 def forget_turn(session_id, turn_id):
-    """重跑只清该轮审批；会话授权跨turn保留。"""
+    """重跑仅清本轮审批，保留会话授权。"""
     records = _events.get(session_id, {})
     for key in [k for k, v in records.items() if v['turn_id'] == turn_id]:
         records.pop(key, None)
@@ -30,7 +28,7 @@ def forget_turn(session_id, turn_id):
 
 
 def forget_session(session_id: str) -> None:
-    """删除会话释放全部运行内存，不把旧授权留给同ID的后续会话。"""
+    """删除会话须清空授权，防止同 ID 复用。"""
     _events.pop(session_id, None)
     for key, slot in list(_pending.items()):
         if slot["session_id"] == session_id:
@@ -40,7 +38,7 @@ def forget_session(session_id: str) -> None:
 
 
 def _options_for_scope(scope: tuple[str, str] | None) -> list[dict]:
-    """选项文案与授权保存使用同一范围快照，不重复解析可能变化的符号链接。"""
+    """展示与授权共用路径快照，避免符号链接变化扩权。"""
     return [
         {"option_id": "allowOnce", "label": "仅本次允许"},
         {"option_id": "allowSession", "label": "本会话内始终允许",
@@ -50,13 +48,12 @@ def _options_for_scope(scope: tuple[str, str] | None) -> list[dict]:
 
 
 def build_options(tool_name: str, tool_input: dict) -> list[dict]:
-    """主助手、子助手与刷新回放共用相同三项，并展示实际授权范围。"""
     return _options_for_scope(session_permissions.scope_for(tool_name, tool_input))
 
 
 def register(request_id: str, tool: str = "", input_data: dict | None = None, *, session_id: str,
              stop_event: asyncio.Event | None = None) -> dict:
-    """绑定所属会话和参数快照；后续模型参数变化不能改变已展示的范围。"""
+    """绑定会话及参数快照，模型后续修改不影响审批范围。"""
     snapshot = deepcopy(input_data or {})
     scope = session_permissions.scope_for(tool, snapshot)
     slot = {
@@ -71,7 +68,7 @@ def register(request_id: str, tool: str = "", input_data: dict | None = None, *,
 
 
 def get_request(request_id: str) -> dict | None:
-    """已停止的请求立即作废；不能先写权限、再发现批准已经迟到。"""
+    """停止先于授权，迟到批准无效。"""
     slot = _pending.get(request_id)
     if slot is not None and slot["stop_event"] is not None and slot["stop_event"].is_set():
         _pending.pop(request_id, None)
@@ -82,7 +79,7 @@ def get_request(request_id: str) -> dict | None:
 
 def resolve(request_id: str, option_id: str, *, session_id: str,
             feedback: str | None = None) -> bool:
-    """只取出一次；错误会话、未知选项与重放均不改决定或授权。"""
+    """决定只消费一次；错误归属、未知选项和重放无效。"""
     slot = get_request(request_id)
     if slot is None or slot["session_id"] != session_id:
         return False
@@ -101,7 +98,7 @@ def resolve(request_id: str, option_id: str, *, session_id: str,
 
 
 async def authorize_tool(deps, tool_name: str, tool_input: dict, *, data_dir=None) -> str | None:
-    """现有策略先判定；会话允许只能覆盖ask，不能覆盖硬拒或明确deny。"""
+    """会话授权仅覆盖 ask，不能覆盖硬拒或 deny。"""
     if deps.stop_flag():
         return "Error: 操作已停止"
     result = evaluate(data_dir, tool_name, tool_input)
@@ -115,7 +112,7 @@ async def authorize_tool(deps, tool_name: str, tool_input: dict, *, data_dir=Non
         return "Error: 操作已停止"
     if not outcome["approved"]:
         return f"Error: 用户拒绝了该操作：{outcome['denial_reason'] or reason}"
-    # 等待期间项目规则可能改变，执行前再确认硬拒/明确拒绝仍优先。
+    # 等待期间规则可能变化，执行前重查拒绝规则。
     latest = evaluate(data_dir, tool_name, tool_input)
     if latest["decision"] == "deny":
         return f"Error: 已被安全策略拒绝：{latest['reason']}"
@@ -123,7 +120,7 @@ async def authorize_tool(deps, tool_name: str, tool_input: dict, *, data_dir=Non
 
 
 class InteractiveApprover:
-    """挂起时直推SSE；收到有效决定且通过停止检查后才保存会话范围。"""
+    """通过决定与停止检查后才保存会话授权。"""
 
     def __init__(self, db, session_id: str, recorder, queue: asyncio.Queue,
                  stop_event: asyncio.Event | None = None) -> None:
@@ -137,7 +134,7 @@ class InteractiveApprover:
         if self.stop_event is not None and self.stop_event.is_set():
             return {"approved": False, "denial_reason": "操作已停止"}
         request_id = new_id()
-        # 先注册再发布，快速回应也能命中槽位；展示和保存使用同一个范围快照。
+        # 先注册再发布，避免快速回复找不到槽位。
         slot = register(request_id, tool_name, tool_input, session_id=self.session_id,
                         stop_event=self.stop_event)
         options = slot["options"]
@@ -165,7 +162,7 @@ class InteractiveApprover:
                 received = False
                 raise
             finally:
-                # gather也会让出执行权，必须在它之后重查停止，避免同tick批准/停止留下授权。
+                # gather 会让出执行，之后须重查停止以免残留授权。
                 record = _events.get(self.session_id, {}).get(request_id)
                 stopped = self.stop_event is not None and self.stop_event.is_set()
                 approved = received and slot["approved"] and not stopped and record is not None

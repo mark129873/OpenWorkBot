@@ -1,49 +1,5 @@
 #!/usr/bin/env python3
-"""
-mini_harness.py - 单文件通用助手 Harness
-
-    用户输入 -> 压缩 -> LLM -> 有 tool_use ? -> 权限 hooks -> 工具 -> 回填
-                                | 否: /goal 模式过目标闸门,否则结束
-
-    工具池: bash / read_file / write_file / edit_file / glob /
-            delete_file(移入 rubbish/) / todo_write / load_skill / subtask(子助手)
-
-九个机制各自的实现(括号 = 代码所在分区):
-    1. Agent Loop      agent_loop 的 while True: 调模型,无 tool_use 即停,   错误也作为 tool_result 喂回,不抛异常打断循环
-                       有则执行工具并把 tool_result 回填继续(§10)
-    2. Tool Use        TOOLS 存给模型看的 schema,TOOL_HANDLERS 是           文件操作全部先过 safe_path 沙箱
-                       名字->函数的 dispatch map,execute_tool 统一
-                       拦截 -> 分发 -> 兜异常(§2)
-    3. Permission      permission_hook 三道闸门: 禁止清单硬拒 /              词表 = sudo 等; 删除词; chmod 777 等 5 个确认词
-                       越界与 shell 删除硬拒 / 高危命令 [y/N] 确认;
-                       拒绝原因作为 tool_result 喂回模型(§4)
-    4. Hooks           UserPromptSubmit / PreToolUse / PostToolUse /      Pre = 权限+日志; Post = 大输出告警; Stop = 计数; Submit 无注册
-                       Stop 四个事件点挂回调,trigger_hooks 里第一个
-                       返回非 None 的回调生效(§3)
-    5. Task System     TodoManager 内存任务板,todo_write 全量替换,           渲染 [ ]/[>]/[x] 面板; 单 in_progress; 上限 20 条
-                       3 轮未更新就在工具结果里注入提醒(§5)
-    6. Subagents       subtask(prompt) 用全新 messages 跑 30 轮独立循环,     子助手仅 6 个基础工具,无 subtask 防递归
-                       最终文本作 tool_result 返回父级;
-                       同一响应里的多个 subtask 严格串行(§7)
-    7. Context Compact ContextCompactor 四级压缩: 新结果落盘留预览 ->         归档 .transcripts/ 与 .task_outputs/; 重试 1 次
-                       中间历史归档 -> 旧结果缩短 -> LLM 摘要重写;
-                       真实 token 计量,占窗口 80% 触发,压到 60%(§8)
-    8. Skill           启动扫描 skills/*/SKILL.md,system prompt 只放        frontmatter 只取 name/description 两字段
-                       "名称 + 描述"目录,load_skill 按需取全文(§6)
-    9. Goal Loop       /goal 后模型每次想停,由无工具的独立判断器裁定             max_tokens=512; 连续 8 次收口; error 不计数
-                       JSON {ok, reason, impossible}; 未达成注入理由
-                       自动续轮,连续 8 次未放行收口交还用户(§9)
-
-硬性约束:
-    1. 所有文件操作必须在项目根目录(启动目录)内,越界一律拒绝;
-    2. 删除命令统一将目标移动到 rubbish/ 而不是销毁.
-
-快速开始:
-    在 scripts_mini_harness/ 目录中:
-    1. 复制 .env.example 为 .env,填写 ANTHROPIC_API_KEY, ANTHROPIC_BASE_URL 与 MODEL_ID
-    2. uv sync --locked                   # 使用本目录的独立依赖配置
-    3. uv run python mini_harness.py       # 交互 REPL; 输入任务直接执行,/goal <条件> 进入目标模式
-"""
+"""单文件助手参考实现：文件限于项目内，删除移入 rubbish/。"""
 
 # /// script
 # requires-python = ">=3.10"
@@ -71,7 +27,7 @@ from pathlib import Path
 import yaml
 
 try:
-    # readline 只有类 Unix 自带; Windows 上没有,静默降级为普通 input()
+    # 无 readline 时退回普通输入。
     import readline
     readline.parse_and_bind('set bind-tty-special-chars off')
     readline.parse_and_bind('set input-meta on')
@@ -85,7 +41,7 @@ from anthropic import Anthropic
 from dotenv import load_dotenv
 
 
-# ============================== §0 配置 ==============================
+# 配置
 
 load_dotenv(override=True)
 if os.getenv("ANTHROPIC_BASE_URL"):
@@ -95,15 +51,13 @@ if os.getenv("ANTHROPIC_BASE_URL"):
 IS_WINDOWS = os.name == "nt"
 
 PROJECT_ROOT = Path.cwd().resolve()
-RUBBISH_DIR = PROJECT_ROOT / "rubbish"                 # 所有"删除"的最终归宿
-TRANSCRIPT_DIR = PROJECT_ROOT / ".transcripts"         # 压缩归档的历史
-TOOL_RESULTS_DIR = PROJECT_ROOT / ".task_outputs" / "tool-results"  # 大输出归档
-SKILLS_DIR = PROJECT_ROOT / "skills"                   # 技能目录
+RUBBISH_DIR = PROJECT_ROOT / "rubbish"
+TRANSCRIPT_DIR = PROJECT_ROOT / ".transcripts"
+TOOL_RESULTS_DIR = PROJECT_ROOT / ".task_outputs" / "tool-results"
+SKILLS_DIR = PROJECT_ROOT / "skills"
 
-# Windows 用 PowerShell,其余用 bash; §4 的拦截规则也按此分两套
 SHELL = ["powershell", "-NoProfile", "-Command"] if IS_WINDOWS else ["bash", "-c"]
 
-# 上下文窗口大小: 压缩阈值按它的百分比计算(默认 1M, 可.env配置)
 CONTEXT_WINDOW_TOKENS = int(os.getenv("CONTEXT_WINDOW_TOKENS", "1000000"))
 
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -115,24 +69,22 @@ client = Anthropic(api_key=ANTHROPIC_API_KEY,
 
 
 THINKING = {"type": "disabled"}
-MAX_TOKENS = 10000          # 每次模型调用的输出上限
-BASH_TIMEOUT = 120         # shell 命令超时秒数
+MAX_TOKENS = 10000
+BASH_TIMEOUT = 120
 
 if READLINE_AVAILABLE:
-    # \001/\002 告诉 readline: ANSI 转义序列零显示宽度,别算进光标列数
+    # ANSI 转义不计入光标宽度。
     PROMPT = "\001\033[36m\002harness >> \001\033[0m\002"
 else:
     PROMPT = "\033[36mharness >> \033[0m"
 
 
 def ts_millis() -> str:
-    """生成精确到毫秒的时间戳字符串(17 位数字)."""
     now = datetime.now()
     return now.strftime("%Y%m%d%H%M%S") + f"{now.microsecond // 1000:03d}"
 
 
 def extract_text(content) -> str:
-    """只挑 text 块拼成字符串(跳过 tool_use 等非文本块)."""
     if not isinstance(content, list):
         return str(content)
     return "\n".join(
@@ -142,20 +94,19 @@ def extract_text(content) -> str:
     ).strip()
 
 
-# ======================== §1 路径沙箱: 越界即抛错 ====================
+# 路径限制
 
 def safe_path(p: str) -> Path:
-    """解析为项目内绝对路径; 越出项目根即抛错."""
     path = (PROJECT_ROOT / p).resolve()
     if not path.is_relative_to(PROJECT_ROOT):
         raise ValueError(f"Path escapes the project: {p}")
     return path
 
 
-# ========== §2 工具层: 出错返回 "Error: ..." 字符串,不打断主循环 ==========
+# 工具执行
 
 def run_bash(command: str) -> str:
-    """在项目根目录执行 shell 命令; 输出保留尾部--报错通常在末尾."""
+    """保留输出尾部，便于查看报错。"""
     try:
         result = subprocess.run(
             [*SHELL, command], cwd=PROJECT_ROOT,
@@ -197,7 +148,6 @@ def run_edit(path: str, old_text: str, new_text: str) -> str:
         file_path = safe_path(path)
         text = file_path.read_text(encoding="utf-8")
         count = text.count(old_text)
-        # 恰好出现一次才替换: 0 次是 old_text 写错,多次是有歧义
         if count != 1:
             return f"Error: Expected 1 occurrence, found {count}"
         file_path.write_text(text.replace(old_text, new_text), encoding="utf-8")
@@ -222,12 +172,11 @@ def run_glob(pattern: str) -> str:
 
 
 def run_delete_file(path: str) -> str:
-    """删除的唯一实现: 移动到 rubbish/<毫秒时间戳>_<名字>,可撤销留痕."""
+    """删除仅移入 rubbish/，保留恢复路径。"""
     try:
         target = safe_path(path)
         if target == PROJECT_ROOT:
             return "Error: refusing to delete the project root"
-        # 注意: is_relative_to 是纯路径运算,rubbish/ 还不存在也能比较
         if target == RUBBISH_DIR or target.is_relative_to(RUBBISH_DIR):
             return "Error: refusing to delete inside rubbish/"
         if not target.exists():
@@ -236,7 +185,7 @@ def run_delete_file(path: str) -> str:
         stamp = ts_millis()
         dest = RUBBISH_DIR / f"{stamp}_{target.name}"
         counter = 1
-        while dest.exists():  # 同毫秒撞名时追加序号,绝不覆盖
+        while dest.exists():  # 同毫秒重名时追加序号，禁止覆盖。
             dest = RUBBISH_DIR / f"{stamp}_{counter}_{target.name}"
             counter += 1
         shutil.move(str(target), str(dest))
@@ -244,8 +193,6 @@ def run_delete_file(path: str) -> str:
     except Exception as e:
         return f"Error: {e}"
 
-
-# ---- 工具 schema(Anthropic API 格式)与 dispatch map ----
 
 BASE_TOOLS = [
     {"name": "bash", "description": "在项目根目录执行 shell 命令.",
@@ -272,7 +219,7 @@ BASE_HANDLERS = {
 }
 
 
-# ============ §3 Hooks: 固定事件点挂回调,返回非 None 即拦截/注入 ============
+# 事件钩子
 
 HOOKS = {"UserPromptSubmit": [], "PreToolUse": [], "PostToolUse": [], "Stop": []}
 
@@ -282,7 +229,7 @@ def register_hook(event: str, callback) -> None:
 
 
 def trigger_hooks(event: str, *args):
-    """按注册顺序执行; 第一个返回非 None 的回调短路后续,返回值即结果."""
+    """首个非 None 返回值短路后续回调。"""
     for callback in HOOKS[event]:
         result = callback(*args)
         if result is not None:
@@ -290,25 +237,20 @@ def trigger_hooks(event: str, *args):
     return None
 
 
-# ============================== §4 权限层 ============================
-# 文件工具是硬沙箱; shell 是规则拦截(教学级,非安全边界).
-# 拒绝原因作为 tool_result 喂回模型,让它自行改道.
+# 权限检查
+# 文件工具限制路径；shell 规则拦截不构成安全边界。
 
-# Gate 1: 无论什么平台都不允许出现的命令片段
 DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=",
              "> /dev/sda", "format ", "diskpart"]
 
-# 删除命令按平台分两套; 只匹配"命令位置"(行首或 ;&|() 换行之后),
-# 避免 model / delimiter 这类单词误报
+# 仅匹配命令位置，避免单词误报。
 DELETE_WORD_UNIX = re.compile(
     r"(?im)(?:^|[;&|()\n])\s*(?:rm|rmdir|unlink|shred)(?=\s|$|[;&|()])")
 DELETE_FIND_UNIX = re.compile(r"(?im)\bfind\b[^;&|()\n]*\s-delete\b")
-# PowerShell: del/rd/ri/rm/erase 都是 Remove-Item 的别名,一并拦截
 DELETE_WORD_WIN = re.compile(
     r"(?im)(?:^|[;&|\n])\s*(?:remove-item|ri|del|erase|rd|rm)(?=\s|$|[;&|])")
 
-# 越界写: cwd 已固定为项目根,写项目内文件用相对路径即可,
-# 因此出现绝对路径写目标一律视为越界(/dev/null 除外)
+# 禁止绝对路径写入，重定向 /dev/null 除外。
 OUTSIDE_WRITE_UNIX = [
     re.compile(r"(?m)>>?\s*/(?!dev/null)"),
     re.compile(r"(?m)>>?\s*~"),
@@ -318,33 +260,30 @@ OUTSIDE_WRITE_UNIX = [
 CD_OUTSIDE_UNIX = re.compile(r"(?m)(?:^|[;&|()\n])\s*cd\s+(?:/|~|\.\.)")
 
 OUTSIDE_WRITE_WIN = [
-    re.compile(r"(?i)>>?\s*[A-Za-z]:[\\/]"),   # 重定向到盘符绝对路径
+    re.compile(r"(?i)>>?\s*[A-Za-z]:[\\/]"),
     re.compile(r"(?i)>>?\s*\\\\"),
     re.compile(r"(?i)\b(?:copy|move|mkdir|md|new-item|ni|set-content|add-content|out-file)\b[^;&|\n]*\s+[A-Za-z]:[\\/]"),
 ]
 CD_OUTSIDE_WIN = re.compile(
     r"(?im)(?:^|[;&|\n])\s*(?:cd|chdir|set-location|sl)\s+(?:[\\/]|[A-Za-z]:[\\/]?|\.\.)")
 
-# Gate 3: 高危但不违规的命令,交互确认
 ASK_KEYWORDS = ("chmod 777", "| bash", "| sh ", "Invoke-Expression", "iex ")
 
 
 def match_delete_command(command: str, windows: bool) -> bool:
-    """判断命令里是否含删除操作(按平台语义)."""
     if windows:
         return bool(DELETE_WORD_WIN.search(command))
     return bool(DELETE_WORD_UNIX.search(command) or DELETE_FIND_UNIX.search(command))
 
 
 def match_outside_write(command: str, windows: bool) -> bool:
-    """判断命令是否试图写到项目外 / 移动出项目."""
     rules = ([*OUTSIDE_WRITE_WIN, CD_OUTSIDE_WIN] if windows
              else [*OUTSIDE_WRITE_UNIX, CD_OUTSIDE_UNIX])
     return any(rule.search(command) for rule in rules)
 
 
 def permission_hook(block):
-    """PreToolUse: 强制权限闸门,返回字符串 = 拦截本次调用."""
+    """返回字符串即拦截本次调用。"""
     name = getattr(block, "name", "")
     args = getattr(block, "input", {}) or {}
 
@@ -356,7 +295,7 @@ def permission_hook(block):
                 return f"已拒绝: 命令命中禁止清单 '{pattern}'"
         if match_delete_command(command, IS_WINDOWS):
             print("\n\033[31m[拦截] 试图通过 shell 删除\033[0m")
-            # 拦截而不是改写命令: 改写 shell 容易误判
+            # 不改写 shell 命令，避免误判。
             return ("已拦截 shell 删除操作.请改用 delete_file 工具: "
                     "它会把目标移动到 rubbish/,而不是销毁.")
         if match_outside_write(command, IS_WINDOWS):
@@ -368,7 +307,7 @@ def permission_hook(block):
             print(f"   bash({command[:120]})")
             try:
                 allowed = input("   允许执行? [y/N] ").strip().lower() in ("y", "yes")
-            except EOFError:  # 非交互场景默认拒绝
+            except EOFError:  # 非交互场景默认拒绝。
                 allowed = False
             if not allowed:
                 return "用户拒绝授权"
@@ -377,21 +316,19 @@ def permission_hook(block):
         path = str(args.get("path", ""))
         try:
             safe_path(path)
-        except ValueError:  # 强制范畴: 硬拒,不询问
+        except ValueError:  # 越界硬拒，不请求确认。
             print("\n\033[31m[拦截] 路径越出项目范围\033[0m")
             return f"路径越出项目范围,已拒绝: {path}"
     return None
 
 
 def log_hook(block):
-    """PreToolUse: 打印每次工具调用的参数预览,便于观察 agent 行为."""
     preview = str(list((getattr(block, "input", {}) or {}).values())[:2])[:60]
     print(f"\033[90m[hook] {getattr(block, 'name', '?')}({preview})\033[0m")
     return None
 
 
 def large_output_hook(block, output):
-    """PostToolUse: 超大输出告警."""
     if len(str(output)) > 100000:
         print(f"\033[33m[hook] 超大输出 "
               f"{getattr(block, 'name', '?')}: {len(str(output))} 字符\033[0m")
@@ -399,7 +336,6 @@ def large_output_hook(block, output):
 
 
 def stop_summary_hook(messages: list):
-    """Stop: 循环即将退出时统计本轮工具调用次数."""
     tool_count = sum(
         1 for message in messages
         for block in (message.get("content")
@@ -409,25 +345,25 @@ def stop_summary_hook(messages: list):
     return None
 
 
-register_hook("PreToolUse", permission_hook)   # 先注册: 权限先行于日志
+register_hook("PreToolUse", permission_hook)   # 权限检查先于日志。
 register_hook("PreToolUse", log_hook)
 register_hook("PostToolUse", large_output_hook)
 register_hook("Stop", stop_summary_hook)
 
 
-# ==== §5 todo_write: TodoManager 内存任务板, 3 轮未更新注入提醒 ====
+# 任务板
 
 TODO_STATUSES = ("pending", "in_progress", "completed")
 
 
 class TodoManager:
-    """内存任务板: update 全量替换并校验, render 渲染成 [ ]/[>]/[x] 面板."""
+    """任务列表全量替换，仅允许一个进行中任务。"""
 
     def __init__(self):
         self.items: list[dict] = []
 
     def update(self, todos: list | str) -> str:
-        if isinstance(todos, str):  # 兼容模型把列表当字符串传
+        if isinstance(todos, str):
             try:
                 todos = json.loads(todos)
             except json.JSONDecodeError:
@@ -496,7 +432,6 @@ TODO_TOOL = {
 
 
 def run_todo_write(todos: list | str) -> str:
-    """全量替换内存任务板, 打印并返回渲染后的任务面板."""
     try:
         output = TODO.update(todos)
     except ValueError as e:
@@ -505,7 +440,7 @@ def run_todo_write(todos: list | str) -> str:
     return output
 
 
-# ===== §6 技能加载: system prompt 只放目录,load_skill 按需取全文 =====
+# 技能加载
 
 class SkillLoader:
     def __init__(self, skills_dir: Path):
@@ -515,7 +450,6 @@ class SkillLoader:
 
     @staticmethod
     def parse_frontmatter(text: str) -> tuple[dict, str]:
-        """切出 --- 包裹的 YAML 头并安全解析."""
         lines = text.splitlines(keepends=True)
         if not lines or lines[0].rstrip("\r\n") != "---":
             return {}, text
@@ -537,7 +471,6 @@ class SkillLoader:
         return metadata, body
 
     def scan(self) -> None:
-        """扫描 skills/*/SKILL.md,取 name / description / 正文."""
         self.skills.clear()
         if not self.skills_dir.exists():
             return
@@ -586,8 +519,6 @@ LOAD_SKILL_TOOL = {
 }
 
 
-# == 工具池: TOOLS 给模型看,TOOL_HANDLERS 是 dispatch,加工具只改这两处 ==
-
 TOOLS = [*BASE_TOOLS, TODO_TOOL, LOAD_SKILL_TOOL]
 TOOL_HANDLERS = {**BASE_HANDLERS,
                  "todo_write": run_todo_write,
@@ -595,7 +526,6 @@ TOOL_HANDLERS = {**BASE_HANDLERS,
 
 
 def build_system_prompt() -> str:
-    """组装 system prompt: 身份 + 硬性规则 + 技能目录 + 防注入约定."""
     return (
         f"你是一个运行在 {PROJECT_ROOT} 的通用助手."
         "需要时调用工具完成任务,直接行动,少解释.\n"
@@ -626,7 +556,6 @@ SYSTEM = build_system_prompt()
 
 
 def execute_tool(block) -> str:
-    """单次工具调用的统一入口: 先过 hooks,再 dispatch,兜异常."""
     blocked = trigger_hooks("PreToolUse", block)
     if blocked:
         return str(blocked)
@@ -639,8 +568,8 @@ def execute_tool(block) -> str:
     return str(output)
 
 
-# ==== §7 子助手: 全新 messages,30 轮上限,最终文本作为 tool_result 返回;
-# 同一响应里的多个 subtask 调用严格串行; 无线程/邮箱/持久化 ====
+# 子助手
+# 子任务串行执行。
 
 SUB_SYSTEM = (
     f"你是一个运行在 {PROJECT_ROOT} 的通用助手."
@@ -649,7 +578,7 @@ SUB_SYSTEM = (
 
 SUB_TOOLS = [tool for tool in TOOLS if tool["name"] in
              ("bash", "read_file", "write_file", "edit_file",
-              "glob", "delete_file")]  # 不含 subtask: 防止递归派生
+              "glob", "delete_file")]  # 禁止递归派生。
 SUB_HANDLERS = {name: TOOL_HANDLERS[name] for name in
                 ("bash", "read_file", "write_file", "edit_file",
                  "glob", "delete_file")}
@@ -658,7 +587,7 @@ SUBAGENT_MAX_TURNS = 30
 
 
 def run_subagent(prompt: str) -> str:
-    """全新 messages 跑独立循环,返回最终文本; 与父级共用权限 hooks."""
+    """独立上下文，共用父级权限钩子。"""
     print("\n\033[35m[子助手启动]\033[0m")
     messages = [{"role": "user", "content": prompt}]
 
@@ -709,24 +638,22 @@ TOOLS.append(SUBTASK_TOOL)
 TOOL_HANDLERS["subtask"] = run_subagent
 
 
-# ==== §8 上下文压缩: 占窗口 >=80% 触发,压到 60%(COMPACT_* 常量) ====
-# prepare() 逐级下沉: 新结果落盘留预览 -> 中间历史归档 -> 旧结果缩短
-# -> 仍超限才用 LLM 摘要重写历史; 被压缩内容都有磁盘副本,可解析引用
+# 上下文压缩
 
 COMPACT_TRIGGER_TOKENS = int(CONTEXT_WINDOW_TOKENS * 0.8)
 COMPACT_TARGET_TOKENS = int(CONTEXT_WINDOW_TOKENS * 0.6)
-MAX_REACTIVE_RETRIES = 1   # prompt_too_long 反应式压缩的重试上限
+MAX_REACTIVE_RETRIES = 1
 
 
 class ContextCompactor:
-    # 内部步骤用字符数做停止条件即可: 只是"删够为止"的循环
+    # 字符数仅用于压缩步骤的停止条件。
     TOOL_RESULT_BATCH_CHAR_LIMIT = 200000
     LARGE_RESULT_CHAR_LIMIT = 30000
     SUMMARY_INPUT_CHAR_LIMIT = 80000
     KEEP_RECENT_RESULTS = 3
     KEEP_RECENT_MESSAGES = 5
     SNIP_MAX_MESSAGES = 50
-    CHARS_PER_TOKEN = 4   # 兜底字符->token 换算(英文经验值,中文偏保守)
+    CHARS_PER_TOKEN = 4   # 字符估算仅作兜底。
 
     def __init__(self, llm_client, model: str,
                  transcript_dir: Path, tool_results_dir: Path):
@@ -734,17 +661,16 @@ class ContextCompactor:
         self.model = model
         self.transcript_dir = transcript_dir
         self.tool_results_dir = tool_results_dir
-        self.last_input_tokens = 0   # 上一次真实 API 计量
-        self.chars_at_measure = 0    # 计量时刻的消息字符总量
+        self.last_input_tokens = 0
+        self.chars_at_measure = 0
 
-    # ---- 计量 ----
 
     @staticmethod
     def estimate_chars(messages: list) -> int:
         return len(json.dumps(messages, default=str, ensure_ascii=False))
 
     def estimate_tokens(self, messages: list) -> int:
-        """估算下次调用的输入 token: 上次真实计量为基线 + 字符增量/4."""
+        """以上次实测令牌数加字符增量估算。"""
         chars = self.estimate_chars(messages)
         if self.last_input_tokens:
             growth = max(0, chars - self.chars_at_measure)
@@ -752,14 +678,12 @@ class ContextCompactor:
         return chars // self.CHARS_PER_TOKEN
 
     def record_usage(self, response, messages: list) -> None:
-        """每次响应后记录真实 input_tokens 作为下次的基线."""
         usage = getattr(response, "usage", None)
         input_tokens = int(getattr(usage, "input_tokens", 0) or 0)
         if input_tokens:
             self.last_input_tokens = input_tokens
             self.chars_at_measure = self.estimate_chars(messages)
 
-    # ---- 消息结构判断 ----
 
     @staticmethod
     def block_type(block):
@@ -784,8 +708,7 @@ class ContextCompactor:
 
     @staticmethod
     def unseen_tool_result_positions(messages: list) -> set:
-        """找出模型还没看过的 tool_result: 未读结果绝不压缩,
-        否则模型丢失该输出,且 tool_use/tool_result 配对断裂会报错."""
+        """标记未读工具结果，避免旧结果压缩误删。"""
         last_assistant = next(
             (index for index in range(len(messages) - 1, -1, -1)
              if messages[index].get("role") == "assistant"),
@@ -800,13 +723,11 @@ class ContextCompactor:
             if isinstance(block, dict) and block.get("type") == "tool_result"
         }
 
-    # ---- 落盘与预览 ----
 
     def write_transcript(self, messages: list) -> Path:
-        """整份历史写入 .transcripts/ 下的 jsonl 档案,返回路径."""
         self.transcript_dir.mkdir(parents=True, exist_ok=True)
         path = self.transcript_dir / f"transcript_{uuid.uuid4().hex}.jsonl"
-        # open("x") 独占创建,归档永不覆盖旧档案
+        # 独占创建，禁止覆盖旧归档。
         with path.open("x", encoding="utf-8") as transcript:
             for message in messages:
                 transcript.write(json.dumps(
@@ -814,7 +735,7 @@ class ContextCompactor:
         return path
 
     def persisted_output_path(self, output: str) -> str | None:
-        """识别已是预览的内容,直接复用已落盘文件(幂等)."""
+        """复用已有归档，避免重复落盘。"""
         candidate = None
         if output.startswith("<persisted-output>\n"):
             candidate = next(
@@ -843,7 +764,6 @@ class ContextCompactor:
 
     def persisted_preview(self, tool_use_id: str, output: str,
                           preview_chars: int = 2000) -> str:
-        """全文落盘,返回带归档路径的预览文本."""
         saved_path = self.persisted_output_path(output)
         if saved_path:
             path = Path(saved_path)
@@ -858,10 +778,9 @@ class ContextCompactor:
         return (f"<persisted-output>\nFull output: {path}\n"
                 f"Preview:\n{preview}\n</persisted-output>")
 
-    # ---- 四级漏斗 ----
 
     def tool_result_budget(self, messages: list, max_chars: int | None = None) -> list:
-        """步 1: 只处理最新一批 tool_result,超预算的落盘留预览(不丢新信息)."""
+        """最新结果超预算时落盘留预览。"""
         if not messages:
             return messages
         content = messages[-1].get("content")
@@ -889,7 +808,6 @@ class ContextCompactor:
         return self.persisted_preview(tool_use_id, output)
 
     def is_archive_marker(self, message: dict) -> bool:
-        """判断消息是否为 snip_compact 留下的归档标记."""
         content = message.get("content")
         match = (re.fullmatch(r"\[\d+ messages archived at (.+)\]", content)
                  if isinstance(content, str) else None)
@@ -900,8 +818,7 @@ class ContextCompactor:
                 and path.is_file())
 
     def snip_compact(self, messages: list, max_messages: int | None = None) -> list:
-        """步 2: 消息数超限时归档中间历史为一条 marker,保留头 3 条与尾部.
-        边界修正保证 tool_use / tool_result 配对不被切开."""
+        """归档中间历史，保留首尾及工具调用与结果配对。"""
         max_messages = max_messages or self.SNIP_MAX_MESSAGES
         if len(messages) <= max_messages:
             return messages
@@ -917,14 +834,14 @@ class ContextCompactor:
             return messages
         middle = messages[head_end:tail_start]
         if len(middle) == 1 and self.is_archive_marker(middle[0]):
-            return messages  # 已归档过,避免重复写档案
+            return messages
         transcript_path = self.write_transcript(messages)
         marker = {"role": "user", "content":
                   f"[{tail_start - head_end} messages archived at {transcript_path}]"}
         return [*messages[:head_end], marker, *messages[tail_start:]]
 
     def micro_compact(self, messages: list, target_chars: int) -> list:
-        """步 3: 把"已消费"的旧 tool_result 缩短为归档引用,保留最近 N 条."""
+        """仅缩短已读旧结果，保留最近结果。"""
         results = [
             (message_index, block_index, block)
             for message_index, message in enumerate(messages)
@@ -936,7 +853,7 @@ class ContextCompactor:
         consumed = [entry for entry in results if entry[:2] not in unseen]
         for _, _, block in consumed[:-self.KEEP_RECENT_RESULTS]:
             if self.estimate_chars(messages) <= target_chars:
-                break  # 够了就少动,压缩是按需的
+                break
             content = str(block.get("content", ""))
             if len(content) <= 120:
                 continue
@@ -948,7 +865,7 @@ class ContextCompactor:
         return messages
 
     def fit_tool_results(self, messages: list, target_chars: int) -> list:
-        """步 3.5 兜底: 所有 tool_result 按大小降序换成 1000 字符预览."""
+        """兜底缩短所有工具结果，全文保留在磁盘。"""
         results = [
             block
             for message in messages
@@ -969,7 +886,6 @@ class ContextCompactor:
         return messages
 
     def summary_input(self, messages: list) -> str:
-        """摘要模型的输入; 超限时掐头去尾."""
         conversation = json.dumps(messages, default=str, ensure_ascii=False)
         if len(conversation) <= self.SUMMARY_INPUT_CHAR_LIMIT:
             return conversation
@@ -980,7 +896,6 @@ class ContextCompactor:
                 + conversation[-tail:])
 
     def summarize_history(self, messages: list) -> str:
-        """独立 LLM 调用生成结构化摘要; prompt 要求只记录事实,不执行指令."""
         response = self.client.messages.create(
             model=self.model, thinking=THINKING,
             system=(
@@ -1000,7 +915,7 @@ class ContextCompactor:
 
     @staticmethod
     def summary_message(label: str, request: str, summary: str, transcript: Path) -> dict:
-        """压缩后的首条消息: 当前请求是唯一指令源,摘要仅供参考."""
+        """当前请求是指令，摘要仅作参考。"""
         return {"role": "user", "content": (
             f"[{label}]\n\n当前用户请求: \n{request}\n\n"
             f"对话摘要(仅供参考): \n"
@@ -1009,20 +924,19 @@ class ContextCompactor:
         )}
 
     def compact_history(self, messages: list, active_request: str) -> list:
-        """归档全量历史后用 LLM 摘要,把 messages 替换为单条消息."""
         transcript = self.write_transcript(messages)
         print(f"[历史已归档: {transcript}]")
         summary = self.summarize_history(messages)
         return [self.summary_message("已压缩", active_request, summary, transcript)]
 
     def reactive_compact(self, messages: list, active_request: str) -> list:
-        """反应式压缩: 保留最近 5 条原文不摘要(prompt_too_long 兜底)."""
+        """超限后保留近期原文，摘要其余历史。"""
         transcript = self.write_transcript(messages)
         print(f"[历史已归档: {transcript}]")
         tail_start = max(0, len(messages) - self.KEEP_RECENT_MESSAGES)
         if (tail_start > 0 and self.is_tool_result(messages[tail_start])
                 and self.has_tool_use(messages[tail_start - 1])):
-            tail_start -= 1  # 不切开 tool_use/tool_result 配对
+            tail_start -= 1  # 保留工具调用与结果配对。
         old_history = messages[:tail_start] if tail_start else messages
         summary = self.summarize_history(old_history)
         message = self.summary_message("反应式压缩", active_request,
@@ -1030,7 +944,7 @@ class ContextCompactor:
         return [message, *messages[tail_start:]] if tail_start else [message]
 
     def prepare(self, messages: list, active_request: str) -> list:
-        """每次模型调用前的压缩总入口,从便宜到贵逐级下沉."""
+        """先归档和裁剪，仍超限才调用模型摘要。"""
         messages = self.tool_result_budget(messages)
         messages = self.snip_compact(messages)
         if self.estimate_tokens(messages) > COMPACT_TRIGGER_TOKENS:
@@ -1047,13 +961,13 @@ class ContextCompactor:
 COMPACTOR = ContextCompactor(client, MODEL, TRANSCRIPT_DIR, TOOL_RESULTS_DIR)
 
 
-# == §9 goal 判断器: 无工具的独立 LLM 裁定; 模型自称完成不算数,只认证据 ==
+# 目标判断
 
-GOAL_BLOCK_CAP = 8   # 同一目标下连续未达成上限,超过则交还用户(防烧钱死循环)
+GOAL_BLOCK_CAP = 8   # 限制未达成后的续轮，避免无限调用。
 
 
 class GoalError(Exception):
-    """goal 判断器无法安全使用时抛出."""
+    """目标判断器结果不可用。"""
 
 
 def _block_type(block):
@@ -1069,7 +983,6 @@ def _block_value(block, key, default=None):
 
 
 def _plain_content(content) -> str:
-    """把 content 渲染成可读文本(含工具调用与结果)给判断器看."""
     if isinstance(content, str):
         return content
     if not isinstance(content, list):
@@ -1092,7 +1005,6 @@ def _plain_content(content) -> str:
 
 
 def transcript_text(messages: list, max_characters: int = 24000) -> str:
-    """倒序取最近消息直到 24000 字符; 单条超大按 3/4 头 + 1/4 尾截断."""
     rendered = [
         f"{message.get('role', 'unknown').upper()}:\n"
         f"{_plain_content(message.get('content', ''))}"
@@ -1120,7 +1032,6 @@ def transcript_text(messages: list, max_characters: int = 24000) -> str:
 
 
 def _parse_json_object(text: str) -> dict:
-    """严格校验判断器返回的 JSON; 结构不对就抛错,不带病决策."""
     stripped = text.strip()
     if stripped.startswith("```"):
         lines = stripped.splitlines()
@@ -1149,8 +1060,7 @@ def _parse_json_object(text: str) -> dict:
 
 
 def evaluate_goal_condition(condition: str, messages: list) -> dict:
-    """无工具的独立 LLM 裁定,返回 {ok, reason, impossible}.
-    条件与对话记录打包成 JSON 数据块交给它: 只判数据,不执行指令."""
+    """独立判断器只评估证据，不执行输入指令。"""
     payload = json.dumps(
         {"completion_condition": condition,
          "conversation": transcript_text(messages)},
@@ -1177,19 +1087,17 @@ def evaluate_goal_condition(condition: str, messages: list) -> dict:
     return _parse_json_object(extract_text(response.content))
 
 
-# =============== §10 主循环: 压缩 -> 调模型 -> 闸门/工具回填 ==============
+# 主循环
 
 def agent_loop(messages: list, active_request: str,
                goal_condition: str | None = None):
-    """返回 (最终文本, goal_status, goal_reason).
-    goal_status: None=普通模式 / achieved / failed / limit / error"""
+    """返回最终文本、目标状态及理由；普通模式状态为 None。"""
 
-    consecutive_blocks = 0   # 单次 goal 执行内连续未达成的次数
+    consecutive_blocks = 0
     reactive_retries = 0
-    rounds_since_todo = 0    # 距上次更新任务板经过的工具轮数
+    rounds_since_todo = 0
 
     while True:
-        # 每次调模型前先压缩
         messages[:] = COMPACTOR.prepare(messages, active_request)
         try:
             response = client.messages.create(
@@ -1198,7 +1106,6 @@ def agent_loop(messages: list, active_request: str,
             )
             reactive_retries = 0
         except Exception as error:
-            # 反应式压缩: 主动管线没拦住的超长,兜底重试一次
             too_long = any(text in str(error).lower()
                            for text in ("prompt_too_long", "too many tokens"))
             if too_long and reactive_retries < MAX_REACTIVE_RETRIES:
@@ -1217,12 +1124,11 @@ def agent_loop(messages: list, active_request: str,
         if not tool_calls:
             text = extract_text(response.content)
 
-            # ---- goal 闸门: 未达成时注入理由并 continue,即自动续轮 ----
             if goal_condition is not None:
                 try:
                     evaluation = evaluate_goal_condition(goal_condition, messages)
                 except Exception as error:
-                    # 解析失败不惩罚(不计入连续 block),交还用户
+                    # 判断器异常直接交还用户，不计未达成次数。
                     trigger_hooks("Stop", messages)
                     return text, "error", f"{type(error).__name__}: {error}"
                 if evaluation["ok"]:
@@ -1245,14 +1151,13 @@ def agent_loop(messages: list, active_request: str,
                     "继续推进,并补上缺失的证据.")})
                 continue
 
-            # ---- 普通模式: Stop hooks 可注入内容强制续轮 ----
+            # 普通模式允许停止钩子要求续轮。
             force = trigger_hooks("Stop", messages)
             if force:
                 messages.append({"role": "user", "content": force})
                 continue
             return text, None, ""
 
-        # ---- 工具执行与结果回填 ----
         results = []
         used_todo = False
         for block in tool_calls:
@@ -1263,7 +1168,6 @@ def agent_loop(messages: list, active_request: str,
                 used_todo = True
             results.append({"type": "tool_result", "tool_use_id": block.id,
                             "content": output})
-        # 3 轮没更新任务板就提醒一次, 防止计划与实际进度脱节(s05 的做法)
         rounds_since_todo = 0 if used_todo else rounds_since_todo + 1
         if rounds_since_todo >= 3:
             results.append({"type": "text",
@@ -1272,10 +1176,9 @@ def agent_loop(messages: list, active_request: str,
         messages.append({"role": "user", "content": results})
 
 
-# ================== §11 入口: REPL 是唯一使用形态 ==================
+# 交互入口
 
 def repl() -> None:
-    """交互主循环: 唯一的任务提交入口."""
     print("harness - 单文件 Agent Harness")
     print(f"项目根目录: {PROJECT_ROOT}")
     print(f"Shell: {'powershell' if IS_WINDOWS else 'bash'} | 模型: {MODEL} | "
@@ -1295,7 +1198,6 @@ def repl() -> None:
             continue
 
         if stripped.startswith("/goal"):
-            # 条件即任务: 判断器未放行就自动续轮,收口后回到普通模式
             condition = stripped[len("/goal"):].strip()
             if not condition:
                 print("用法: /goal <完成条件>,例如 /goal pytest 全部通过且退出码为 0")

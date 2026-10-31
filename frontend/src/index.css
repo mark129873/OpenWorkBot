@@ -1,7 +1,5 @@
-/* 全局样式：Tailwind v4 入口 + 浅色主题基础 */
 @import "tailwindcss";
 
-/* 一个强调色贯穿导航、焦点和主按钮；状态色只表达成功、风险与错误。 */
 @theme {
   --color-accent-50: #fdf8eb;
   --color-accent-100: #f8ebc8;
@@ -13,8 +11,6 @@
   --color-accent-700: #805416;
   --color-accent-800: #654111;
 }
-
-/* 视觉约定见 PRODUCT §6：白色正文、微暖灰导航、暖黄强调；数字使用等宽字体。 */
 
 :root {
   color-scheme: light;
@@ -30,29 +26,23 @@ body {
     "Microsoft YaHei", "Noto Sans SC", sans-serif;
 }
 
-/* 等宽工具类（耗时/token/代码行内用）；tabular-nums 让数字跳动时不抖动 */
 .font-num {
   font-family: ui-monospace, SFMono-Regular, "Cascadia Mono", Consolas, monospace;
   font-variant-numeric: tabular-nums;
 }
 
-/* 流式文本光标（生成中显示） */
 .stream-cursor::after {
   content: "▍";
   @apply text-accent-700 animate-pulse;
 }
 
-/* ---------- 质感细节 ---------- */
-
-/* 选中文字：强调色淡底 */
 ::selection {
   background-color: #f8ebc8;
 }
 
-/* 细滚动条：冷静不发抢 */
 * {
   scrollbar-width: thin;
-  scrollbar-color: rgb(212 212 216 / 0.9) transparent; /* zinc-300 */
+  scrollbar-color: rgb(212 212 216 / 0.9) transparent;
 }
 *::-webkit-scrollbar {
   width: 6px;
@@ -63,19 +53,17 @@ body {
   border-radius: 9999px;
 }
 *::-webkit-scrollbar-thumb:hover {
-  background-color: rgb(161 161 170); /* zinc-400 */
+  background-color: rgb(161 161 170);
 }
 *::-webkit-scrollbar-track {
   background: transparent;
 }
 
-/* 键盘焦点：统一强调色 ring（鼠标点击不出现） */
 :focus-visible {
   outline: 2px solid #976615;
   outline-offset: 3px;
 }
 
-/* 消息/面板入场：轻微上浮淡入（尊重 reduced-motion） */
 @media (prefers-reduced-motion: no-preference) {
   .animate-enter {
     animation: enter 0.24s cubic-bezier(0.16, 1, 0.3, 1) both;

@@ -1,13 +1,9 @@
-/** 审批只允许三个明确决定；会话权限由后端内存保存，不改变项目模式。 */
+/* 会话授权由后端保存，不改变项目模式。 */
 export type ApprovalOptionId = 'allowOnce' | 'allowSession' | 'deny'
 export interface ApprovalOption { option_id: ApprovalOptionId; label: string; content?: string }
 
-/**
- * 类型定义：与后端 SSE / 回放契约一一对应（docs/ARCHITECTURE.md §6）。
- * 后端字段用 epoch 毫秒浮点，前端保持一致不做转换。
- */
+/* 时间字段沿用后端 epoch 毫秒。 */
 
-/** 侧栏会话项（GET /api/sessions） */
 export interface SessionItem {
   id: string
   title: string
@@ -15,11 +11,10 @@ export interface SessionItem {
   created_at: number
   updated_at: number
   tokens_used: number
-  input_tokens: number // 输入 token 累计（用量聚合）
-  running: boolean // 后台生成中 → 呼吸点
+  input_tokens: number
+  running: boolean
 }
 
-/** 工作块条目（kind 判别联合） */
 export type WorkItem =
   | { kind: 'text'; id: string; text: string; time: number }
   | {
@@ -47,7 +42,7 @@ export type WorkItem =
       tool: string
       input: unknown
       reason: string
-      status: 'requested' | 'approved' | 'denied' | 'auto' // auto = 权限规则放行
+      status: 'requested' | 'approved' | 'denied' | 'auto' // auto 表示权限规则放行
       time: number
     }
   | {
@@ -65,7 +60,6 @@ export interface TodoItem {
   status: 'pending' | 'in_progress' | 'completed'
 }
 
-/** 一轮对话（turn）= 用户消息 + 工作块 + 最终回复 */
 export interface TurnData {
   turn_id: string
   state: 'running' | 'success' | 'stopped' | 'failed'
@@ -77,7 +71,6 @@ export interface TurnData {
   final_text: string | null
 }
 
-/** 会话详情（GET /api/sessions/{id}） */
 export interface SessionDetail {
   session: {
     id: string
@@ -86,9 +79,9 @@ export interface SessionDetail {
     created_at: number
     updated_at: number
     tokens_used: number
-    input_tokens: number // 输入 token 累计
-    context_used: number // 最近一轮"最后一步 input"≈当前上下文占用（进度条口径）
-    context_window: number // 上下文窗口大小（token）
+    input_tokens: number
+    context_used: number // 最近一轮最后一步的输入量，近似上下文占用
+    context_window: number
   }
   turns: TurnData[]
   pending_approval: {
@@ -103,10 +96,9 @@ export interface SessionDetail {
   } | null
 }
 
-/** SSE 事件（后端 event type 的前端形态） */
 export type SseEvent =
   | { type: 'turn_started'; turn_id: string; started_at: number }
-  // message_id标识模型步骤；省略时兼容旧流，不能用于区分不同步骤。
+  // 缺少 message_id 时无法区分模型步骤。
   | { type: 'delta'; text: string; message_id?: string }
   | { type: 'tool_started'; tool_call_id: string; name: string; input: unknown }
   | {
@@ -126,7 +118,7 @@ export type SseEvent =
       tool: string
       input: unknown
       reason: string
-      options: ApprovalOption[] // 仅本次 / 本会话 / 拒绝
+      options: ApprovalOption[]
     }
   | { type: 'approval_resolved'; request_id: string; approved: boolean }
   | { type: 'token_count'; input_tokens: number; output_tokens: number }

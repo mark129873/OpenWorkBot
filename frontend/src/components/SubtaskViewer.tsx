@@ -1,11 +1,3 @@
-/**
- * 右侧 subtask 查看面板：显示子助手目标与实时/历史输出。
- *
- * 点击会话流中的 subtask 卡片打开；数据是卡片对应的 work item 对象
- * （useSessionStream 里流式 delta 会原地追加 output），运行中每 500ms
- * 强制重渲染以跟随增长；结束后保留可回看。
- */
-
 import { useEffect, useState } from 'react'
 import { UsersThree, X } from '@phosphor-icons/react'
 import { MarkdownWithCopy } from './MessageItem'
@@ -21,7 +13,7 @@ export interface SubtaskViewerProps {
 
 export function SubtaskViewer({ subtask, onClose }: SubtaskViewerProps) {
   const running = subtask.status === 'running'
-  // 运行中轻量 tick：output 由流式事件原地追加，tick 强制读取最新值
+  // 输出原地追加，定时刷新以读取最新值。
   const [, setTick] = useState(0)
   useEffect(() => {
     if (!running) return
@@ -31,7 +23,6 @@ export function SubtaskViewer({ subtask, onClose }: SubtaskViewerProps) {
 
   return (
     <aside aria-label="子助手详情" className="subtask-panel flex w-[360px] shrink-0 flex-col border-l border-zinc-200 bg-white">
-      {/* 头部：目标 + 状态 + 关闭 */}
       <div className="flex h-[68px] shrink-0 items-center gap-2.5 border-b border-zinc-200 px-5 text-[14px] font-semibold text-zinc-800">
         <UsersThree size={20} className="text-accent-700" />子助手
         <button type="button" onClick={onClose} className="icon-button ml-auto" aria-label="关闭面板" title="关闭面板"><X size={18} /></button>
@@ -49,7 +40,6 @@ export function SubtaskViewer({ subtask, onClose }: SubtaskViewerProps) {
         </p>
       </div>
 
-      {/* 输出区：流式增量（历史卡片为最终输出全文） */}
       <div className="min-h-0 flex-1 overflow-y-auto px-5 pb-6">
         {subtask.output ? (
           <MarkdownWithCopy text={subtask.output} streaming={running} />

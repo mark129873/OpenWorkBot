@@ -1,19 +1,3 @@
-"""agent 主循环：mini_harness §10 的移植，形态改为异步事件生成器。
-
-一个 turn = 一次 run_turn() 调用：
-  用户输入 → [压缩检查(BE-7)] → LLM 流式调用 → 有 tool_use 则
-  过权限闸门 → 审批回调(BE-6 接交互) → 线程池执行 → 结果回填续轮；
-  无 tool_use 且 Stop hook 无注入则收口。
-
-设计约定：
-- 事件即产物：循环是 async generator，逐个 yield 事件 dict（SSE 层直接转发）；
-- 错误不打断循环：工具异常由 execute_tool 转成 Error 字符串（tools.py），
-  LLM 异常转成 error 事件并以 failed 收口；
-- stop_flag 在每个检查点轮询：流中、每个工具执行前、每轮开始；
-  命中即以 stopped 收口，已生成的部分已落盘（停止后保留部分输出）；
-- 工时记账：记录本轮总耗时，包含审批等待。
-"""
-
 import asyncio
 import logging
 import time
@@ -29,63 +13,52 @@ from app.sessions.recorder import TurnRecorder
 
 logger = logging.getLogger(__name__)
 
-# 单 turn 的模型步上限（安全阀；mini_harness 子循环 30 轮同思想）
 MAX_STEPS_DEFAULT = 40
 
-# 输出预览长度：SSE 事件里只带预览，全文走回放接口
+# SSE 仅传预览，全文从回放读取。
 _PREVIEW_LEN = 400
 
 
 async def _auto_approver(tool_name: str, tool_input: dict, reason: str, **_kwargs) -> dict:
-    """默认审批回调：BE-4 阶段自动批准（BE-6 的交互审批经 deps 注入替换）。
-
-    为什么默认放行：验证循环与权限分档逻辑本身；返回 dict 与
-    InteractiveApprover 的契约一致（approved + denial_reason）。
-    """
+    """默认自动批准；HTTP 入口须注入交互审批。"""
     return {"approved": True, "denial_reason": None}
 
 
 @dataclass
 class TurnDeps:
-    """一次 turn 的全部依赖（测试可全部注入假实现）。
+    """settings 为 None 时禁用压缩。"""
 
-    settings 为 None 时禁用压缩检查（单元测试默认禁用，真实端点传入）。
-    """
-
-    client: object  # LLM 流式客户端：async stream(system, messages, tools) -> async iterator
+    client: object  # 协议：async stream(system, messages, tools)。
     recorder: TurnRecorder
     system_prompt: str
-    history: list = field(default_factory=list)  # Anthropic messages 形态，原地追加
+    history: list = field(default_factory=list)
     tools: list = field(default_factory=lambda: list(TOOLS))
-    approver: Callable = _auto_approver  # async (tool, input, reason) -> 审批结果dict
+    approver: Callable = _auto_approver  # 异步返回 approved、denial_reason。
     max_steps: int = MAX_STEPS_DEFAULT
     stop_flag: Callable[[], bool] = field(default_factory=lambda: (lambda: False))
-    settings: object = None  # 压缩预算等（None = 禁用压缩）
-    last_input_tokens: int | None = None  # 最近主模型实际输入量
-    measured_history_tokens: int | None = None  # 同次调用前历史估算，供计算步间增量
-    active_history_start: int | None = None  # 当前用户原文所在索引，摘要不能跨越此处
-    queue: object | None = None  # SSE共用队列（审批/子助手直推事件用）
-    persist_user_message: bool = True  # 重新生成时为 False（用户消息已存在）
-    user_sequence: int | None = None  # 重新生成时锚定的既有用户消息 sequence
+    settings: object = None
+    last_input_tokens: int | None = None
+    measured_history_tokens: int | None = None  # 调用前历史估算，用于计算新增用量。
+    active_history_start: int | None = None  # 摘要不得跨越当前用户消息。
+    queue: object | None = None
+    persist_user_message: bool = True  # 重跑已有用户消息，不重复保存。
+    user_sequence: int | None = None
 
 
 def _preview(text: str) -> str:
-    """工具输出的事件预览（全文走回放接口）。"""
     return text if len(text) <= _PREVIEW_LEN else text[:_PREVIEW_LEN] + "…"
 
 
 def _is_error_output(output: str) -> bool:
-    """mini_harness 约定：Error 开头的输出代表工具执行失败。"""
     return isinstance(output, str) and output.startswith("Error:")
 
 
 def _new_tool_part_id() -> str:
-    """工具部件的稳定行 id：同一次调用的多次状态推进写同一行。"""
-    return f"tl{uuid.uuid4().hex[:30]}"  # 32 字符以内
+    """同一工具调用的状态更新复用此 ID。"""
+    return f"tl{uuid.uuid4().hex[:30]}"
 
 
 def _last_user_text(history: list) -> str:
-    """取用户输入文本（历史最后一条 user 消息由 BE-5 端点压入）。"""
     for msg in reversed(history):
         if msg.get("role") == "user":
             content = msg.get("content")
@@ -97,7 +70,7 @@ def _last_user_text(history: list) -> str:
 
 
 async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
-    """执行一个回复轮次，逐个吐事件。最终事件必为 turn_completed。"""
+    """最后发出 turn_completed 事件。"""
     turn_id = deps.recorder.begin_turn(
         user_text=_last_user_text(deps.history),
         persist_user=deps.persist_user_message,
@@ -115,22 +88,20 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
                                        maybe_compact, needs_compact)
 
         steps = 0
-        context_retries = 0  # 整个turn最多一次专项恢复，不因成功模型步而重置。
+        context_retries = 0  # 每轮仅一次超限恢复，成功模型步不重置。
         while True:
-            # 与原步数边界一致：只有还需续轮时检查，末步正常结束仍算成功。
+            # 仅需续轮时检查步数，末步正常结束仍成功。
             if steps >= deps.max_steps:
                 error_message = f"达到单轮步数上限 {deps.max_steps}"
-                # 前置失败同样保存消息错误，刷新后仍可解释失败并显示重试入口。
+                # 前置失败也落盘，刷新后可重试。
                 deps.recorder.write_error_part(deps.recorder.step_message(), error_message)
                 yield {"type": "error", "message": error_message}
                 state = "failed"
                 break
-            # ---- 检查点：停止 ----
             if deps.stop_flag():
                 stop_requested = True
                 break
 
-            # 每步重新检查工具结果增长；安全压缩后仍超限就停止，不丢当前轮历史。
             if deps.settings is not None:
                 async for compact_event in maybe_compact(deps):
                     yield compact_event
@@ -145,11 +116,10 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
                     state = "failed"
                     break
 
-            # ---- LLM 流式调用（一个模型步） ----
             steps += 1
             input_estimate = estimate_history_tokens(deps.history)
             message_id = deps.recorder.step_message()
-            reply = None  # 记录上下文进入失败时尚未产生reply，异常路径也必须可收口。
+            reply = None  # 调用前失败可能尚无 reply。
             try:
                 with record_model_step(deps, deps.system_prompt, deps.history, deps.tools) as reply:
                     async for event in deps.client.stream(
@@ -161,17 +131,17 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
                         reply.accept(event)
                         kind = event.get("type")
                         if kind == "text_delta":
-                            # 消息 ID 标记模型步边界，让实时过程正文与最终回复的划分和回放一致。
+                            # 消息 ID 对齐实时流与回放的模型步边界。
                             yield {"type": "delta", "text": event.get("text", ""), "message_id": message_id}
                         elif kind == "usage":
                             deps.recorder.add_usage(**reply.usage)
-                            # 只有主循环input影响主上下文压缩预算。
+                            # 主上下文预算仅计主模型输入。
                             deps.last_input_tokens = reply.usage["input_tokens"]
                             deps.measured_history_tokens = input_estimate
                             yield {"type": "token_count", "input_tokens": reply.usage["input_tokens"],
                                    "output_tokens": reply.usage["output_tokens"]}
-            except Exception as exc:  # LLM 层异常：转 error 事件，failed 收口
-                # 只恢复明确的输入超限；流已产生内容时不重试，避免重复输出或工具计划。
+            except Exception as exc:
+                # 流已有内容时不重试，避免重复输出或工具计划。
                 if (deps.settings is not None and is_context_limit_error(exc)
                         and context_retries < 1 and reply is not None
                         and not reply.text and not reply.tool_uses):
@@ -185,7 +155,7 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
                 if is_context_limit_error(exc):
                     exc = RuntimeError(f"上下文超限且无法继续安全恢复；请缩短请求或工具输出后重试。原错误：{exc}")
                 logger.exception("LLM 调用失败")
-                # 已经推给用户的正文先落盘；异常不能使刷新和下一轮上下文丢失部分答案。
+                # 先保存已展示正文，避免异常后丢失部分答案。
                 if reply is not None and reply.text:
                     deps.recorder.write_text_part(message_id, reply.text)
                 deps.recorder.write_error_part(message_id, str(exc))
@@ -195,7 +165,6 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
             text_acc, tool_uses = reply.text, reply.tool_uses
             deps.recorder.finish_message(message_id, "tool_calls" if tool_uses else "stop")
 
-            # ---- 里程碑落盘：正文与工具调用（pending 态） ----
             if text_acc:
                 deps.recorder.write_text_part(message_id, text_acc)
             part_ids: dict[str, str] = {}
@@ -214,10 +183,8 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
                 )
 
             if stop_requested:
-                # 流中途被停：已生成的部分已落盘，以 stopped 收口
                 break
 
-            # ---- 无工具调用：本轮结束（Stop hook 可注入内容强制续轮） ----
             if not tool_uses:
                 deps.history.append({"role": "assistant", "content": text_acc})
                 injection = hooks.trigger("Stop", {"turn_id": turn_id, "steps": steps})
@@ -226,7 +193,6 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
                     continue
                 break
 
-            # ---- 工具执行：权限闸门 → 审批 → 线程池执行 ----
             deps.history.append(
                 {"role": "assistant", "content": reply.assistant_blocks()}
             )
@@ -239,7 +205,7 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
                 async for event in _execute_one(deps, message_id, tool_use, part_ids[tool_use["id"]], result_box):
                     yield event
                 tool_results.append(result_box["tool_result"])
-                # 子助手在流中停止后直接结束父轮，不能先命中下一步的预算或步数限制。
+                # 子助手停止后立即结束父轮，避免误报预算或步数超限。
                 if deps.stop_flag():
                     stop_requested = True
                     break
@@ -248,7 +214,7 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
                 break
             if tool_results:
                 deps.history.append({"role": "user", "content": tool_results})
-    except Exception as exc:  # 循环级兜底：任何意外都不允许吞掉收口事件
+    except Exception as exc:
         logger.exception("turn 循环异常")
         yield {"type": "error", "message": str(exc)}
         state = "failed"
@@ -272,13 +238,7 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
 async def _execute_one(
     deps: TurnDeps, message_id: str, tool_use: dict, part_id: str, result_box: dict
 ) -> AsyncIterator[dict]:
-    """单个工具调用：权限分档 → 审批 → 执行 → 落盘 + 事件（异步生成器）。
-
-    为什么是生成器：subtask/todo_write 需要在执行过程中实时吐事件
-    （子助手流式输出、任务板更新），不能等执行完一次性返回。
-    结果通过 result_box["tool_result"] 带出（生成器无法用 return 值传给调用方）。
-    约定：denied（策略拒绝/用户拒绝）不执行、不发 tool_started，只发结果卡。
-    """
+    """结果写入 result_box；拒绝时不执行、不发 tool_started。"""
     name = tool_use["name"]
     tool_input = tool_use.get("input") or {}
     call_id = tool_use["id"]
@@ -286,11 +246,10 @@ async def _execute_one(
 
     hooks.trigger("PreToolUse", {"name": name, "tool_call_id": call_id})
 
-    # 权限评估（ZCode checkPermission 复刻）：allow 执行 / deny 拒绝 / ask 走审批
     output = await authorize_tool(
         deps, name, tool_input, data_dir=deps.settings.data_dir if deps.settings else None
     )
-    # 审批返回到执行之间再次检查，自定义审批回调也不能越过停止信号。
+    # 审批返回后重查停止，防止迟到批准执行。
     if deps.stop_flag():
         output = "Error: 操作已停止"
     status = "denied" if output is not None else "completed"
@@ -300,7 +259,6 @@ async def _execute_one(
             {"tool_call_id": call_id, "name": name, "input": tool_input, "status": "running"},
         )
         if name == "subtask":
-            # 特殊工具：嵌套循环，事件实时吐（最后由哨兵带出输出文本）
             from app.agent.subtask import run_subtask_events
 
             async for event in run_subtask_events(deps, message_id, tool_input):
@@ -310,7 +268,6 @@ async def _execute_one(
                 else:
                     yield event
         elif name == "todo_write":
-            # 特殊工具：落 todo part + todo_updated 事件
             from app.agent.todo import handle_todo_write
 
             output, extra_events = await handle_todo_write(deps, message_id, tool_input)

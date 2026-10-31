@@ -1,4 +1,4 @@
-# 参考用的示范项目，不纳入本仓库
+# 外部参考仓库
 .github_claude-for-legal/
 .github_claude-for-legal-ZH/
 .github_claude-for-legal-zh-cn/
@@ -6,7 +6,7 @@
 .github_ZCode/
 .github_learn-claude-code/
 
-# 本地密钥，绝不入库
+# 密钥
 .env
 
 # Python 运行时产物
@@ -14,7 +14,7 @@ __pycache__/
 .pytest_cache/
 .venv/
 
-# harness 运行时生成的目录
+# 运行产物
 /rubbish/
 /.task/
 /.transcripts/
@@ -52,4 +52,3 @@ eggs/
 pip-wheel-metadata/
 wheels/
 # ----- ↑ 以上为 ZCode 默认排除规则（自定义规则请写在本行下方，不会被同步/恢复改动）-----
-# 自定义规则写在下方（本行提示可删除）

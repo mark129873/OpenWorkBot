@@ -1,7 +1,3 @@
-/**
- * 会话导航：列表由后端事实驱动，每 5 秒刷新；新建仍只生成草稿 id。
- * 选中按钮与删除按钮是同级元素，避免嵌套按钮让键盘、读屏和点击行为混乱。
- */
 import { ChatTeardrop, HardDrives, Plus, SidebarSimple, SquaresFour, Trash } from '@phosphor-icons/react'
 import { useCallback, useEffect, useState } from 'react'
 import { createSession, deleteSession, listSessions } from '../api/client'
@@ -16,7 +12,6 @@ export interface SidebarProps {
   onDraftCreated: (id: string) => void
 }
 
-/** 今天显示时分，较早的会话显示月日，避免每一行都堆完整日期。 */
 function formatTime(ms: number): string {
   const date = new Date(ms)
   return date.toDateString() === new Date().toDateString()
@@ -40,13 +35,11 @@ export function Sidebar({ sessions, currentId, onSelect, onSessionsChange, onDra
   }, [onSessionsChange])
 
   useEffect(() => {
-    // 首次读取也异步触发；effect 只管理调度，卸载时一起清理，避免同步派发界面状态。
     const first = setTimeout(() => void refresh(), 0)
     const timer = setInterval(() => void refresh(), 5000)
     return () => { clearTimeout(first); clearInterval(timer) }
   }, [refresh])
 
-  /** 抽屉里选完会话就露出正文；桌面仍保持原来的三栏结构。 */
   const closeDrawer = () => {
     if (window.matchMedia('(max-width: 760px)').matches && sidebarOpen) toggleSidebar()
   }
@@ -67,7 +60,6 @@ export function Sidebar({ sessions, currentId, onSelect, onSessionsChange, onDra
       setConfirmingId(null)
       await refresh()
     } catch (e) {
-      // 删除失败时保留列表与确认入口，明确显示原因，用户可以稍后重试。
       setError(e instanceof Error ? e.message : '删除失败，请重试')
     }
   }
@@ -107,7 +99,7 @@ export function Sidebar({ sessions, currentId, onSelect, onSessionsChange, onDra
                       </span>
                     </span>
                   </button>
-                  {/* 删除独立于导航按钮，仍需第二次明确确认；不把 hover 当作唯一入口。 */}
+                  {/* 删除需二次确认，且不能仅靠悬停触达。 */}
                   {confirmingId === s.id ? (
                     <div className="flex items-center justify-end gap-2 px-3 pb-3">
                       <button type="button" onClick={() => setConfirmingId(null)} className="rounded-lg px-2.5 py-1.5 text-[12px] text-zinc-600 hover:bg-zinc-200/60">取消</button>

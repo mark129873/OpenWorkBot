@@ -1,4 +1,3 @@
-"""turn 记录器：六表子集，消息元信息与轮次累计分开保存。"""
 from app.models import Message, TurnUsage, new_id, now_ms
 from app.sessions import store
 
@@ -21,7 +20,7 @@ class TurnRecorder:
 
     def add_usage(self, input_tokens: int, output_tokens: int, cache_read_tokens: int = 0,
                   cache_creation_tokens: int = 0, *, subtask: bool = False) -> None:
-        """子模型只入整轮累计，不能覆盖主模型消息的 usage 或上下文占用。"""
+        """子模型计入整轮累计，不覆盖主模型用量和上下文。"""
         self.tokens_used += output_tokens
         self.tokens_input += input_tokens
         self.cache_read_tokens += cache_read_tokens
@@ -51,7 +50,7 @@ class TurnRecorder:
         return self.turn_id
 
     def end_turn(self, state: str) -> dict:
-        """总耗时包含审批等待；状态使用 ZCode 词表，API 在边界转换。"""
+        """总耗时包含审批等待。"""
         ended = now_ms()
         row = self.db.get(TurnUsage, (self.session_id, self.turn_id))
         if row is None:
@@ -93,7 +92,6 @@ class TurnRecorder:
         store.replace_todos(self.db, self.session_id, items)
 
     def write_error_part(self, message_id: str, message: str) -> str:
-        """保留调用入口名；实际错误属于 message.error，不创建 error part。"""
         row = self.db.get(Message, message_id)
         data = store._load(row.data)
         data['error'] = {'name': 'APIError', 'data': {'message': message}}

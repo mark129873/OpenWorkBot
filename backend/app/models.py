@@ -1,4 +1,3 @@
-"""ZCode SQLite 六表子集；省略未使用能力，不改变保留字段的存储含义。"""
 import time
 import uuid
 from sqlalchemy import CheckConstraint, ForeignKey, Index, Integer, Text, text
@@ -6,7 +5,6 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
 def now_ms() -> int:
-    """ZCode 使用 epoch 毫秒。"""
     return int(time.time() * 1000)
 
 

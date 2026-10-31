@@ -1,4 +1,4 @@
-# 参考用的示范项目，不纳入本仓库
+# 外部参考仓库
 .github_claude-for-legal/
 .github_claude-for-legal-ZH/
 .github_claude-for-legal-zh-cn/
@@ -6,7 +6,7 @@
 .github_ZCode/
 .github_learn-claude-code/
 
-# 本地密钥，绝不入库
+# 密钥
 .env
 
 # Python 运行时产物
@@ -14,13 +14,13 @@ __pycache__/
 .pytest_cache/
 .venv/
 
-# harness 运行时生成的目录
+# 运行产物
 /rubbish/
 /.task/
 /.transcripts/
 /.task_outputs/
 
-# 后端运行时数据（SQLite/工作区/日志）与测试沙箱
+# 后端数据与测试目录
 backend/data/
 backend/tests/.tmp-data/
 
@@ -28,11 +28,11 @@ backend/tests/.tmp-data/
 frontend/node_modules/
 frontend/dist/
 
-# 临时文件目录（AGENTS.md 约定：不入库，可随时清空）
+# 临时文件
 /tmp/
 
 # ZCode 会话产物
 .zcode/
 
-# model-io JSONL（逐次 LLM 调用快照，含对话正文，绝不入库）
+# 模型快照含正文，不入库
 /log/

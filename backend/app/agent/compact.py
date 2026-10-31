@@ -1,21 +1,3 @@
-"""上下文压缩：ZCode compact 思路的移植（docs/ARCHITECTURE.md §5）。
-
-策略（从便宜到贵）：
-1. 不动：估算/真实 token 未超预算 → 什么都不做；
-2. microcompact：本地把旧工具结果改写为占位符（保留最近 N 条完整），
-   零 LLM 成本，先做；
-3. compact：仍超预算才调 LLM 生成结构化摘要，摘要成为 resume 边界
-   （load_history 只发边界之后的消息）。
-
-预算口径（产品决策）：预算 = 上下文窗口 − 32K 输出预留 − 13K buffer。
-token 来源：最近真实 input_tokens 加历史增长量，并以字符数/4估算兜底。
-
-熔断：连续 3 次摘要失败后本会话跳过 compact（避免每轮都烧一次失败调用），
-无法安全缩减时由调用方明确失败；专项超限恢复也不能绕过熔断。
-
-每步检查预算，但摘要边界只跨已结束的旧轮；活跃轮的原始请求与工具配对不切开。
-"""
-
 import asyncio
 import logging
 from copy import deepcopy
@@ -28,27 +10,21 @@ from app.sessions import store
 
 logger = logging.getLogger(__name__)
 
-# 连续摘要失败熔断阈值（ZCode policy 同款数字）
 _MAX_COMPACT_FAILURES = 3
-# 占位符文本（microcompact 改写旧工具输出用）
 _MICRO_PLACEHOLDER = "[旧工具结果已清除以节省上下文]"
 
-# 会话 -> 连续失败计数（进程内；重启清零无妨）
 _failure_counts: dict[str, int] = {}
 
 
 def context_budget(settings) -> int:
-    """可用上下文预算 = 窗口 − 输出预留 − 安全缓冲。"""
     return settings.context_window - settings.compact_output_reserve - settings.compact_buffer
 
 
 def estimate_tokens(text: str) -> int:
-    """字符数/4 粗估（与 mini_harness 一致；仅用于无真实 usage 时的兜底）。"""
     return max(1, len(text) // 4)
 
 
 def estimate_history_tokens(history: list) -> int:
-    """估算整段历史的 token（Anthropic messages 形态）。"""
     total = 0
     for msg in history:
         content = msg.get("content")
@@ -71,7 +47,7 @@ def json_dumps_safe(obj) -> str:
 
 def needs_compact(settings, history: list, last_input_tokens: int | None = None,
                   measured_history_tokens: int | None = None) -> bool:
-    """真实用量加测量后增量；取估算下限，避免小的旧usage掩盖新工具大输出。"""
+    """真实用量加新增历史估算，避免旧用量掩盖大输出。"""
     estimate = estimate_history_tokens(history)
     if last_input_tokens is not None and last_input_tokens > 0:
         growth = max(0, estimate - measured_history_tokens) if measured_history_tokens is not None else 0
@@ -80,7 +56,7 @@ def needs_compact(settings, history: list, last_input_tokens: int | None = None,
 
 
 def is_context_limit_error(exc: Exception) -> bool:
-    """只识别明确的输入上下文超限；普通400、网络错误和输出长度错误均不重试。"""
+    """仅输入上下文超限可重试，其他错误不重试。"""
     body = getattr(exc, "body", None)
     error = body.get("error", body) if isinstance(body, dict) else {}
     code = error.get("code") or error.get("type") if isinstance(error, dict) else None
@@ -94,11 +70,7 @@ def is_context_limit_error(exc: Exception) -> bool:
 
 
 def microcompact_parts(db, session_id: str, keep: int, *, before_sequence: int | None = None) -> int:
-    """把较旧的工具输出改写为占位符，保留最近 keep 条完整。
-
-    只动"已完成/已失败"且输出非空的 tool_call part；返回改写条数。
-    为什么整行 upsert：与存储层里程碑语义一致，sequence/时间线不动。
-    """
+    """替换旧工具输出，保留顺序与最近完整结果。"""
     query = select(Part).where(
         Part.session_id == session_id, func.json_extract(Part.data, "$.type") == "tool")
     if before_sequence is not None:
@@ -124,7 +96,6 @@ def _has_output(part: Part) -> bool:
 
 
 def build_transcript(history: list) -> str:
-    """把历史铺成纯文本对话稿（摘要调用的输入）。"""
     lines: list[str] = []
     for msg in history:
         role = "用户" if msg.get("role") == "user" else "助手"
@@ -155,7 +126,6 @@ COMPACT_PROMPT = """你是会话压缩器。把下面这段"助手与用户的�
 
 
 async def summarize_history(client, history: list) -> str:
-    """调 LLM 生成摘要（复用流式客户端，tools 置空）。"""
     transcript = build_transcript(history)
     chunks: list[str] = []
     async for event in client.stream(
@@ -169,7 +139,7 @@ async def summarize_history(client, history: list) -> str:
 
 
 async def maybe_compact(deps, *, force: bool = False) -> AsyncIterator[dict]:
-    """只改旧轮前缀；不从库重载活跃历史，Stop注入与工具往返也完整保留。"""
+    """仅压缩旧轮前缀，保留活跃轮及工具配对。"""
     settings, history = deps.settings, deps.history
     active_start = getattr(deps, "active_history_start", None)
     if active_start is None:
@@ -178,11 +148,11 @@ async def maybe_compact(deps, *, force: bool = False) -> AsyncIterator[dict]:
                                       getattr(deps, "measured_history_tokens", None)):
         return
     if active_start <= 0:
-        return  # 当前轮自身过大时没有安全旧前缀，调用方明确失败而非硬截断。
+        return  # 当前轮过大且无安全前缀时失败，不硬截断。
     session_id = deps.recorder.session_id
     cutoff = deps.recorder.first_user_sequence - 1
 
-    # 本地占位仅影响旧轮。按callID替换旧前缀，绝不丢弃尚未落库的活跃历史。
+    # 仅按 callID 替换旧前缀，保留未落库活跃历史。
     cleared = microcompact_parts(deps.recorder.db, session_id, settings.microcompact_keep,
                                  before_sequence=cutoff + 1)
     if cleared:
@@ -206,7 +176,7 @@ async def maybe_compact(deps, *, force: bool = False) -> AsyncIterator[dict]:
         logger.warning("compact 熔断中，跳过摘要 session=%s", session_id)
         return
 
-    # 摘要输入与待替换前缀一致；模型失败时原历史和边界不动。
+    # 摘要失败时保持原历史与边界。
     prior = deepcopy(history[:active_start])
     tokens_before = estimate_history_tokens(history)
     try:
@@ -234,5 +204,4 @@ async def maybe_compact(deps, *, force: bool = False) -> AsyncIterator[dict]:
 
 
 def reset_failure_count(session_id: str) -> None:
-    """（测试辅助）清空指定会话的熔断计数。"""
     _failure_counts.pop(session_id, None)

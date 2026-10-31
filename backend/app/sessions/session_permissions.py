@@ -1,11 +1,11 @@
-"""会话工具授权：只存进程内存，精确范围，不读取或写入项目规则。"""
+"""会话授权仅存内存，不读写项目规则。"""
 
 import json
 import os
 
 from app.agent.tools import safe_path
 
-# 文件内容可以在已批准的目标内变化；未知字段必须参与精确匹配，不能扩权。
+# 文件内容可变，未知参数仍须精确匹配以防扩权。
 _FILE_PAYLOADS = {
     "read_file": (), "write_file": ("content",),
     "edit_file": ("old_text", "new_text"), "delete_file": (),
@@ -14,7 +14,7 @@ _grants: dict[str, set[tuple[str, str]]] = {}
 
 
 def scope_for(tool: str, tool_input: dict) -> tuple[str, str] | None:
-    """文件绑定规范路径；命令/其他工具绑定完整参数，不解释通配或命令前缀。"""
+    """文件绑定真实路径；其他工具精确匹配完整参数，不支持通配。"""
     scoped = dict(tool_input)
     if tool in _FILE_PAYLOADS:
         path = scoped.get("path")
@@ -27,14 +27,13 @@ def scope_for(tool: str, tool_input: dict) -> tuple[str, str] | None:
         for key in _FILE_PAYLOADS[tool]:
             scoped.pop(key, None)
     try:
-        # 完整JSON包括嵌套参数、未知字段；不做strip/lower，保留命令原义。
+        # 保留完整参数及大小写、空白，避免改变命令含义。
         return tool, json.dumps(scoped, sort_keys=True, ensure_ascii=False, allow_nan=False)
     except (TypeError, ValueError):
         return None
 
 
 def describe(scope: tuple[str, str] | None) -> str:
-    """弹窗直接展示可复用范围，避免用户把本会话允许误解为整个工具放行。"""
     if scope is None:
         return "参数无效，无法保存会话授权"
     tool, content = scope

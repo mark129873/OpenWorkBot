@@ -11,7 +11,7 @@ WINDOWS = os.name == "nt"
 
 
 def stop(process):
-    # 只清理本脚本创建的进程组/进程树，不影响已有服务。
+    # 仅停止本脚本创建的进程。
     if WINDOWS:
         if process.poll() is None:
             subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"],
@@ -36,10 +36,9 @@ def main():
         uv, npm = shutil.which("uv"), shutil.which("npm")
         if not uv or not npm:
             raise RuntimeError("Please install uv and Node.js (including npm).")
-        # cwd 指向各自目录：后端 uv 会使用 backend 的配置与虚拟环境。
         frontend = [npm, "run", "dev", "--", "--host", "127.0.0.1", "--port", "5173", "--strictPort"]
         if WINDOWS:
-            # npm.cmd 需要 cmd 执行，双层引号兼容带空格的安装路径。
+            # 双层引号兼容 Windows 含空格路径。
             frontend = f'"{os.environ.get("COMSPEC", "cmd.exe")}" /d /s /c ""{npm}" run dev -- --host 127.0.0.1 --port 5173 --strictPort"'
         commands = [
             ([uv, "run", "uvicorn", "app.main:app", "--host", "127.0.0.1", "--port", "8100"], "backend"),
@@ -59,7 +58,7 @@ def main():
         print(f"Startup failed: {exc}", flush=True)
         return 1
     finally:
-        # 避免重复 Ctrl+C 打断清理，留下后台服务。
+        # 清理期间忽略重复 Ctrl+C。
         signal.signal(signal.SIGINT, signal.SIG_IGN)
         for process in reversed(processes):
             stop(process)
