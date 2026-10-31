@@ -75,6 +75,12 @@ function AppShell() {
         onSelect={openSession}
         onSessionsChange={setSessions}
         onDraftCreated={handleDraftCreated}
+        onDeleted={(id) => {
+          draftIdsRef.current.delete(id)
+          if (matchPath('/session/:sessionId', window.location.pathname)?.params.sessionId === id) {
+            navigate('/', { replace: true })
+          }
+        }}
       />
 
         <Routes>
@@ -182,6 +188,10 @@ function SessionView({
   const navigate = useNavigate()
   const [detail, setDetail] = useState<SessionDetail | null>(null)
   const [activeSubtask, setActiveSubtask] = useState<SubtaskItem | null>(null)
+  const [detailLoaded, setDetailLoaded] = useState(false)
+  const [detailError, setDetailError] = useState<string | null>(null)
+  const [retryDetail, setRetryDetail] = useState(0)
+  const [stopError, setStopError] = useState<string | null>(null)
   const [permission, setPermission] = useState<PermissionState>({ mode: 'build' })
 
   const refreshPermission = useCallback(() => {
@@ -217,18 +227,26 @@ function SessionView({
       && generation === getStreamGeneration()
     getSessionDetail(sessionId)
       .then((d) => {
-        if (isCurrent()) setDetail(d)
+        if (isCurrent()) {
+          draftIdsRef.current.delete(sessionId)
+          setDetail(d)
+          setDetailLoaded(true)
+          setDetailError(null)
+        }
       })
       .catch((e) => {
         if (!isCurrent()) return
-        const knownDraft = e instanceof ApiError && e.status === 404
-          && draftIdsRef.current?.has(sessionId)
-        if (!knownDraft) navigate('/', { replace: true })
+        if (e instanceof ApiError && e.status === 404) {
+          if (draftIdsRef.current.has(sessionId)) { setDetailLoaded(true); setDetailError(null) }
+          else navigate('/', { replace: true })
+        } else {
+          setDetailError(e instanceof Error ? e.message : '会话加载失败，请重试')
+        }
       })
     return () => {
       cancelled = true
     }
-  }, [sessionId, navigate, draftIdsRef, getStreamGeneration])
+  }, [sessionId, navigate, draftIdsRef, getStreamGeneration, retryDetail])
 
   /* 新请求或新流开始后丢弃旧回放。 */
   const refreshDetail = useCallback(async (completion?: StreamCompletion) => {
@@ -239,11 +257,15 @@ function SessionView({
       const next = await getSessionDetail(sessionId)
       if (request !== detailRequestRef.current || generation !== getStreamGeneration()) return
       setDetail(next)
+      setDetailLoaded(true)
+      setDetailError(null)
       // 运行中只同步审批；终态才替换正文。
       const current = next.turns.find((turn) => turn.turn_id === completion?.turnId)
       if (completion && current) reconcileTurn(completion, current, pendingFromDetail(next))
-    } catch {
-      /* 请求失败保留已显示内容。 */
+    } catch (e) {
+      if (request === detailRequestRef.current && generation === getStreamGeneration()) {
+        setDetailError(e instanceof Error ? e.message : '会话加载失败，请重试')
+      }
     }
   }, [sessionId, reconcileTurn, getStreamGeneration])
 
@@ -276,19 +298,30 @@ function SessionView({
 
   const handleSend = useCallback(
     (text: string, execution: ExecutionDraft, onAccepted?: () => void) => {
-      void send(text, refreshAfterTurn, execution, onAccepted)
+      setStopError(null)
+      void send(text, refreshAfterTurn, execution, () => {
+        draftIdsRef.current.delete(sessionId)
+        onAccepted?.()
+      })
     },
-    [send, refreshAfterTurn],
+    [send, refreshAfterTurn, draftIdsRef, sessionId],
   )
 
   const handleStop = useCallback(() => {
-    void stopTurn(sessionId)
-  }, [sessionId])
+    setStopError(null)
+    void stopTurn(sessionId).catch((e) => {
+      setStopError(e instanceof Error ? e.message : '停止失败，请重试')
+      void refreshDetail(getCompletion())
+    })
+  }, [sessionId, refreshDetail, getCompletion])
 
   const handleRetry = useCallback(() => {
     // 重跑保留原用户消息；回放失败时用实时快照恢复。
     void regenerate(liveTurn ?? detail?.turns.at(-1) ?? null, refreshAfterTurn)
   }, [regenerate, refreshAfterTurn, liveTurn, detail])
+
+  const isRunning = isStreaming || liveTurn?.state === 'running'
+    || !!detail?.turns.some((turn) => turn.state === 'running')
 
   return (
     <>
@@ -297,8 +330,12 @@ function SessionView({
         liveTurn={liveTurn}
         replacedTurnId={replacedTurnId}
         isStreaming={isStreaming}
+        isRunning={isRunning}
+        detailLoaded={detailLoaded}
+        detailError={detailError}
         currentId={sessionId}
-        streamError={streamError}
+        streamError={stopError || streamError}
+        stopError={stopError}
         livePendingApproval={pendingApproval}
         permission={permission}
         onSend={handleSend}
@@ -306,6 +343,7 @@ function SessionView({
         onRegenerate={handleRetry}
         onApprovalResolved={refreshAfterApproval}
         onOpenSubtask={setActiveSubtask}
+        onRetryDetail={() => setRetryDetail((value) => value + 1)}
       />
 
       {activeSubtask && (

@@ -80,6 +80,9 @@ class AnthropicStreamClient:
                     msg_usage = getattr(event, "usage", None)
                     if msg_usage is not None:
                         usage["output_tokens"] = getattr(msg_usage, "output_tokens", 0) or 0
+                    reason = getattr(getattr(event, "delta", None), "stop_reason", None)
+                    if reason:
+                        yield {"type": "stop_reason", "reason": reason}
 
             yield {
                 "type": "usage",

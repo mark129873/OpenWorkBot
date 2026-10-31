@@ -56,7 +56,6 @@ async def run_subtask_events(deps, message_id: str, tool_input: dict):
                             break
                         reply.accept(event)
                         if event.get("type") == "text_delta":
-                            # 收到即保存，断线或停止不丢已展示内容。
                             text = event.get("text", "")
                             output_acc.append(text)
                             await deps.queue.put(
@@ -69,6 +68,10 @@ async def run_subtask_events(deps, message_id: str, tool_input: dict):
             if deps.stop_flag():
                 status = "stopped"
             if status == "stopped":
+                break
+            if reply.stop_reason == "max_tokens":
+                status = "failed"
+                output_acc.append("\n模型输出达到上限，子助手未完成。")
                 break
             tool_uses = reply.tool_uses
             if not tool_uses:
@@ -104,6 +107,7 @@ async def run_subtask_events(deps, message_id: str, tool_input: dict):
                 break
             child_history.append({"role": "user", "content": tool_results})
         else:
+            status = "failed"
             output_acc.append(f"\n[达到子助手轮数上限 {SUBTASK_MAX_TURNS}]")
     except Exception as exc:
         logger.exception("subtask 执行异常")

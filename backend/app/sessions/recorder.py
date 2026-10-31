@@ -91,10 +91,10 @@ class TurnRecorder:
     def write_todos(self, items: list) -> None:
         store.replace_todos(self.db, self.session_id, items)
 
-    def write_error_part(self, message_id: str, message: str) -> str:
+    def write_error_part(self, message_id: str, message: str, finish: str = 'error') -> str:
         row = self.db.get(Message, message_id)
         data = store._load(row.data)
         data['error'] = {'name': 'APIError', 'data': {'message': message}}
         row.data = store._dump(data)
-        self.finish_message(message_id, 'error')
+        self.finish_message(message_id, finish)
         return message_id

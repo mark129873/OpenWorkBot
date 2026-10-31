@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable
 
@@ -134,10 +135,14 @@ def tool_delete_file(path: str) -> str:
             return f"Error: 文件不存在：{path}"
         import time
 
-        trash_name = f"{int(time.time() * 1000)}_{target.name}"
-        trash_dir = workspace_root() / ".rubbish"
+        trash_name = f"{int(time.time() * 1000)}_{uuid.uuid4().hex}_{target.name}"
+        trash_dir = safe_path(".rubbish")
         trash_dir.mkdir(parents=True, exist_ok=True)
-        shutil.move(str(target), str(trash_dir / trash_name))
+        candidate = trash_dir / trash_name
+        if candidate.exists() or candidate.is_symlink():
+            return "Error: 回收站目标已存在"
+        destination = safe_path(str(candidate))
+        shutil.move(str(target), str(destination))
         return f"已删除 {path}（移入 .rubbish/{trash_name}，可找回）"
     except Exception as exc:
         return f"Error: 删除失败：{exc}"

@@ -13,6 +13,7 @@ class ModelReply:
     text: str = ""
     tool_uses: list[dict] = field(default_factory=list)
     usage: dict = field(default_factory=lambda: {"input_tokens": 0, "output_tokens": 0})
+    stop_reason: str | None = None
 
     def accept(self, event: dict) -> None:
         kind = event.get("type")
@@ -22,6 +23,8 @@ class ModelReply:
             self.tool_uses.append(event)
         elif kind == "usage":
             self.usage = {key: event.get(key, 0) for key in _USAGE_KEYS}
+        elif kind == "stop_reason":
+            self.stop_reason = event.get("reason")
 
     def assistant_blocks(self) -> list[dict]:
         blocks = [{"type": "text", "text": self.text}] if self.text else []
@@ -56,6 +59,7 @@ def record_model_step(deps, system: str, messages: list, tools: list,
                 for t in reply.tool_uses
             ],
             usage=reply.usage,
+            stop_reason=reply.stop_reason,
             duration_ms=(time.monotonic() - started) * 1000,
             tool_names=[t["name"] for t in tools],
             subtask_id=subtask_id,

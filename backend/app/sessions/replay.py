@@ -101,22 +101,28 @@ def load_replay(
                     {"kind": "text", "id": part.id, "text": data.get("text", ""), "time": item_time}
                 )
             elif part_kind(part) == "tool_call":
+                status = data.get("status", "completed")
+                output = data.get("output", "")
+                if status in ("pending", "running") and bucket["state"] != "running":
+                    output = ("工具未执行。" if status == "pending" else
+                              "工具执行结果未知，可能已产生副作用，请先检查。")
+                    status = "stopped"
                 bucket["work_items"].append(
                     {
                         "kind": "tool_call",
                         "id": part.id,
                         "name": data.get("name", ""),
                         "input": data.get("input"),
-                        "status": "failed" if data.get("status") == "error" else data.get("status", "completed"),
-                        "output": data.get("output", ""),
+                        "status": "failed" if status == "error" else status,
+                        "output": output,
                         "time": item_time,
                     }
                 )
                 if data.get('name') == 'subtask':
                     bucket['work_items'].append({'kind': 'subtask', 'id': part.id,
                         'goal': (data.get('input') or {}).get('goal', ''),
-                        'status': 'failed' if data.get('status') == 'error' else data.get('status', 'running'),
-                        'output': data.get('output', ''), 'time': item_time})
+                        'status': 'failed' if status == 'error' else ('running' if status == 'pending' else status),
+                        'output': output, 'time': item_time})
                 elif data.get('name') == 'todo_write' and data.get('status') == 'completed':
                     from app.agent.todo import parse_items
                     items, error = parse_items((data.get('input') or {}).get('items'))
@@ -239,12 +245,20 @@ def load_history(db: DbSession, session_id: str) -> list[dict]:
                         "input": data.get("input") or {},
                     }
                 )
+                status = data.get("status")
+                output = data.get("output", "")
+                if status == "pending":
+                    output = "Error: 工具未执行。"
+                elif status == "running":
+                    output = "Error: 工具执行结果未知，可能已产生副作用，请先检查。"
+                elif status == "stopped":
+                    output = f"Error: 工具已停止，结果可能不完整；请检查副作用。\n{output}"
                 pending_tool_results.append(
                     {
                         "type": "tool_result",
                         "tool_use_id": data.get("tool_call_id", part.id),
-                        "content": data.get("output", ""),
-                        **({"is_error": True} if data.get("status") == "error" else {}),
+                        "content": output,
+                        **({"is_error": True} if status != "completed" else {}),
                     }
                 )
         if content:

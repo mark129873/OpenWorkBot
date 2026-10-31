@@ -19,8 +19,12 @@ export interface ChatAreaProps {
   /* 原轮次用于本地消息尚无持久 ID 时去重。 */
   replacedTurnId?: string | null
   isStreaming: boolean
+  isRunning: boolean
+  detailLoaded: boolean
+  detailError: string | null
   currentId: string | null
   streamError: string | null
+  stopError: string | null
   permission: PermissionState
   livePendingApproval: LivePendingApproval | null
   onSend: (text: string, execution: ExecutionDraft, onAccepted?: () => void) => void
@@ -28,12 +32,14 @@ export interface ChatAreaProps {
   onRegenerate: () => void
   onApprovalResolved: () => void
   onOpenSubtask?: (s: SubtaskItem) => void
+  onRetryDetail: () => void
 }
 
 export function ChatArea(props: ChatAreaProps) {
   const {
-    detail, liveTurn, replacedTurnId, isStreaming, currentId, streamError, livePendingApproval, permission,
-    onSend, onStop, onRegenerate, onApprovalResolved, onOpenSubtask,
+    detail, liveTurn, replacedTurnId, isStreaming, isRunning, detailLoaded, detailError,
+    currentId, streamError, stopError, livePendingApproval, permission,
+    onSend, onStop, onRegenerate, onApprovalResolved, onOpenSubtask, onRetryDetail,
   } = props
   const { sidebarOpen, toggleSidebar } = useShell()
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -49,7 +55,7 @@ export function ChatArea(props: ChatAreaProps) {
 
   // 实时审批优先，否则恢复回放中的未决审批。
   const modalApproval: PendingApproval | null =
-    livePendingApproval ?? pendingFromDetail(detail)
+    isStreaming ? livePendingApproval : livePendingApproval ?? pendingFromDetail(detail)
 
   useEffect(() => {
     const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
@@ -71,7 +77,7 @@ export function ChatArea(props: ChatAreaProps) {
         </button>
         <h1 className="min-w-0 flex-1 truncate text-[14px] font-semibold text-zinc-800">
           {detail?.session.title || '新会话'}
-          {liveTurn?.state === 'running' && (
+          {isRunning && (
             <span className="ml-2 text-xs font-normal text-accent-700">生成中…</span>
           )}
         </h1>
@@ -81,16 +87,16 @@ export function ChatArea(props: ChatAreaProps) {
       <div className="min-h-0 flex-1 overflow-y-auto px-5 py-8 sm:px-8">
         {hasContent ? (
           <div className="mx-auto max-w-[800px] space-y-10">
-            {turns.map((t) => (
+            {turns.map((t, index) => (
               <TurnGroup
                 key={t.turn_id}
                 turn={t}
                 onOpenSubtask={onOpenSubtask}
-                onRegenerate={onRegenerate}
+                onRegenerate={!liveTurn && !isRunning && index === turns.length - 1 ? onRegenerate : undefined}
               />
             ))}
             {liveTurn && (
-              <TurnGroup turn={liveTurn} onOpenSubtask={onOpenSubtask} onRegenerate={onRegenerate} />
+              <TurnGroup turn={liveTurn} onOpenSubtask={onOpenSubtask} onRegenerate={!isRunning ? onRegenerate : undefined} />
             )}
           </div>
         ) : (
@@ -109,9 +115,15 @@ export function ChatArea(props: ChatAreaProps) {
         </div>
       )}
 
+      {detailError && (
+        <div role="alert" className="mx-5 mb-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[13px] text-amber-800">
+          {detailError} <button type="button" onClick={onRetryDetail} className="ml-2 underline">重试加载</button>
+        </div>
+      )}
+
       <Composer
-        disabled={!currentId}
-        streaming={isStreaming}
+        disabled={!currentId || !detailLoaded}
+        streaming={isRunning}
         permission={permission}
         onSend={onSend}
         onStop={onStop}
@@ -119,9 +131,12 @@ export function ChatArea(props: ChatAreaProps) {
 
       {modalApproval && currentId && (
         <ApprovalModal
+          key={modalApproval.request_id}
           sessionId={currentId}
           approval={modalApproval}
           onResolved={onApprovalResolved}
+          onStop={onStop}
+          stopError={stopError}
         />
       )}
     </main>

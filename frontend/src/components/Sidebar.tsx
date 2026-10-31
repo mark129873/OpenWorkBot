@@ -10,6 +10,7 @@ export interface SidebarProps {
   onSelect: (id: string) => void
   onSessionsChange: (items: SessionItem[]) => void
   onDraftCreated: (id: string) => void
+  onDeleted: (id: string) => void
 }
 
 function formatTime(ms: number): string {
@@ -19,7 +20,7 @@ function formatTime(ms: number): string {
     : `${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
 }
 
-export function Sidebar({ sessions, currentId, onSelect, onSessionsChange, onDraftCreated }: SidebarProps) {
+export function Sidebar({ sessions, currentId, onSelect, onSessionsChange, onDraftCreated, onDeleted }: SidebarProps) {
   const { sidebarOpen, toggleSidebar } = useShell()
   const [confirmingId, setConfirmingId] = useState<string | null>(null)
   const [creating, setCreating] = useState(false)
@@ -58,6 +59,7 @@ export function Sidebar({ sessions, currentId, onSelect, onSessionsChange, onDra
     try {
       await deleteSession(id)
       setConfirmingId(null)
+      onDeleted(id)
       await refresh()
     } catch (e) {
       setError(e instanceof Error ? e.message : '删除失败，请重试')

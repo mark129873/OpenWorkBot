@@ -2,6 +2,7 @@ import asyncio
 import logging
 import time
 import uuid
+from contextlib import aclosing
 from dataclasses import dataclass, field
 from typing import AsyncIterator, Callable
 
@@ -122,24 +123,23 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
             reply = None  # 调用前失败可能尚无 reply。
             try:
                 with record_model_step(deps, deps.system_prompt, deps.history, deps.tools) as reply:
-                    async for event in deps.client.stream(
+                    async with aclosing(deps.client.stream(
                         system=deps.system_prompt, messages=deps.history, tools=deps.tools
-                    ):
-                        if deps.stop_flag():
-                            stop_requested = True
-                            break
-                        reply.accept(event)
-                        kind = event.get("type")
-                        if kind == "text_delta":
-                            # 消息 ID 对齐实时流与回放的模型步边界。
-                            yield {"type": "delta", "text": event.get("text", ""), "message_id": message_id}
-                        elif kind == "usage":
-                            deps.recorder.add_usage(**reply.usage)
-                            # 主上下文预算仅计主模型输入。
-                            deps.last_input_tokens = reply.usage["input_tokens"]
-                            deps.measured_history_tokens = input_estimate
-                            yield {"type": "token_count", "input_tokens": reply.usage["input_tokens"],
-                                   "output_tokens": reply.usage["output_tokens"]}
+                    )) as stream:
+                        async for event in stream:
+                            if deps.stop_flag():
+                                stop_requested = True
+                                break
+                            reply.accept(event)
+                            kind = event.get("type")
+                            if kind == "text_delta":
+                                yield {"type": "delta", "text": event.get("text", ""), "message_id": message_id}
+                            elif kind == "usage":
+                                deps.recorder.add_usage(**reply.usage)
+                                deps.last_input_tokens = reply.usage["input_tokens"]
+                                deps.measured_history_tokens = input_estimate
+                                yield {"type": "token_count", "input_tokens": reply.usage["input_tokens"],
+                                       "output_tokens": reply.usage["output_tokens"]}
             except Exception as exc:
                 # 流已有内容时不重试，避免重复输出或工具计划。
                 if (deps.settings is not None and is_context_limit_error(exc)
@@ -163,10 +163,16 @@ async def run_turn(deps: TurnDeps) -> AsyncIterator[dict]:
                 state = "failed"
                 break
             text_acc, tool_uses = reply.text, reply.tool_uses
-            deps.recorder.finish_message(message_id, "tool_calls" if tool_uses else "stop")
-
             if text_acc:
                 deps.recorder.write_text_part(message_id, text_acc)
+            if not stop_requested and reply.stop_reason == "max_tokens":
+                error_message = "模型输出达到上限，结果未完成；请重试或缩小任务范围。"
+                deps.recorder.write_error_part(message_id, error_message, finish="max_tokens")
+                yield {"type": "error", "message": error_message}
+                state = "failed"
+                break
+            deps.recorder.finish_message(message_id, "interrupted" if stop_requested else
+                                         (reply.stop_reason or ("tool_calls" if tool_uses else "stop")))
             part_ids: dict[str, str] = {}
             for tool_use in tool_uses:
                 part_id = _new_tool_part_id()
@@ -300,4 +306,5 @@ async def _execute_one(
         "status": status,
         "output_preview": _preview(output or ""),
     }
-    result_box["tool_result"] = {"type": "tool_result", "tool_use_id": call_id, "content": output or ""}
+    result_box["tool_result"] = {"type": "tool_result", "tool_use_id": call_id, "content": output or "",
+                                 **({"is_error": True} if status != "completed" else {})}

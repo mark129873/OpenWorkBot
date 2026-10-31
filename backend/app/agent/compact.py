@@ -10,10 +10,7 @@ from app.sessions import store
 
 logger = logging.getLogger(__name__)
 
-_MAX_COMPACT_FAILURES = 3
 _MICRO_PLACEHOLDER = "[旧工具结果已清除以节省上下文]"
-
-_failure_counts: dict[str, int] = {}
 
 
 def context_budget(settings) -> int:
@@ -135,6 +132,8 @@ async def summarize_history(client, history: list) -> str:
     ):
         if event.get("type") == "text_delta":
             chunks.append(event.get("text", ""))
+        elif event.get("type") == "stop_reason" and event.get("reason") == "max_tokens":
+            raise ValueError("摘要输出达到上限")
     return "".join(chunks).strip()
 
 
@@ -172,10 +171,6 @@ async def maybe_compact(deps, *, force: bool = False) -> AsyncIterator[dict]:
     if not force and not needs_compact(settings, history, deps.last_input_tokens,
                                       getattr(deps, "measured_history_tokens", None)):
         return
-    if _failure_counts.get(session_id, 0) >= _MAX_COMPACT_FAILURES:
-        logger.warning("compact 熔断中，跳过摘要 session=%s", session_id)
-        return
-
     # 摘要失败时保持原历史与边界。
     prior = deepcopy(history[:active_start])
     tokens_before = estimate_history_tokens(history)
@@ -188,20 +183,14 @@ async def maybe_compact(deps, *, force: bool = False) -> AsyncIterator[dict]:
         if estimate_history_tokens([summary]) >= estimate_history_tokens(prior):
             raise ValueError("摘要未缩短上下文，保留原历史")
     except Exception as exc:
-        _failure_counts[session_id] = _failure_counts.get(session_id, 0) + 1
-        logger.warning("compact 摘要失败(%s/%s): %s", _failure_counts[session_id], _MAX_COMPACT_FAILURES, exc)
+        logger.warning("compact 摘要失败: %s", exc)
         return
 
     store.save_compaction(deps.recorder.db, session_id, deps.recorder.turn_id,
                           cutoff, summary_text, tokens_before, estimate_tokens(summary_text))
-    _failure_counts[session_id] = 0
     deps.history[:] = [summary, *history[active_start:]]
     deps.active_history_start = 1
     deps.last_input_tokens = None
     deps.measured_history_tokens = None
     yield {"type": "compacted", "tokens_before": tokens_before,
            "tokens_after": estimate_history_tokens(deps.history)}
-
-
-def reset_failure_count(session_id: str) -> None:
-    _failure_counts.pop(session_id, None)

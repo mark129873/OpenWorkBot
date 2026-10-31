@@ -1,6 +1,6 @@
 /* 输入文字时禁用数字快捷键，避免误授权。 */
 import { ArrowRight, ShieldCheck } from '@phosphor-icons/react'
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { submitApproval } from '../api/client'
 
 import type { ApprovalOption, ApprovalOptionId } from '../types'
@@ -15,9 +15,11 @@ export interface ApprovalModalProps {
   sessionId: string
   approval: PendingApproval
   onResolved: () => void
+  onStop: () => void
+  stopError: string | null
 }
 
-export function ApprovalModal({ sessionId, approval, onResolved }: ApprovalModalProps) {
+export function ApprovalModal({ sessionId, approval, onResolved, onStop, stopError }: ApprovalModalProps) {
   // 未知审批选项不得成为按钮或快捷键。
   const options = approval.options.filter((option) => ['allowOnce', 'allowSession', 'deny'].includes(option.option_id))
   const [submitting, setSubmitting] = useState(false)
@@ -26,6 +28,11 @@ export function ApprovalModal({ sessionId, approval, onResolved }: ApprovalModal
   const dialogRef = useRef<HTMLDivElement>(null)
   // 立即上锁，防止重渲染前重复提交。
   const submittingRef = useRef(false)
+  const activeRef = useRef(false)
+  useLayoutEffect(() => {
+    activeRef.current = true
+    return () => { activeRef.current = false }
+  }, [])
   const decide = async (optionId: ApprovalOptionId) => {
     if (submittingRef.current) return
     submittingRef.current = true
@@ -33,9 +40,12 @@ export function ApprovalModal({ sessionId, approval, onResolved }: ApprovalModal
     setError(null)
     try {
       await submitApproval(sessionId, approval.request_id, optionId, optionId === 'deny' ? feedback.trim().slice(0, 4096) || undefined : undefined)
-      onResolved()
-    } catch (e) { setError(e instanceof Error ? e.message : '提交失败，请重试') }
-    finally { submittingRef.current = false; setSubmitting(false) }
+      if (activeRef.current) onResolved()
+    } catch (e) {
+      if (activeRef.current) setError(e instanceof Error ? e.message : '提交失败，请重试')
+    } finally {
+      if (activeRef.current) { submittingRef.current = false; setSubmitting(false) }
+    }
   }
   // 初始焦点避开授权按钮，关闭后恢复原焦点。
   useEffect(() => {
@@ -88,7 +98,8 @@ export function ApprovalModal({ sessionId, approval, onResolved }: ApprovalModal
         </div>
         <label className="mt-5 block text-[12px] font-medium text-zinc-600" htmlFor="approval-feedback">拒绝理由 <span className="font-normal">（可选）</span></label>
         <textarea id="approval-feedback" value={feedback} onChange={(e) => setFeedback(e.target.value)} maxLength={4096} rows={2} placeholder="说明需要调整的地方，将反馈给模型" className="mt-2 w-full resize-none rounded-xl border border-zinc-300 p-3 text-[13px] leading-6 text-zinc-700 placeholder:text-zinc-500 focus:border-accent-600" />
-        {error && <p role="alert" className="mt-3 text-[13px] text-red-700">{error}</p>}
+        {(error || stopError) && <p role="alert" className="mt-3 text-[13px] text-red-700">{error || stopError}</p>}
+        <button type="button" onClick={onStop} className="mt-3 rounded border border-zinc-300 px-3 py-1 text-[12px] text-zinc-700">停止任务</button>
         <p role="status" className="mt-3 text-[11px] text-zinc-500">{submitting ? '正在提交决定…' : '未在输入文字时，可按数字键选择对应选项'}</p>
       </div>
     </div>

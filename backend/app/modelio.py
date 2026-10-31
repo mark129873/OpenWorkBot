@@ -21,6 +21,7 @@ def record_llm_call(
     tool_names: list[str] | None = None,
     subtask_id: str | None = None,
     error: str | None = None,
+    stop_reason: str | None = None,
 ) -> None:
     try:
         record = {
@@ -39,6 +40,7 @@ def record_llm_call(
             "response": {
                 "text": response_text,
                 "tool_calls": tool_calls,
+                "stop_reason": stop_reason,
             },
             "usage": {
                 "input_tokens": usage.get("input_tokens", 0),
