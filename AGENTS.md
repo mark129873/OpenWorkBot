@@ -1,36 +1,44 @@
-# OpenWorkBot 开发约定
+# AGENTS.md
 
-## 定位
-
-基于 law2 已有前后端增量开发自主智能员工 Harness，不从零重建。
-产品愿景以 docs/prd.md 为准；RAG 作为 MCP 外部能力，当前不展开其设计。
+OpenWorkBot, 目标打造类OpenAI Dots 的自主智能员工, 面向个人与企业提供主动执行, 多智能体协同, 长期记忆, 工作流自动化的AI原生产品, 构建可自主规划, 自动调用工具, 自主迭代的超级Agent舰队
 
 ## 开始工作
+1. 读取 scripts_mini_harness/mini_harness.py, 作为此项目harness思想的参考
+2. 阅读 docs/prd.md了解功能需求与用户侧交互
+3. 阅读 docs/architecture.md，了解项目架构
+4. 读取 docs/progress.md，了解最新会话进度日志
+5. 读取 docs/feature_list.json，确认开发进度
+6. 读取 docs/reliability.md，了解运行与验证要求
 
-1. 确认工作目录与 Git 状态，保留用户已有改动。
-2. 阅读 docs/prd.md、docs/PRODUCT.md、docs/ARCHITECTURE.md。
-3. 操作环境前阅读 docs/init.md 与 docs/RELIABILITY.md；文档中的命令不表示已经运行通过。
-4. 按用户明确范围工作，不自行扩展功能或恢复已删除内容。
+## 结束会话前：
+- 更新 docs/progress.md
+- 更新 docs/feature_list.json
+- 更新 docs/progress.md, 记录仍未解决的风险或 blocker
+- 在工作处于安全状态后，用简洁的中文提交
 
-## 保持精简
+## 工作规则
+- 新增功能时，请**先更新对应文档，再编写代码**。
+- 优先依赖仓库里的持久化文件，而不是聊天记录。
+- 除非为了消除当前 blocker 的窄范围修复，否则不要扩大到其他功能。
+- 数据库不做 schema 迁移（本项目仍在开发阶段, 不涉及到数据库的保留以及历史数据迁移）：改 models.py 表结构后，删除 backend/data/ 重启即全新建表；测试一律从空库开始（pytest 已每测自动清空 .tmp-data，浏览器手测/E2E 前先清空 backend/data/）。
+- 如果涉及到修改docs目录下的文件以及AGENTS.md，要求内容非常简洁, 但不失信息
 
-- 不保留 mini 参考项目、旧进度流水账、旧测试和历史交付报告。
-- 不新增重复文档与归档；已知问题集中在 ARCHITECTURE.md。
-- 不复制 .git、密钥、运行数据、依赖、缓存、日志或外部参考仓库。
-- 保留现有业务能力；清理文档不代表重构业务代码。
-- 中文注释简洁解释目的与原因；避免无必要的复杂结构。
+## 代码规范
+- 代码要求简洁精炼, 避免使用复杂的语法或模式, 保持代码结构清晰
 
-## 验证与数据
+## 项目目录
+一级目录:
+- backend/ — 后端代码
+- frontend/ — 前端代码
+- docs/ — 项目文档
+- scripts_mini_harness/ — harness 思想的参考实现: mini_harness.py
+- tmp/ — 临时文件目录(不入库, 可随时清空)
 
-- 当前无测试套件，不继承 law2 历史通过记录，不宣称未运行的检查通过。
-- 模型调用、收费任务、安装与发布遵守用户授权；未获批准不执行。
-- 原项目没有数据库迁移机制；不要因改动表结构自动删除用户数据。
-- 文件路径校验不是系统沙箱，会话回放不是持久任务恢复。
-- 未实现、未验证与已验证能力必须区分。
+项目开发参考目录(.开头):
+- .github_codex/ — OpenAI Codex CLI 源码仓库克隆, agent harness工程实现参考: https://github.com/openai/codex
+- .github_ZCode/ — ZCode 源码仓库克隆, agent harness工程实现参考: https://github.com/zai-org/ZCode
+- .github_learn-claude-code/ — learn-claude-code 教程仓库克隆, agent harness思想参考: https://github.com/shareAI-lab/learn-claude-code
 
-## 文档与发布
 
-- README.md 由用户维护，未经明确授权不修改。
-- 行为变化同步 PRODUCT.md，实现变化同步 ARCHITECTURE.md，环境变化同步 init.md。
-- 收尾核对 docs/clean-state-checklist.md，向用户报告改动及未完成项。
-- 提交和 push 按用户指令执行，不自动发布。
+## 特别规定
+- README.md 暂不修改
