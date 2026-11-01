@@ -5,6 +5,7 @@
 .github_codex/
 .github_ZCode/
 .github_learn-claude-code/
+.github_hermes-agent/
 
 # 密钥
 .env
