@@ -292,7 +292,9 @@ class Runtime:
                         "需要读取文件、搜索、研究、分析、编辑或执行其他实际工作的独立新要求必须使用 create，"
                         "即使只读、禁止命令或禁止修改也必须分配给后台助手；instruction 要保留用户的限制。"
                         "只有无需任何实际操作的常识和简单问答才使用 chat。"
-                        "对每项独立要求分别输出意图；变更或停止要列出受影响的审批 ID，不确定时标记 unclear。\n"
+                        "对每项独立要求分别输出意图；禁止任务中的某项操作属于 update，只有明确停止整个任务才用 stop。"
+                        "变更或停止必须结合审批的文件路径或命令，列出受影响的审批 ID；确认没有受影响审批时返回空数组，"
+                        "无法判断时标记 unclear。\n"
                         f"任务：{json.dumps(tasks, ensure_ascii=False)}\n审批：{json.dumps(approvals, ensure_ascii=False)}")
         request = {"message_id": event["message_id"], "user_seq": event["user_seq"], "text": event["text"],
                    "recent_messages": [{"role": m["role"], "text": m["text"]} for m in recent]}
@@ -311,13 +313,13 @@ class Runtime:
         route = reply.tool_uses[0].get("input") or {}
         self._validate_route(route, event)
         known_approvals = {a["request_id"] for a in approvals}
-        summary = await self.change(lambda session: self._apply_route(session, event, route, known_approvals))
+        result = await self.change(lambda session: self._apply_route(session, event, route, known_approvals))
         with db.new_session() as session:
             later_pending = any(row.get("event_type") == "message" and row["status"] == "pending"
                                 and row["user_seq"] > event["user_seq"] for row in store.records(session, "user_event"))
-        if later_pending:
+        if later_pending or not result["needs_reply"]:
             return
-        await self._dialog(f"系统已处理用户消息：{summary}", source_seq=event["user_seq"])
+        await self._dialog(f"系统已处理用户消息：{result['summary']}", source_seq=event["user_seq"])
 
     @staticmethod
     def _validate_route(route: dict, event: dict) -> None:
@@ -336,12 +338,13 @@ class Runtime:
                     or (intent.get("type") in {"create", "update"} and not intent["instruction"].strip())):
                 raise ValueError("任务意图无效")
 
-    def _apply_route(self, session, event: dict, route: dict, known_approvals: set[str] | None = None) -> str:
+    def _apply_route(self, session, event: dict, route: dict, known_approvals: set[str] | None = None) -> dict:
         row = store.get(session, f"input:{event['id']}")
         if not row or row["status"] != "pending":
-            return "消息已处理"
+            return {"summary": "消息已处理", "needs_reply": False}
         store.append_history(session, "main", "user", event["text"], key=f"input:{event['id']}")
         notes = []
+        needs_reply = bool(route["needs_clarification"])
         decisions = [d for d in store.records(session, "user_event")
                      if d.get("event_type") == "approval" and d["user_seq"] > event["user_seq"]]
         later_messages = [m for m in store.records(session, "user_event")
@@ -350,33 +353,49 @@ class Runtime:
             kind = intent["type"]
             task_id = intent.get("task_id", "")
             if kind == "create":
+                needs_reply = True
                 task = self.create_task(session, intent["instruction"], event["user_seq"],
                                         key=f"route:{event['id']}:{index}")
                 notes.append(f"已创建任务 {task['title']}（{task['id']}）")
             elif kind in {"update", "stop"}:
                 task = store.get(session, f"task:{task_id}")
-                if not task or task["status"] in _TERMINAL:
+                if not task:
+                    needs_reply = True
                     notes.append("任务不存在或已结束，请澄清")
                     continue
                 newer = [d for d in decisions if d["task_id"] == task_id]
                 affected = intent.get("approval_ids", [])
                 if any(not (approval := store.get(session, f"approval:{request_id}")) or approval["task_id"] != task_id
                        for request_id in affected):
+                    needs_reply = True
                     notes.append(f"任务 {task['title']} 的审批关联无效，请澄清")
                     continue
-                conflict = (kind == "stop" or not affected or any(d["id"] in affected for d in newer)
-                            or any(d["id"] not in (known_approvals or set()) for d in newer))
-                if newer and conflict:
-                    notes.append(f"任务 {task['title']} 有更新的审批决定，请结合当前状态确认冲突后再调整")
+                relevant = (newer if kind == "stop" and not affected
+                            else [decision for decision in newer if decision["id"] in affected])
+                if relevant:
+                    latest = max(relevant, key=lambda decision: decision["user_seq"])
+                    choice = latest.get("option_id")
+                    label = "批准" if choice in {"allowOnce", "allowSession"} else "拒绝" if choice == "deny" else "审批"
+                    text = f"任务「{task['title']}」：你随后已{label}该操作，我会以较新的决定为准。"
+                    store.add_visible(session, "assistant", text, message_id=f"ack:{event['id']}:{index}")
+                    store.append_history(session, "main", "assistant", text, key=f"ack:{event['id']}:{index}")
+                    notes.append(f"任务 {task['title']} 有更新的审批决定，已告知用户以较新决定为准")
                     continue
-                if later_messages:
+                uncertain = bool(newer and (kind == "stop" or "approval_ids" not in intent
+                                 or any(d["id"] not in (known_approvals or set()) for d in newer)))
+                if task["status"] in _TERMINAL and not uncertain and not later_messages:
+                    needs_reply = True
+                    notes.append("任务已结束，请判断是否需要继续")
+                    continue
+                needs_reply = True
+                if later_messages or uncertain:
                     identity = f"reconcile:{event['id']}:{index}"
                     store.put(session, identity, {"type": "reconcile", "id": identity, "event_id": event["id"],
                               "intent": intent, "task_id": task_id, "status": "pending"})
                     agent_bus.send(session, source="runtime", target="main", task_id=task_id,
-                                   content=f"任务【{task['title']}】的较早修改请求需结合后续消息重新判断。",
+                                   content=f"任务【{task['title']}】的较早修改请求需结合后续消息或审批重新判断。",
                                    kind="reconcile", message_id=identity)
-                    notes.append(f"任务 {task['title']} 有更新消息，需重新判断")
+                    notes.append(f"任务 {task['title']} 有更新消息或审批，需重新判断")
                     continue
                 if kind == "stop":
                     task["stop_requested"] = True
@@ -388,10 +407,13 @@ class Runtime:
                     self._send_update(session, task, intent["instruction"], f"update:{event['id']}:{index}")
                 notes.append(f"已{('停止' if kind == 'stop' else '更新')}任务 {task['title']}")
             elif kind == "unclear" or route["needs_clarification"]:
+                needs_reply = True
                 notes.append("需要向用户澄清")
+            else:
+                needs_reply = True
         row["status"] = "processed"
         store.put(session, f"input:{event['id']}", row)
-        return "；".join(notes) or "继续对话"
+        return {"summary": "；".join(notes) or "继续对话", "needs_reply": needs_reply}
 
     def create_task(self, session, goal: str, order: int, *, key: str | None = None, title: str | None = None) -> dict:
         if not isinstance(goal, str) or not goal.strip():
@@ -445,6 +467,7 @@ class Runtime:
             task = store.get(session, f"task:{pending['task_id']}")
             latest_seq = store.get(session, "meta")["user_seq"]
             later = [item for item in store.records(session, "user_event") if item["user_seq"] > event["user_seq"]]
+            approvals = [item for item in store.records(session, "approval") if item.get("task_id") == pending["task_id"]]
         if not task or task["status"] in _TERMINAL:
             if task:
                 await self._dialog(f"任务【{task['title']}】已结束，但此前收到修改要求：{pending['intent']['instruction']}。"
@@ -460,7 +483,7 @@ class Runtime:
                   "如果较早要求与较新决定冲突，返回 chat 表示不再执行；无冲突则保留原意图；"
                   "无法判断时返回 unclear 并要求澄清。只能针对给定任务，不能创建新任务。仅调用 route_input。")
         request = {"message_id": event["message_id"], "user_seq": event["user_seq"], "original_intent": pending["intent"],
-                   "task": task, "later_user_events": later}
+                   "task": task, "later_user_events": later, "approvals": approvals}
         messages = [{"role": "user", "content": json.dumps(request, ensure_ascii=False)}]
         deps = SimpleNamespace(client=self.client, recorder=SimpleNamespace(session_id="main", turn_id=report["id"]))
         with record_model_step(deps, prompt, messages, [ROUTE]) as reply:
@@ -491,8 +514,14 @@ class Runtime:
                 elif intent["type"] in {"update", "stop"}:
                     decisions = [d for d in later if d.get("event_type") == "approval" and d.get("task_id") == current["id"]]
                     affected = intent.get("approval_ids", [])
-                    if decisions and (intent["type"] == "stop" or not affected or any(d["id"] in affected for d in decisions)):
+                    relevant = (decisions if intent["type"] == "stop" and not affected
+                                else [d for d in decisions if d["id"] in affected])
+                    if relevant:
                         result = "较早要求与更新的审批冲突，未执行该要求"
+                    elif decisions and intent["type"] == "stop":
+                        result = "停止整个任务可能影响更新的其他审批，请向用户简短确认"
+                    elif decisions and "approval_ids" not in intent:
+                        result = "无法确定较早要求与更新审批是否冲突，请向用户简短确认"
                     else:
                         args = {"task_id": current["id"], "instruction": intent["instruction"]}
                         result = self._main_action(session, f"task_{intent['type']}", args, None, report["id"])
@@ -508,6 +537,7 @@ class Runtime:
     async def _dialog(self, note: str, *, source_seq: int | None = None, required_review: str | None = None,
                       review_report_id: str | None = None) -> None:
         generation = self.generation
+        unavailable_attempts = 0
         for step in range(40):
             if generation != self.generation:
                 raise asyncio.CancelledError
@@ -517,15 +547,16 @@ class Runtime:
             messages.append({"role": "user", "content": f"{note}\n当前任务：{json.dumps(tasks, ensure_ascii=False)}"})
             deps = SimpleNamespace(client=self.client, recorder=SimpleNamespace(session_id="main", turn_id=new_id()))
             system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
+            dialog_tools = [tool for tool in MAIN_TOOLS if required_review or tool["name"] != "task_review"] + SHARED_TOOLS
             message_id = None
             text = ""
             saved_length = 0
             last_update = 0.0
             try:
-                with record_model_step(deps, system_prompt, messages, MAIN_TOOLS + SHARED_TOOLS) as reply:
+                with record_model_step(deps, system_prompt, messages, dialog_tools) as reply:
                     choice = {"tool_choice": {"type": "tool", "name": "task_review"}} if required_review and step == 0 else {}
                     async for event in self.client.stream(system=system_prompt, messages=messages,
-                                                          tools=MAIN_TOOLS + SHARED_TOOLS, **choice):
+                                                          tools=dialog_tools, **choice):
                         if generation != self.generation:
                             raise asyncio.CancelledError
                         reply.accept(event)
@@ -547,6 +578,27 @@ class Runtime:
                     if (len(reply.tool_uses) != 1 or reply.tool_uses[0].get("name") != "task_review"
                             or (reply.tool_uses[0].get("input") or {}).get("task_id") != required_review):
                         raise ValueError("模型没有对指定任务作出有效判断")
+                if any(call.get("name") not in {tool["name"] for tool in dialog_tools} for call in reply.tool_uses):
+                    unavailable_attempts += 1
+                    blocks = reply.assistant_blocks()
+                    results = [{"type": "tool_result", "tool_use_id": call["id"],
+                                "content": "Error: 当前工具不可用，本步未执行。", "is_error": True}
+                               for call in reply.tool_uses]
+                    def unavailable(session):
+                        if message_id:
+                            store.update_visible(session, message_id, text=text, status="interrupted")
+                        store.append_history(session, "main", "assistant", blocks)
+                        store.append_history(session, "main", "user", results)
+                    await self.change(unavailable)
+                    if unavailable_attempts >= 2:
+                        def acknowledge(session):
+                            text = "这条回复暂时无法完成，请重试。"
+                            store.add_visible(session, "assistant", text, status="failed")
+                            store.append_history(session, "main", "assistant", text)
+                        await self.change(acknowledge)
+                        return
+                    note = "刚才的工具调用没有执行，请直接回复用户；任务结果由系统送达后再判断。"
+                    continue
                 def update_usage(session):
                     meta = store.get(session, "meta")
                     meta["context_usage"] = {"used": reply.usage.get("input_tokens", 0), "window": settings.context_window}

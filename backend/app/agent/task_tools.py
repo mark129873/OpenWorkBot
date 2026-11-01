@@ -8,7 +8,8 @@ ROUTE = _schema("route_input", "判断用户消息与任务的关系。", {
         "type": {"type": "string", "enum": ["chat", "create", "query", "update", "stop", "unclear"],
                  "description": "create 用于需要读取、搜索、分析或其他实际工作的独立新任务；chat 仅用于无需操作的简单问答。"},
         "task_id": {"type": "string"}, "instruction": {"type": "string"},
-        "approval_ids": {"type": "array", "items": {"type": "string"}},
+        "approval_ids": {"type": "array", "items": {"type": "string"},
+                         "description": "受本意图影响的审批 ID，包括已决定的审批；确认无影响时为空数组。"},
     }, "required": ["type", "instruction"]}},
     "needs_clarification": {"type": "boolean"},
 }, ["message_id", "user_seq", "intents", "needs_clarification"])

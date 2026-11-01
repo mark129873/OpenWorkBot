@@ -133,9 +133,88 @@ def test_newer_approval_is_not_overridden_by_older_message(isolated):
             {"type": "create", "instruction": "整理清单"}]}
         notes = runtime._apply_route(session, event, route)
         session.commit()
-        assert "更新的审批决定" in notes
+        assert "更新的审批决定" in notes["summary"] and notes["needs_reply"]
         assert not store.get(session, f"task:{task['id']}")["stop_requested"]
         assert len(store.records(session, "task_state")) == 2
+
+
+@pytest.mark.parametrize("intent_type", ["update", "stop"])
+def test_approval_ack_uses_the_affected_operation(isolated, intent_type):
+    with db.new_session() as session:
+        store.initialize(session, isolated)
+        runtime = Runtime(client=FakeModel())
+        task = runtime.create_task(session, "两个操作", 1)
+        event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
+                 "text": "不要写入 A", "user_seq": 1, "status": "pending"}
+        store.put(session, "input:old", event)
+        for request_id, seq, option in [("a", 2, "allowOnce"), ("b", 3, "deny")]:
+            store.put(session, f"approval:{request_id}", {"type": "approval", "request_id": request_id,
+                      "task_id": task["id"], "status": "resolved", "option_id": option, "user_seq": seq})
+            store.put(session, f"decision:{request_id}", {"type": "user_event", "event_type": "approval",
+                      "id": request_id, "task_id": task["id"], "user_seq": seq, "option_id": option})
+        runtime._apply_route(session, event, {"needs_clarification": False, "intents": [{
+            "type": intent_type, "task_id": task["id"], "instruction": "不要写入 A", "approval_ids": ["a"]}]}, {"a", "b"})
+        session.commit()
+        assert "随后已批准" in store.visible(session)[-1]["text"]
+        assert not store.records(session, "agent_message", context_id=task["context_id"])
+
+
+def test_uncertain_new_approval_is_rejudged_instead_of_dropping_update(isolated):
+    with db.new_session() as session:
+        store.initialize(session, isolated)
+        runtime = Runtime(client=FakeModel())
+        task = runtime.create_task(session, "写入并整理", 1)
+        event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
+                 "text": "补充整理说明", "user_seq": 1, "status": "pending"}
+        store.put(session, "input:old", event)
+        store.put(session, "approval:a", {"type": "approval", "request_id": "a", "task_id": task["id"],
+                  "status": "resolved", "option_id": "allowOnce", "user_seq": 2})
+        store.put(session, "decision:a", {"type": "user_event", "event_type": "approval", "id": "a",
+                  "task_id": task["id"], "user_seq": 2, "option_id": "allowOnce"})
+        runtime._apply_route(session, event, {"needs_clarification": False, "intents": [{
+            "type": "update", "task_id": task["id"], "instruction": "补充整理说明"}]})
+        session.commit()
+        assert store.records(session, "agent_message", context_id="main")[0]["kind"] == "reconcile"
+        assert not store.records(session, "agent_message", context_id=task["context_id"])
+
+
+@pytest.mark.parametrize("task_status", ["running", "completed"])
+def test_older_stop_acknowledges_newer_approval_without_guessing(isolated, task_status):
+    class StaleStopModel:
+        model = "fake"
+
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            assert tool_choice and tool_choice["name"] == "route_input"
+            request = json.loads(messages[-1]["content"])
+            yield {"type": "tool_use", "id": "route", "name": "route_input", "input": {
+                "message_id": request["message_id"], "user_seq": request["user_seq"],
+                "intents": [{"type": "stop", "task_id": task["id"], "instruction": "不要写入",
+                             "approval_ids": ["approval"]}], "needs_clarification": False}}
+
+    async def run():
+        nonlocal task
+        runtime = Runtime(client=StaleStopModel())
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            task = runtime.create_task(session, "写入测试文件", 1)
+            task["status"] = task_status
+            store.put(session, f"task:{task['id']}", task)
+            store.add_visible(session, "user", "不要写入", message_id="user:old")
+            event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
+                     "text": "不要写入", "user_seq": 1, "status": "pending"}
+            store.put(session, "input:old", event)
+            store.put(session, "approval:approval", {"type": "approval", "request_id": "approval",
+                      "task_id": task["id"], "status": "resolved", "option_id": "allowOnce", "user_seq": 2})
+            store.put(session, "decision:approval", {"type": "user_event", "event_type": "approval",
+                      "id": "approval", "task_id": task["id"], "user_seq": 2, "option_id": "allowOnce"})
+            session.commit()
+        await runtime._input(event)
+        with db.new_session() as session:
+            assert not store.get(session, f"task:{task['id']}")["stop_requested"]
+            assert store.get(session, "input:old")["status"] == "processed"
+            assert "随后已批准" in store.visible(session)[-1]["text"]
+    task = None
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize("conflict", [False, True])
@@ -200,6 +279,83 @@ def test_review_requires_delivered_result(isolated):
         agent_bus.deliver(session, report)
         assert "completed" in runtime._main_action(session, "task_review", args, None, "proper", "review")
         session.commit()
+
+
+def test_progress_cannot_offer_review_until_final_report(isolated):
+    from app.agent import agent_bus
+
+    class ProgressModel(FakeModel):
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            if not tool_choice and "旧轮或已判断" in messages[-1]["content"]:
+                assert "task_review" not in {tool["name"] for tool in tools}
+                yield {"type": "text_delta", "text": "进展已收到。"}
+                return
+            async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
+                yield event
+
+    async def run():
+        runtime = Runtime(client=ProgressModel())
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            task = runtime.create_task(session, "并行任务", 1)
+            task.update(status="reviewing", run_id="run")
+            store.put(session, f"task:{task['id']}", task)
+            agent_bus.send(session, source=task["context_id"], target="main", task_id=task["id"],
+                           content="先前进展", kind="progress", message_id="progress", run_id="run")
+            agent_bus.send(session, source=task["context_id"], target="main", task_id=task["id"],
+                           content="最终结果", kind="review", message_id="final", run_id="run")
+            session.commit()
+            progress = store.get(session, "bus:progress")
+            final = store.get(session, "bus:final")
+        await runtime._report(progress)
+        with db.new_session() as session:
+            assert store.get(session, f"task:{task['id']}")["status"] == "reviewing"
+        await runtime._report(final)
+        with db.new_session() as session:
+            assert store.get(session, f"task:{task['id']}")["status"] == "completed"
+            assert store.get(session, "bus:progress")["delivery"] == "processed"
+            assert store.get(session, "bus:final")["delivery"] == "processed"
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("repeat", [False, True])
+def test_unavailable_tool_is_not_executed_or_retried_forever(isolated, repeat):
+    class ConfusedModel:
+        model = "fake"
+
+        def __init__(self):
+            self.calls = 0
+
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            assert "task_review" not in {tool["name"] for tool in tools}
+            self.calls += 1
+            if self.calls == 1 or repeat:
+                yield {"type": "tool_use", "id": f"bad-{self.calls}", "name": "task_review",
+                       "input": {"task_id": task["id"], "decision": "complete"}}
+            else:
+                yield {"type": "text_delta", "text": "我会等待最终报告。"}
+
+    async def run():
+        nonlocal task
+        model = ConfusedModel()
+        runtime = Runtime(client=model)
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            task = runtime.create_task(session, "处理任务", 1)
+            task["status"] = "reviewing"
+            store.put(session, f"task:{task['id']}", task)
+            session.commit()
+        await runtime._dialog("请根据进展回复用户。")
+        with db.new_session() as session:
+            assert store.get(session, f"task:{task['id']}")["status"] == "reviewing"
+            assert not store.records(session, "agent_action")
+            assert store.visible(session)[-1]["status"] == ("failed" if repeat else "completed")
+            history = store.history(session, "main")
+            assert history[0]["content"][0]["name"] == "task_review"
+            assert history[1]["content"][0]["is_error"]
+        assert model.calls == 2
+    task = None
+    asyncio.run(run())
 
 
 def test_old_run_report_cannot_review_new_run(isolated):

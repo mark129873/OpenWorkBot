@@ -17,6 +17,7 @@ from app.models import new_id
 from app.sessions import approvals, chat_store as store, session_permissions
 
 _PROMPT = """你是后台工作助手，专注完成给定任务。独立保存工作上下文；先读后改，工具执行失败不能当作成功。
+必须遵守用户明确限定的操作和顺序；禁止的操作即使只读、用于定位或检查也不能执行。用户指定具体命令且禁止其他命令时，不得追加或替换命令；不确定时询问主助手。
 关键进展或需要用户确认的问题使用 task_report 告诉主助手。完成后简短汇报结果、验证及未解决的问题。
 收到用户修改、停止或同伴消息时按最新要求调整；不要冒充主助手或其他助手。"""
 
