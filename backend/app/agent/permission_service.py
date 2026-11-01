@@ -88,7 +88,7 @@ def hard_deny_reason(tool_name: str, tool_input: dict) -> str | None:
             if pattern in command:
                 return f"命令命中绝对禁止清单：{pattern.strip()}"
         return None
-    if tool_name in ("write_file", "edit_file", "delete_file", "read_file"):
+    if tool_name in ("write_file", "edit_file", "delete_file", "read_file", "rag_ingest"):
         try:
             safe_path(str(tool_input.get("path", "")))
         except ValueError as exc:
@@ -101,7 +101,7 @@ def hard_deny_reason(tool_name: str, tool_input: dict) -> str | None:
     return None
 
 
-_SUBJECT_KEYS = ("command", "url", "file_path", "path", "pattern")
+_SUBJECT_KEYS = ("command", "url", "file_path", "path", "pattern", "document_id")
 
 
 def _subject(tool_input: dict) -> str:
@@ -172,6 +172,9 @@ def check_permission(
     rule = match_rule(rules, "allow", tool_name, tool_input)
     if rule:
         return _allow("rule.allow", f"命中允许规则：{rule.get('ruleContent') or rule.get('toolName')}")
+
+    if tool_name in {"rag_search", "rag_list", "rag_ingest", "rag_remove"}:
+        return _allow("mode.knowledge", "知识库操作按用户明确要求执行")
 
     if mode == "edit":
         if cap["permission"] == "edit" and cap["sideEffectScope"] == "workspace":

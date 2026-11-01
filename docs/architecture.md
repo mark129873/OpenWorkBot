@@ -1,6 +1,6 @@
 # architecture.md 架构与技术设计
 
-本文记录已批准并实现的主聊天与多助手架构、技术设计和运行边界。
+本文记录主聊天、多助手与已批准的 RAG 技术设计和运行边界；实现状态见进度记录。
 
 ## 1. 当前基线
 
@@ -17,7 +17,7 @@ React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最�
 - 用户可随时发新消息，追问、修改、停止或提出其他任务。新消息仅打断主助手当前回复，已输出文字保存并标记；Worker 继续运行。后台报告等新消息处理后，按实际发送顺序追加。
 - 设置中的“删除”需确认；先停止任务并归档聊天和已保存结果，再新建空白助手。保留工作区、项目规则、模型配置及原模型日志；执行模式恢复 build，临时授权清空。
 - 主对话与各任务上下文独立保存和压缩，不将所有 Worker 工作细节塞进主对话。
-- 只使用单个 FastAPI 进程、`asyncio`、现有模型、SQLite 与 SSE。最多三个 Worker 执行槽位；不引入 Redis、Celery、LangGraph、任务表、Kanban 或长期记忆模块。现有 todo 不负责调度。
+- Bot 使用单个 FastAPI 进程、`asyncio`、现有模型、SQLite 与 SSE。最多三个 Worker 执行槽位；Bot 不引入 Redis、Celery、LangGraph、任务表、Kanban 或长期记忆模块。独立 RAG 服务可使用 LangGraph。
 
 ## 3. 目标架构与代码结构
 
@@ -51,7 +51,8 @@ React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最�
 | 接口 | 契约 |
 | --- | --- |
 | `GET /api/chat` | 返回 `{revision, assistant_id, reset, messages, approvals, permission_mode, context_usage}`。 |
-| `POST /api/chat/messages` | 接收 `{assistant_id, client_message_id, text, permission_mode?}`；非空校验，保存后返回 202，不等待模型。相同请求幂等；复用 ID 参数不同时或该消息已被删除中断时返回 409，后者需用新 ID 重发。 |
+| `POST /api/chat/messages` | 接收 `{assistant_id, client_message_id, text?, attachments?, permission_mode?}`；正文和附件至少有一项，保存后返回 202，不等待模型。相同请求幂等；复用 ID 参数不同时或该消息已被删除中断时返回 409。 |
+| `POST /api/chat/uploads` | 每次上传一个文件；前端支持多文件，全部成功后发送消息。单文件最多 100 MiB，写入临时文件后原子替换工作区 `uploads/` 中的同名文件；助手 ID、上传 ID 和文件结果持久化，重复请求不得覆盖更新后的文件。 |
 | `GET /api/chat/events` | SSE 先推送一致快照，再推送 `{revision, type, data}`，事件包括消息、审批和用量。 |
 | `POST /api/chat/approvals/{request_id}` | 接收 `assistant_id`、`option_id` 和可选拒绝理由；失效请求或不同决定重复提交返回冲突。 |
 | `POST /api/chat/reset` | 接收 `{assistant_id, reset_id, confirm_stopped?}`，幂等受理删除及必要的重试。 |
@@ -149,3 +150,13 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 - [DeepSeek `6337fc823ce`](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/6337fc823ce20251c8de8085948165c81aaa701e/src/app/effects.ts)：参考 Router / Worker 分工、待处理记录和失败重试；不照搬其授权或额外槽位。
 - [Anthropic 工具选择](https://platform.claude.com/docs/en/api/http/messages)：指定 `tool_choice` 可要求调用特定工具；[部分思考模式存在限制](https://platform.claude.com/docs/en/build-with-claude/thinking)，当前客户端默认关闭该模式。
 - [DeepSeek 接口](https://api-docs.deepseek.com/guides/anthropic_api/)与 [OpenAI GPT-6 工具调用](https://developers.openai.com/api/docs/guides/function-calling)：前者非思考模式支持指定工具，后者通过 Responses API 接入。
+
+## 11. 受控 Agentic RAG
+
+- `rag/` 是独立 Python 环境及 stdio MCP 服务，仅 Worker 注册查询、导入、列表和移出；运行时另用内部取消接口。主助手将知识库请求交后台，不阻塞普通聊天；单纯问答可直接返回 Worker 答案。入库和移出核对用户原话中的明确指令，硬拒及显式权限规则仍有效；不确定的表达可能需重述。
+- 检索图为检索计划 → 查询生成 → 混合检索与重排 → 证据评估 → 生成答案；支持多查询并发，证据不足最多补检一轮，只评估证据，不检查生成后的答案。答案带来源，无法可靠检索时报告错误。
+- 资料支持可提取文本的 PDF、TXT、Markdown，单文件最多 100 MiB；按 500 字符切分、重叠 50 字符，每批最多 32 块生成本机 Embedding；Milvus Cloud 稠密/BM25 混合检索并本机重排，规划、评估与回答复用 Bot 模型配置。
+- RAG 元数据独立保存在 `rag/data/`；同一工作区文件重新入库时先写新版本，成功后切换可检索版本，失败保留旧版。覆盖工作区文件不自动更新索引；移出仅删除知识库内容，删除助手保留知识库。
+- 用户自行删除 law 旧 Milvus 集合；新服务不得自动清空或接管未识别的集合。测试仅用独立临时工作区、空库和隔离集合。上传逐项反馈，任一文件失败时保留草稿、不发送消息；纯文件消息无需正文。
+- 首次执行 `uv sync --project rag`，参考 `rag/.env.example` 配置 law 的 Milvus 连接、本机模型路径及设备；安装并将 `llama` 加入 PATH。根启动脚本自动启动 Embedding / 重排服务，服务故障不停止 Bot。结果未知的操作需用户明确要求重试；已开始的云端请求可能无法撤回。
+- RAG 和模型不记录密钥；现有模型快照可能包含检索内容。无独立知识库页面、通用 MCP 管理或 OCR；证据评估及回答仍可能出错，生成后不再校验。中断或云端清理失败可能留下不可检索的旧分块，暂不自动清理。

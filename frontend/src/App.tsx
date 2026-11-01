@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { ChatTeardropText, GearSix, ShieldCheck, Trash } from '@phosphor-icons/react'
 
-import { ApiError, cancelAssistantReset, decideChatApproval, getChat, resetAssistant, sendChatMessage, type ChatApproval, type ChatSnapshot, type ExecutionDraft } from './api/client'
+import { ApiError, cancelAssistantReset, decideChatApproval, getChat, resetAssistant, sendChatMessage, uploadChatFile, type ChatApproval, type ChatSnapshot, type ExecutionDraft } from './api/client'
 import { Composer } from './components/Composer'
 import { MarkdownWithCopy, UserBubble } from './components/MessageItem'
 import { TokenBadge } from './components/TokenBadge'
@@ -69,14 +69,33 @@ export default function App() {
     bottom.current?.scrollIntoView({ behavior: reduced ? 'instant' : 'smooth', block: 'end' })
   }, [chat?.messages, chat?.approvals])
 
-  const send = (text: string, execution: ExecutionDraft, onAccepted?: () => void) => {
+  const send = (text: string, execution: ExecutionDraft, onAccepted?: (remaining?: File[]) => void, files: File[] = []) => {
     if (!chat || chat.reset || resetBusy) return
     const assistantId = chat.assistant_id
-    const key = JSON.stringify([assistantId, text, execution.mode])
+    const key = JSON.stringify([assistantId, text, execution.mode, files.map((f) => [f.name, f.size, f.lastModified])])
     if (sending.current.has(key)) return
     sending.current.add(key)
     const id = retryIds.current.get(key) ?? crypto.randomUUID()
-    void enqueue(() => sendChatMessage(assistantId, id, text, execution.mode)).then(() => {
+    const submit = async () => {
+      const uploaded = new Map<string, string>()
+      const errors: string[] = []
+      let status = 0
+      for (const [index, file] of files.entries()) {
+        try {
+          const result = await uploadChatFile(assistantId, `${id}-${index}`, file)
+          uploaded.set(result.path, result.upload_id)
+        } catch (e) {
+          if (e instanceof ApiError) status = e.status
+          errors.push(`${file.name}：${e instanceof Error ? e.message : '上传失败'}`)
+        }
+      }
+      if (errors.length) {
+        const message = `文件上传失败，请重试或移除后再发送：${errors.join('；')}`
+        throw status ? new ApiError(status, message) : new Error(message)
+      }
+      await enqueue(() => sendChatMessage(assistantId, id, text, execution.mode, [...uploaded.values()]))
+    }
+    void submit().then(() => {
       retryIds.current.delete(key)
       setError(null)
       if (previousAssistant.current === assistantId) onAccepted?.()
@@ -152,7 +171,7 @@ export default function App() {
                     decide={(option, feedback) => enqueue(() => decideChatApproval(chat!.assistant_id, item.approval.request_id, option, feedback))
                       .catch((e: unknown) => { if (e instanceof ApiError && e.status === 409) void getChat().then(update).catch(() => {}); throw e })} />
                 : item.message.role === 'user'
-                ? <UserBubble key={item.message.id} text={item.message.text} />
+                ? <UserBubble key={item.message.id} text={item.message.text} attachments={item.message.attachments} />
                 : <div key={item.message.id} className="max-w-[88%]">
                     <p className="mb-2 text-[12px] font-medium text-zinc-500">助手</p>
                     <MarkdownWithCopy text={item.message.text} streaming={item.message.status === 'streaming'} />

@@ -90,10 +90,10 @@ def records(db, kind: str, *, context_id: str | None = None,
 
 
 def add_visible(db, role: str, text: str, *, message_id: str | None = None,
-                status: str = "completed") -> str:
+                status: str = "completed", attachments: list | None = None) -> str:
     message_id = message_id or new_id()
     db.add(Message(id=message_id, session_id="main", data=dump({
-        "role": role, "visible": True, "status": status,
+        "role": role, "visible": True, "status": status, "attachments": attachments or [],
         "order": get(db, "meta")["revision"] + 1,
     })))
     db.flush()
@@ -124,6 +124,7 @@ def visible(db) -> list[dict]:
         Message.session_id == "main", func.json_extract(Message.data, "$.visible") == 1,
         func.json_extract(Part.data, "$.type") == "text").order_by(Message.sequence, Message.id)).all()
     return [{"id": message.id, "role": read(message)["role"], "text": read(part)["text"],
+             "attachments": read(message).get("attachments", []),
              "status": read(message).get("status", "completed"), "time": message.time_created,
              "order": read(message).get("order", 0)}
             for message, part in rows]

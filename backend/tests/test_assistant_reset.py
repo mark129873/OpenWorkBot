@@ -215,6 +215,33 @@ def test_previously_recovered_unknown_operation_requires_confirmation_on_later_r
     asyncio.run(run())
 
 
+def test_reset_waits_for_unknown_result_created_while_stopping(isolated):
+    async def run():
+        runtime = Runtime()
+        runtime.client = None
+        await runtime.start()
+        release = asyncio.Event()
+        active = asyncio.create_task(release.wait())
+        runtime.active_tools.add(active)
+        try:
+            old_id = (await runtime.snapshot())["assistant_id"]
+            assert (await runtime.reset(old_id, "during-stop"))["status"] == "stopping"
+            await runtime.change(lambda session: store.put(session, "execution:later", {
+                "type": "tool_execution", "id": "later", "status": "completed", "result_unknown": True}))
+            release.set()
+            await active
+            await wait_for(lambda: (snapshot_now(runtime)["reset"] or {}).get("status") == "blocked")
+            assert (await runtime.snapshot())["assistant_id"] == old_id
+            assert (await runtime.snapshot())["reset"]["reason"] == "unknown"
+            await runtime.reset(old_id, "during-stop", confirm_stopped=True)
+            await wait_for(lambda: snapshot_now(runtime)["assistant_id"] != old_id)
+        finally:
+            release.set()
+            await asyncio.gather(active, return_exceptions=True)
+            await runtime.close()
+    asyncio.run(run())
+
+
 def test_timeout_can_retry_or_cancel_without_resuming_stopped_tasks(isolated, monkeypatch):
     monkeypatch.setattr(settings, "bash_timeout", -4)
     async def run():

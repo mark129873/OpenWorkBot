@@ -31,6 +31,11 @@ def _valid_offset(value) -> bool:
     return type(value) is int and 0 <= value < 2**63
 
 
+def _unknown_execution(execution: dict) -> bool:
+    return bool(execution.get("result_unknown") or
+                str(execution.get("output", "")).startswith("Error: 工具结果未知"))
+
+
 def _task_summary(task: dict) -> dict:
     goal = task.get("goal", "")
     files = task.get("files", [])
@@ -78,6 +83,7 @@ class Conflict(ValueError):
 
 class Runtime:
     def __init__(self, client=None) -> None:
+        self.data_dir = settings.data_dir
         self.client = client if client is not None else (build_client(settings) if not validate_llm_config(settings) else None)
         self.lock = asyncio.Lock()
         self.wake = asyncio.Event()
@@ -93,6 +99,9 @@ class Runtime:
         self.approval_events: dict[str, asyncio.Event] = {}
         self.stops: dict[str, asyncio.Event] = {}
         self.file_locks: dict[str, asyncio.Lock] = {}
+        self.upload_locks: dict[str, asyncio.Lock] = {}
+        from app.agent.rag_client import RagClient
+        self.rag = RagClient()
         self.generation = 0
         self.closing = False
 
@@ -160,6 +169,7 @@ class Runtime:
         await asyncio.gather(*pending, return_exceptions=True)
         if self.active_tools:
             await asyncio.wait(self.active_tools, timeout=max(1, settings.bash_timeout + 5))
+        await self.rag.close()
 
     async def run_tool(self, function, *args, **kwargs):
         task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
@@ -218,8 +228,11 @@ class Runtime:
         if assistant_id != meta["assistant_id"] or meta.get("reset"):
             raise Conflict("助手已更换或正在删除，请刷新后重试")
 
-    async def accept(self, client_id: str, text: str, mode: str | None, *, assistant_id: str) -> dict:
-        if not client_id or len(client_id) > 128 or not text.strip() or len(text) > 100000:
+    async def accept(self, client_id: str, text: str, mode: str | None, *, assistant_id: str,
+                     attachments: list[str] | None = None) -> dict:
+        attachments = attachments or []
+        if (not client_id or len(client_id) > 128 or (not text.strip() and not attachments)
+                or len(text) > 100000 or len(attachments) != len(set(attachments))):
             raise ValueError("消息 ID 或内容无效")
         if mode is not None and mode not in {"build", "edit", "yolo"}:
             raise ValueError("权限模式无效")
@@ -229,19 +242,31 @@ class Runtime:
             self._check_assistant(session, assistant_id)
             old = store.get(session, f"input:{client_id}")
             if old:
-                if old["text"] != text or old.get("permission_mode") != mode:
+                if (old.get("user_text", old["text"]) != text or old.get("permission_mode") != mode
+                        or old.get("attachments", []) != attachments):
                     raise Conflict("消息 ID 已用于不同内容")
                 if old["status"] == "cancelled":
                     raise Conflict("消息已因删除操作中断，请重新发送")
                 return {"message_id": message_id, "user_seq": old["user_seq"], "replayed": True}
+            uploaded = []
+            for upload_id in attachments:
+                item = store.get(session, f"upload:{upload_id}")
+                if not item or item.get("assistant_id") != assistant_id or item.get("status") != "completed":
+                    raise Conflict("上传文件无效或已失效")
+                latest = store.get(session, f"upload-target:{item['target_key']}")
+                if not latest or latest.get("id") != upload_id:
+                    raise Conflict("上传文件已被更新，请重新发送")
+                uploaded.append({"id": upload_id, "name": item["name"], "path": item["path"], "size": item["size"]})
             for reply in store.records(session, "main_reply"):
                 if reply["status"] == "pending":
                     reply["status"] = "superseded"
                     store.put(session, f"reply:{reply['id']}", reply)
             meta = store.bump(session, user_event=True)
-            store.add_visible(session, "user", text, message_id=message_id)
+            store.add_visible(session, "user", text, message_id=message_id, attachments=uploaded)
+            context = text + ("\n已上传至工作区：" + "、".join(item["path"] for item in uploaded) if uploaded else "")
             event = {"type": "user_event", "event_type": "message", "id": client_id,
-                     "message_id": message_id, "user_seq": meta["user_seq"], "text": text,
+                     "message_id": message_id, "user_seq": meta["user_seq"], "text": context,
+                     "user_text": text, "attachments": attachments,
                      "permission_mode": mode, "status": "pending"}
             store.put(session, f"input:{client_id}", event)
             if mode is not None:
@@ -313,10 +338,12 @@ class Runtime:
                     raise Conflict("已有删除请求正在处理")
                 if current.get("reason") == "unknown" and not confirm_stopped:
                     return current
+                if current.get("reason") == "unknown":
+                    current["confirmed_unknown_ids"] = [item["id"] for item in store.records(session, "tool_execution")
+                                                        if _unknown_execution(item)]
                 current.update(status="stopping", reason=None)
             else:
-                unknown = any(execution.get("result_unknown") or str(execution.get("output", "")).startswith("Error: 工具结果未知")
-                              for execution in store.records(session, "tool_execution"))
+                unknown = any(_unknown_execution(execution) for execution in store.records(session, "tool_execution"))
                 current = {"id": reset_id, "assistant_id": assistant_id, "status": "blocked" if unknown else "stopping"}
                 if unknown:
                     current["reason"] = "unknown"
@@ -399,6 +426,17 @@ class Runtime:
                 current = meta.get("reset")
                 if not current or current["id"] != reset_id or current["status"] != "stopping":
                     return
+                executions = store.records(session, "tool_execution")
+                for execution in executions:
+                    if execution["status"] == "started":
+                        execution.update(status="completed", result_unknown=True,
+                                         output="Error: 工具结果未知，可能已产生副作用；请先检查，不要自动重跑。")
+                        store.put(session, f"execution:{execution['id']}", execution)
+                confirmed = set(current.get("confirmed_unknown_ids", []))
+                if any(_unknown_execution(item) and item["id"] not in confirmed for item in executions):
+                    current.update(status="blocked", reason="unknown")
+                    store.put(session, "meta", meta)
+                    return
                 for task in store.records(session, "task_state"):
                     if task["status"] not in _TERMINAL:
                         task.update(status="stopped", stop_requested=True)
@@ -407,11 +445,6 @@ class Runtime:
                     if helper["status"] not in _TERMINAL:
                         helper["status"] = "stopped"
                         store.put(session, f"helper:{helper['context_id']}", helper)
-                for execution in store.records(session, "tool_execution"):
-                    if execution["status"] == "started":
-                        execution.update(status="completed", result_unknown=True,
-                                         output="Error: 工具结果未知，可能已产生副作用；请先检查，不要自动重跑。")
-                        store.put(session, f"execution:{execution['id']}", execution)
                 archive_id = store.archive(session)
                 new_assistant_id = new_id()
                 store.put(session, "meta", {"type": "meta", "revision": meta["revision"],
@@ -513,6 +546,15 @@ class Runtime:
         await self.change(save)
 
     async def _input(self, event: dict) -> None:
+        if event.get("attachments") and not event.get("user_text", "").strip():
+            def save_upload(session):
+                row = store.get(session, f"input:{event['id']}")
+                if row and row["status"] == "pending":
+                    store.append_history(session, "main", "user", event["text"], key=f"input:{event['id']}")
+                    row["status"] = "processed"
+                    store.put(session, f"input:{event['id']}", row)
+            await self.change(save_upload)
+            return
         if self.client is None:
             raise RuntimeError("模型配置不完整")
         generation = self.generation
@@ -524,6 +566,8 @@ class Runtime:
             current_order = next((m["order"] for m in visible if m["id"] == event["message_id"]), 0)
             recent = [m for m in visible if m["order"] <= current_order][-12:]
         route_prompt = (_PROMPT_PATH.read_text(encoding="utf-8") + "\n\n判断新消息与任务的关系；仅返回 route_input。"
+                        "知识库查询、入库、查看、移出一律使用 create 交给后台助手；用户未要求入库时不得入库。"
+                        "单纯的知识库问答标记 knowledge_question=true，包含其他工作的任务不得标记。"
                         "简单问答以及只需少量操作、预计可快速完成的简单任务使用 chat，由主助手直接处理。"
                         "复杂、耗时或适合并行的独立新任务使用 create，交给后台助手；instruction 要保留用户的限制。"
                         "简单任务需要工具或历史查询需要搜索时，同时在 first_action 中给出第一个工具及完整参数，"
@@ -581,6 +625,8 @@ class Runtime:
         for intent in route["intents"]:
             if (not isinstance(intent, dict) or intent.get("type") not in {"chat", "create", "query", "update", "stop", "unclear"}
                     or not isinstance(intent.get("instruction"), str)
+                    or ("knowledge_question" in intent and type(intent["knowledge_question"]) is not bool)
+                    or (intent.get("knowledge_question") and intent.get("type") != "create")
                     or not isinstance(intent.get("approval_ids", []), list)
                     or any(not isinstance(x, str) or not x for x in intent.get("approval_ids", []))
                     or (intent.get("type") in {"update", "stop"}
@@ -624,7 +670,8 @@ class Runtime:
             if kind == "create":
                 needs_reply = True
                 task = self.create_task(session, intent["instruction"], event["user_seq"],
-                                        key=f"route:{event['id']}:{index}")
+                                        key=f"route:{event['id']}:{index}",
+                                        knowledge_question=intent.get("knowledge_question", False))
                 notes.append(f"已创建任务 {task['title']}（{task['id']}）")
             elif kind in {"update", "stop"}:
                 task = store.get(session, f"task:{task_id}")
@@ -728,22 +775,26 @@ class Runtime:
             store.append_history(session, "main", "assistant", text, key=f"ack:{event['id']}:{index}")
         return {"summary": summary, "needs_reply": needs_reply}
 
-    def create_task(self, session, goal: str, order: int, *, key: str | None = None, title: str | None = None) -> dict:
+    def create_task(self, session, goal: str, order: int, *, key: str | None = None, title: str | None = None,
+                    knowledge_question: bool = False) -> dict:
         if not isinstance(goal, str) or not goal.strip():
             raise ValueError("任务目标不能为空")
         identity = key or new_id()
         old = store.get(session, f"task-key:{identity}")
         if old:
-            if old["goal"] != goal or old.get("title") != title:
+            if (old["goal"] != goal or old.get("title") != title
+                    or old.get("knowledge_question", False) != knowledge_question):
                 raise ValueError("相同任务调用 ID 的参数不一致")
             return store.get(session, f"task:{old['task_id']}")
         task_id, context_id = new_id(), new_id()
         task = {"type": "task_state", "id": task_id, "context_id": context_id,
                 "title": (title or goal.strip().splitlines()[0])[:40], "goal": goal,
+                "knowledge_question": knowledge_question,
                 "order": order, "status": "queued", "stop_requested": False,
                 "dependency": None, "files": [], "run_id": None, "steps": 0}
         store.put(session, f"task:{task_id}", task)
-        store.put(session, f"task-key:{identity}", {"type": "task_key", "task_id": task_id, "goal": goal, "title": title})
+        store.put(session, f"task-key:{identity}", {"type": "task_key", "task_id": task_id, "goal": goal,
+                  "title": title, "knowledge_question": knowledge_question})
         store.append_history(session, context_id, "user", f"任务目标：{goal}", key=f"goal:{task_id}")
         return task
 
@@ -759,6 +810,29 @@ class Runtime:
         if report.get("kind") == "reconcile":
             await self._reconcile(report)
             return
+        if report.get("kind") == "rag_answer":
+            def show_rag(session):
+                row = store.get(session, f"bus:{report['id']}")
+                current = store.get(session, f"task:{report['task_id']}")
+                if not row or not current:
+                    return True
+                pending = [item for item in store.records(session, "agent_message", context_id=current["context_id"],
+                                                          delivery="pending") if item.get("source") == "main"]
+                if (current["status"] != "reviewing" or current.get("run_id") != report.get("run_id")
+                        or current.get("stop_requested") or pending):
+                    row["kind"] = "review"
+                    store.put(session, f"bus:{report['id']}", row)
+                    return False
+                current["status"] = "completed"
+                store.put(session, f"task:{current['id']}", current)
+                self._release_dependents(session, current)
+                store.add_visible(session, "assistant", row["content"], message_id=f"rag-answer:{report['id']}")
+                store.append_history(session, "main", "assistant", row["content"], key=f"rag-answer:{report['id']}")
+                agent_bus.processed(session, row)
+                return True
+            if await self.change(show_rag):
+                return
+            report["kind"] = "review"
         if report.get("kind") == "direct":
             await self._dialog("请根据直接执行的工具结果继续处理并回复用户。", allow_direct=True,
                                direct_task_id=report["task_id"], direct_report_id=report["id"])
@@ -1163,7 +1237,10 @@ class Runtime:
                      review_report_id: str | None = None) -> str:
         if name == "task_create":
             order = source_seq or store.get(session, "meta")["user_seq"]
-            task = self.create_task(session, args["goal"], order, key=identity, title=args.get("title"))
+            if type(args.get("knowledge_question", False)) is not bool:
+                return "Error: 知识库问答标记无效"
+            task = self.create_task(session, args["goal"], order, key=identity, title=args.get("title"),
+                                    knowledge_question=args.get("knowledge_question", False))
             return f"已受理任务 {task['title']}，ID：{task['id']}"
         if name == "read_tool_output":
             return read_output(session, args)
@@ -1308,16 +1385,18 @@ class Runtime:
                                content=f"依赖任务 {completed['title']} 状态：{completed['status']}。请检查结果并继续。")
 
     def _send_update(self, session, task: dict, content: str, identity: str, source_seq: int | None = None) -> None:
+        if source_seq:
+            task["latest_user_seq"] = max(task.get("latest_user_seq", task["order"]), source_seq)
+            store.put(session, f"task:{task['id']}", task)
         targets = [task["context_id"]] + [helper["context_id"] for helper in store.records(session, "agent_run")
                   if helper["task_id"] == task["id"] and helper["status"] not in _TERMINAL]
         for target in targets:
             message_id = f"{identity}:{target}"
             agent_bus.send(session, source="main", target=target, task_id=task["id"],
                            content=f"用户修改要求：{content}", message_id=message_id)
-            if task.get("direct"):
-                message = store.get(session, f"bus:{message_id}")
-                message["user_seq"] = source_seq or store.get(session, "meta")["user_seq"]
-                store.put(session, f"bus:{message_id}", message)
+            message = store.get(session, f"bus:{message_id}")
+            message["user_seq"] = source_seq or store.get(session, "meta")["user_seq"]
+            store.put(session, f"bus:{message_id}", message)
 
     async def _schedule(self) -> None:
         while not self.closing:

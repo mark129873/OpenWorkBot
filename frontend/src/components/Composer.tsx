@@ -1,5 +1,5 @@
 /* 模式随发送生效；输入法组字时 Enter 不发送。 */
-import { ArrowUp, CaretDown, Check, Hand, ShieldCheck, ShieldWarning } from '@phosphor-icons/react'
+import { ArrowUp, CaretDown, Check, Hand, Paperclip, ShieldCheck, ShieldWarning, X } from '@phosphor-icons/react'
 import { useEffect, useRef, useState } from 'react'
 import type { ExecutionDraft, PermissionState } from '../api/client'
 
@@ -8,7 +8,7 @@ export interface ComposerProps {
   streaming: boolean
   permission: PermissionState
   assistantId?: string
-  onSend: (text: string, execution: ExecutionDraft, onAccepted?: () => void) => void
+  onSend: (text: string, execution: ExecutionDraft, onAccepted?: (remaining?: File[]) => void, files?: File[]) => void
   onStop: () => void
 }
 const MODE_META: Record<string, { label: string; icon: typeof Hand; hint: string }> = {
@@ -19,11 +19,13 @@ const MODE_META: Record<string, { label: string; icon: typeof Hand; hint: string
 
 export function Composer({ disabled, permission, assistantId, onSend }: ComposerProps) {
   const [text, setText] = useState('')
+  const [files, setFiles] = useState<File[]>([])
   const [draftMode, setDraftMode] = useState(permission.mode)
   const [previousMode, setPreviousMode] = useState(permission.mode)
   const [previousAssistant, setPreviousAssistant] = useState(assistantId)
   const [menuOpen, setMenuOpen] = useState(false)
   const areaRef = useRef<HTMLTextAreaElement>(null)
+  const fileRef = useRef<HTMLInputElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
   const modeButtonRef = useRef<HTMLButtonElement>(null)
   // 编辑版本防止旧请求确认清空新草稿。
@@ -52,25 +54,40 @@ export function Composer({ disabled, permission, assistantId, onSend }: Composer
 
   const trySend = () => {
     const trimmed = text.trim()
-    if (!trimmed || disabled) return
+    if ((!trimmed && files.length === 0) || disabled) return
     const revision = editRevisionRef.current
-    onSend(trimmed, { mode: draftMode }, () => {
-      if (editRevisionRef.current === revision) setText('')
-    })
+    onSend(trimmed, { mode: draftMode }, (remaining = []) => {
+      if (editRevisionRef.current === revision) { setText(''); setFiles(remaining) }
+    }, files)
     areaRef.current?.focus()
   }
   const meta = MODE_META[draftMode] ?? MODE_META.build
   const ModeIcon = meta.icon
-  const canSend = !disabled && text.trim().length > 0
+  const canSend = !disabled && (text.trim().length > 0 || files.length > 0)
 
   return (
     <div className="composer-shell">
       <div className={`composer-card ${disabled ? 'opacity-60' : ''}`}>
+        {files.length > 0 && <div className="mb-2 flex flex-wrap gap-2">
+          {files.map((file, index) => <span key={`${file.name}-${file.lastModified}-${index}`} className="flex max-w-full items-center gap-1 rounded-lg bg-zinc-100 px-2 py-1 text-xs text-zinc-700">
+            <span className="max-w-48 truncate">{file.name}</span>
+            <button type="button" aria-label={`移除 ${file.name}`} disabled={disabled} onClick={() => {
+              editRevisionRef.current += 1; setFiles((current) => current.filter((_, i) => i !== index))
+            }}><X size={13} /></button>
+          </span>)}
+        </div>}
         <textarea ref={areaRef} value={text} onChange={(e) => { editRevisionRef.current += 1; setText(e.target.value) }} onKeyDown={(e) => {
           if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); trySend() }
         }} rows={2} disabled={disabled} aria-label="消息" placeholder={disabled ? '正在连接主聊天…' : '描述你的目标，或继续这段对话…'} className="composer-input block" />
         <div className="mt-3 flex items-center justify-between gap-3">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
+            <input ref={fileRef} type="file" multiple className="sr-only" aria-label="选择上传文件" disabled={disabled} onChange={(e) => {
+              const selected = Array.from(e.target.files ?? [])
+              if (selected.length) { editRevisionRef.current += 1; setFiles((current) => [...current, ...selected]) }
+              e.target.value = ''
+            }} />
+            <button type="button" className="icon-button" disabled={disabled} aria-label="添加文件" title="添加文件"
+              onClick={() => fileRef.current?.click()}><Paperclip size={18} /></button>
             <div ref={menuRef} className="relative" onKeyDown={(e) => {
               if (e.key === 'Escape') { setMenuOpen(false); modeButtonRef.current?.focus() }
             }}>

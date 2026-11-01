@@ -4,12 +4,14 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import time
 from types import SimpleNamespace
 
 from app import db
 from app.agent import agent_bus, compact, hooks, tools
 from app.agent.model_call import record_model_step
+from app.agent.rag_client import RAG_NAMES
 from app.agent.runtime import read_output
 from app.agent.task_tools import WORKER_TOOLS
 from app.config import settings
@@ -17,6 +19,7 @@ from app.models import new_id
 from app.sessions import approvals, chat_store as store, session_permissions
 
 _PROMPT = """你是后台工作助手，专注完成给定任务。独立保存工作上下文；先读后改，工具执行失败不能当作成功。
+知识库查询使用 rag_search；仅在用户明确要求时使用 rag_ingest 或 rag_remove，不得自行入库或移出。已指定文件路径时直接调用 rag_ingest，不要先执行命令、读取文件或列出知识库；移出前用 rag_list 查文件 ID，再调用 rag_remove。普通知识库问答完整返回工具答案和来源。
 必须遵守用户明确限定的操作和顺序；禁止的操作即使只读、用于定位或检查也不能执行。用户指定具体命令且禁止其他命令时，不得追加或替换命令；不确定时询问主助手。
 关键进展或需要用户确认的问题使用 task_report 告诉主助手。完成后简短汇报结果、验证及未解决的问题。
 收到用户修改、停止或同伴消息时按最新要求调整；不要冒充主助手或其他助手。"""
@@ -130,10 +133,12 @@ class Worker:
                     if existing and (existing["name"] != call["name"] or existing["input"] != (call.get("input") or {})):
                         raise ValueError("重复工具调用 ID 的参数不一致")
                     if not existing:
+                        task = store.get(session, f"task:{self.task_id}")
                         store.put(session, f"execution:{identity}", {
                             "type": "tool_execution", "id": identity, "task_id": self.task_id,
                             "context_id": self.context_id, "run_id": self.run_id, "call_id": call["id"],
-                            "name": call["name"], "input": call.get("input") or {}, "status": "pending"})
+                            "name": call["name"], "input": call.get("input") or {}, "status": "pending",
+                            "user_seq": task.get("latest_user_seq", task["order"])})
                     calls.append(identity)
                 store.put(session, f"group:{group_id}", {"type": "tool_group", "id": group_id,
                           "context_id": self.context_id, "calls": calls, "status": "pending"})
@@ -177,6 +182,8 @@ class Worker:
                 def save_result(session):
                     current = store.get(session, f"execution:{identity}")
                     current.update(status="completed", output=output)
+                    if "结果未知" in output or "结果可能未知" in output:
+                        current["result_unknown"] = True
                     store.put(session, f"execution:{identity}", current)
                 await self.runtime.change(save_result)
         def finish_group(session):
@@ -200,6 +207,46 @@ class Worker:
             return "Error: 工具参数必须是对象"
         if name in {"task_report", "agent_list", "agent_send", "agent_wait", "agent_help", "read_tool_output"}:
             return await self.communicate(name, args, execution["id"])
+        if name in RAG_NAMES:
+            if name in {"rag_ingest", "rag_remove"} and not self.knowledge_authorized(name):
+                return "Error: 需要用户明确指定知识库入库或移出操作。"
+            with db.new_session() as session:
+                pending = [item for item in store.records(session, "agent_message", context_id=self.context_id,
+                                                         delivery="pending") if item.get("source") == "main"]
+                task = store.get(session, f"task:{self.task_id}")
+                previous = [item for item in store.records(session, "tool_execution")
+                            if item.get("id") != execution["id"]
+                            and item.get("name") == name and item.get("input") == args and item.get("result_unknown")]
+            if pending:
+                return "Error: 收到新的用户要求，请先处理后再调用知识库。"
+            if previous:
+                since = max(item.get("user_seq", task["order"]) for item in previous)
+                if not self.knowledge_authorized(name, after=since):
+                    return "Error: 此前知识库操作结果未知，请先检查并等待用户明确要求重试。"
+            error = await self.authorize(execution)
+            if error:
+                return error
+            error = await self.started(execution, task.get("latest_user_seq", task["order"]))
+            if error:
+                return error
+            call = asyncio.create_task(self.runtime.rag.call(name, {**args, "operation_id": execution["id"]}))
+            stopped = asyncio.create_task(self.stop.wait())
+            try:
+                await asyncio.wait([call, stopped], return_when=asyncio.FIRST_COMPLETED)
+                if self.stop.is_set():
+                    await self.runtime.rag.cancel(execution["id"])
+                    call.cancel()
+                    await asyncio.gather(call, return_exceptions=True)
+                    return "Error: 操作已停止，知识库工具结果可能未知，请先检查。"
+                return await call
+            except asyncio.CancelledError:
+                await asyncio.shield(self.runtime.rag.cancel(execution["id"]))
+                raise
+            finally:
+                if not call.done():
+                    call.cancel()
+                stopped.cancel()
+                await asyncio.gather(call, stopped, return_exceptions=True)
         if name not in tools.TOOL_HANDLERS and name != "todo_write":
             return f"Error: 未知工具 {name}"
         if name in {"read_file", "write_file", "edit_file", "delete_file"}:
@@ -229,6 +276,30 @@ class Worker:
             return f"{'Error: ' if failed else ''}[输出 ID: {output_id}]\n{tools.output_preview(output, limit=29900)}"
         return await self.runtime.run_tool(tools.execute_tool, name, args)
 
+    def knowledge_authorized(self, name: str, after: int = -1) -> bool:
+        # shortcut: 只识别常见明确指令，误拒频繁时扩展表达。
+        task = self.task()
+        with db.new_session() as session:
+            sequences = {task["order"]} | {item.get("user_seq") for item in store.records(session, "agent_message")
+                                          if item.get("task_id") == self.task_id and item.get("source") == "main"}
+            messages = sorted((item for item in store.records(session, "user_event")
+                               if item.get("event_type") == "message" and item.get("user_seq") in sequences
+                               and item["user_seq"] > after), key=lambda item: item["user_seq"], reverse=True)
+        actions = {
+            "rag_ingest": r"入库|导入|加入|加进|添加|收录|存入|写入|放入|放进|放到|上传到|上传至|更新索引|重建索引|\b(?:ingest|import|add|put|store|reindex|update)\b",
+            "rag_remove": r"移出|移除|删除|去除|去掉|剔除|\b(?:remove|delete|drop)\b",
+            "rag_search": r"查询|检索|搜索|查找|\b(?:search|query|find)\b",
+            "rag_list": r"列表|列出|查看|有哪些|\b(?:list|show)\b",
+        }[name]
+        for item in messages:
+            text = item.get("user_text", item.get("text", "")).casefold()
+            action = re.search(actions, text)
+            scope = re.search(r"知识库|入库|索引|knowledge\s*base|\brag\b|\bindex\b", text)
+            retry = after >= 0 and re.search(r"重试|再试|重新执行|\bretry\b|\btry again\b", text)
+            if (action and scope) or retry:
+                return not bool(re.search(r"(?:不要|禁止|不许|别|无需|不必|do not|don't|never).{0,30}(?:" + actions + r"|重试|再试|retry)", text))
+        return False
+
     async def authorize(self, execution: dict) -> str | None:
         name, args = execution["name"], execution["input"]
         deps = SimpleNamespace(recorder=SimpleNamespace(session_id="main"),
@@ -236,12 +307,19 @@ class Worker:
                                approver=lambda tool, inputs, reason: self.approve(execution, reason))
         return await approvals.authorize_tool(deps, name, args, data_dir=settings.data_dir)
 
-    async def started(self, execution: dict) -> str | None:
+    async def started(self, execution: dict, expected_user_seq: int | None = None) -> str | None:
         def started(session):
             current = store.get(session, f"execution:{execution['id']}")
             task = store.get(session, f"task:{self.task_id}")
             if task.get("stop_requested"):
                 return "Error: 用户已停止任务，工具未执行。"
+            if (expected_user_seq is not None and
+                    task.get("latest_user_seq", task["order"]) != expected_user_seq):
+                return "Error: 收到新的用户要求，请先判断后再执行。"
+            if expected_user_seq is not None and any(
+                    item.get("event_type") == "message" and item.get("status") == "pending"
+                    and item["user_seq"] > expected_user_seq for item in store.records(session, "user_event")):
+                return "Error: 收到新的用户消息，请先判断后再执行。"
             if task.get("direct"):
                 decisions = [a.get("user_seq", 0) for a in store.records(session, "approval")
                              if a.get("task_id") == self.task_id and a.get("tool_call_id") == execution["call_id"]
@@ -564,6 +642,19 @@ class Worker:
             else:
                 task["status"] = "reviewing"
             store.put(session, f"task:{self.task_id}", task)
+            if result == "result" and task.get("knowledge_question"):
+                calls = [item for item in store.records(session, "tool_execution", context_id=self.context_id)
+                         if item.get("run_id") == self.run_id and item.get("name") != "task_report"]
+                if len(calls) == 1 and calls[0].get("name") == "rag_search" and calls[0].get("status") == "completed":
+                    try:
+                        answer = json.loads(calls[0].get("output", ""))
+                    except (ValueError, TypeError):
+                        answer = {}
+                    if answer.get("status") in {"success", "insufficient"} and isinstance(answer.get("answer"), str):
+                        agent_bus.send(session, source=self.context_id, target="main", task_id=self.task_id,
+                                       content=answer["answer"], kind="rag_answer",
+                                       message_id=f"finish:{self.task_id}:{self.run_id}", run_id=self.run_id)
+                        return
             agent_bus.send(session, source=self.context_id, target="main", task_id=self.task_id,
                            content=f"任务【{task['title']}】一轮结束（{result}）：{content}",
                            kind="result" if result == "stopped" else "review",

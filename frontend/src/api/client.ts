@@ -33,6 +33,7 @@ export interface ChatMessage {
   status: string
   time: number
   order: number
+  attachments?: { id: string; name: string; path: string; size: number }[]
 }
 
 export interface ChatApproval {
@@ -60,10 +61,18 @@ export function getChat(): Promise<ChatSnapshot> {
   return request('/api/chat')
 }
 
-export function sendChatMessage(assistantId: string, clientMessageId: string, text: string, mode?: string): Promise<unknown> {
+export function sendChatMessage(assistantId: string, clientMessageId: string, text: string, mode?: string, attachments: string[] = []): Promise<unknown> {
   return request('/api/chat/messages', { method: 'POST', body: JSON.stringify({
-    assistant_id: assistantId, client_message_id: clientMessageId, text, ...(mode ? { permission_mode: mode } : {}),
+    assistant_id: assistantId, client_message_id: clientMessageId, text, attachments, ...(mode ? { permission_mode: mode } : {}),
   }) })
+}
+
+export function uploadChatFile(assistantId: string, uploadId: string, file: File): Promise<{ upload_id: string; name: string; path: string }> {
+  const body = new FormData()
+  body.append('assistant_id', assistantId)
+  body.append('upload_id', uploadId)
+  body.append('file', file)
+  return request('/api/chat/uploads', { method: 'POST', headers: {}, body })
 }
 
 export function decideChatApproval(assistantId: string, requestId: string, optionId: ApprovalOptionId, feedback?: string): Promise<unknown> {

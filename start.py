@@ -47,8 +47,18 @@ def main():
         for command, directory in commands:
             options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS else {"start_new_session": True}
             processes.append(subprocess.Popen(command, cwd=ROOT / directory, **options))
+        core = list(processes)
+        python = ROOT / "rag" / ".venv" / ("Scripts/python.exe" if WINDOWS else "bin/python")
+        if python.is_file():
+            try:
+                options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if WINDOWS else {"start_new_session": True}
+                processes.append(subprocess.Popen([str(python), "run_models.py"], cwd=ROOT / "rag", **options))
+            except OSError:
+                print("RAG 模型服务启动失败；普通聊天继续可用。", flush=True)
+        else:
+            print("RAG 环境未安装；普通聊天继续可用。", flush=True)
         print("Starting http://127.0.0.1:5173/ | Ctrl+C stops both services.", flush=True)
-        while all(process.poll() is None for process in processes):
+        while all(process.poll() is None for process in core):
             time.sleep(0.2)
         print("A service exited; stopping both services.", flush=True)
         return 1

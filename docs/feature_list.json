@@ -39,6 +39,27 @@
       "description": "删除确认、停止进度及异常处理。",
       "status": "passing",
       "evidence": "前端 2 项测试、构建及 lint 通过；隔离浏览器验证菜单、确认、阻塞、取消与草稿。"
+    },
+    {
+      "id": "Backend-03",
+      "name": "后台 RAG 知识库",
+      "description": "Worker 经 MCP 管理和检索独立知识库。",
+      "status": "passing",
+      "evidence": "空库后端 116 项、RAG 10 项通过；真实模型及隔离 Milvus 导入、问答、更新、移出通过，真实 Bot 经 Worker/MCP 导入和问答通过。"
+    },
+    {
+      "id": "Frontend-03",
+      "name": "聊天文件上传",
+      "description": "多文件上传至工作区并关联聊天。",
+      "status": "passing",
+      "evidence": "100 MiB 和超限边界、覆盖与重试通过；前端 2 项、构建、lint 及隔离浏览器多文件和后台聊天验收通过。"
+    },
+    {
+      "id": "Backend-04",
+      "name": "大文档真实入库性能",
+      "description": "验证 100 MiB 文档的实际入库耗时与稳定性。",
+      "status": "in_progress",
+      "evidence": "尚未用真实模型与云端处理 100 MiB 文档；上传大小边界已验证。"
     }
   ]
 }

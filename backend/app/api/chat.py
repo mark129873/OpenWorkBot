@@ -1,7 +1,7 @@
 import asyncio
 import json
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
@@ -13,8 +13,9 @@ router = APIRouter(prefix="/api/chat")
 class MessageInput(BaseModel):
     assistant_id: str = Field(min_length=1, max_length=128)
     client_message_id: str = Field(min_length=1, max_length=128)
-    text: str = Field(min_length=1, max_length=100000)
+    text: str = Field(default="", max_length=100000)
     permission_mode: str | None = None
+    attachments: list[str] = Field(default_factory=list)
 
 
 class ApprovalInput(BaseModel):
@@ -38,7 +39,19 @@ async def chat(request: Request):
 async def send_message(body: MessageInput, request: Request):
     try:
         return await request.app.state.runtime.accept(body.client_message_id, body.text, body.permission_mode,
-                                                      assistant_id=body.assistant_id)
+                                                      assistant_id=body.assistant_id, attachments=body.attachments)
+    except Conflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/uploads")
+async def upload_file(request: Request, assistant_id: str = Form(), upload_id: str = Form(),
+                      file: UploadFile = File()):
+    from app.api.uploads import upload
+    try:
+        return await upload(request.app.state.runtime, assistant_id, upload_id, file)
     except Conflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except ValueError as exc:
