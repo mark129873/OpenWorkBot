@@ -1887,3 +1887,291 @@ def test_direct_task_cannot_wait_for_dependency(isolated):
             "task_id": direct["id"], "dependency_id": other["id"]}, 1, "wait")
         assert result.startswith("Error:")
         assert store.get(session, f"task:{direct['id']}")["dependency"] is None
+
+
+class FirstActionModel:
+    model = "fake"
+
+    def __init__(self, name, args, intent="chat"):
+        self.name, self.args, self.intent = name, args, intent
+        self.calls = []
+        self.reply_messages = []
+
+    async def stream(self, *, system, messages, tools, tool_choice=None):
+        if tool_choice and tool_choice["name"] == "route_input":
+            self.calls.append("first")
+            assert system.startswith("你是用户长期使用的主助手")
+            request = json.loads(messages[-1]["content"])
+            yield {"type": "tool_use", "id": new_id(), "name": "route_input", "input": {
+                "message_id": request["message_id"], "user_seq": request["user_seq"],
+                "intents": [{"type": self.intent, "instruction": request["text"]}],
+                "needs_clarification": False,
+                "first_action": {"intent_index": 0, "name": self.name, "input": self.args}}}
+        elif system.startswith("你是后台工作助手"):
+            raise AssertionError("首个直接动作不应启动后台助手模型")
+        else:
+            self.calls.append("reply")
+            self.reply_messages = messages
+            yield {"type": "text_delta", "text": "已处理结果。"}
+        yield {"type": "stop_reason", "reason": "end_turn"}
+
+
+def test_first_action_runs_pwd_in_two_model_calls(isolated, monkeypatch):
+    from app.agent import tools
+
+    calls = []
+    monkeypatch.setattr(tools, "capture_bash", lambda command: (calls.append(command) or "workspace", False))
+
+    async def run():
+        model = FirstActionModel("bash", {"command": "pwd"})
+        runtime = Runtime(client=model)
+        await runtime.start()
+        try:
+            await runtime.accept("pwd-first", "pwd", "build")
+            await wait_for(lambda: bool(model.reply_messages))
+            assert model.calls == ["first", "reply"] and calls == ["pwd"]
+            assert "workspace" in json.dumps(model.reply_messages, ensure_ascii=False)
+            with db.new_session() as session:
+                history = store.history(session, "main")
+                action = next(block for entry in history if isinstance(entry["content"], list)
+                              for block in entry["content"] if block.get("type") == "tool_use")
+                assert action["name"] == "route_input"
+                assert action["input"]["first_action"]["name"] == "bash"
+                assert action["input"]["first_action"]["input"] == {"command": "pwd"}
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_first_action_can_search_history_in_two_model_calls(isolated):
+    async def run():
+        model = FirstActionModel("task_search", {"keyword": "枫叶"}, intent="query")
+        runtime = Runtime(client=model)
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            task = runtime.create_task(session, "远古枫叶", 1)
+            task["status"] = "completed"
+            store.put(session, f"task:{task['id']}", task)
+            session.commit()
+        await runtime.start()
+        try:
+            await runtime.accept("search-first", "查找枫叶任务", "build")
+            await wait_for(lambda: bool(model.reply_messages))
+            assert model.calls == ["first", "reply"]
+            assert task["id"] in json.dumps(model.reply_messages, ensure_ascii=False)
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_first_action_ids_are_scoped_to_the_user_message(isolated):
+    with db.new_session() as session:
+        store.initialize(session, isolated)
+        runtime = Runtime(client=FirstActionModel("task_search", {"keyword": "A"}, intent="query"))
+        for seq, keyword in enumerate(("alpha", "beta"), 1):
+            task = runtime.create_task(session, keyword, seq)
+            task["status"] = "completed"
+            store.put(session, f"task:{task['id']}", task)
+            event = {"type": "user_event", "event_type": "message", "id": f"search-{seq}",
+                     "message_id": f"user:search-{seq}", "text": keyword, "user_seq": seq, "status": "pending"}
+            store.put(session, f"input:search-{seq}", event)
+            route = {"message_id": event["message_id"], "user_seq": seq,
+                     "intents": [{"type": "query", "instruction": keyword}], "needs_clarification": False,
+                     "first_action": {"intent_index": 0, "name": "task_search", "input": {"keyword": keyword}}}
+            runtime._validate_route(route, event)
+            runtime._apply_route(session, event, route, set(), "same-call")
+            action = store.get(session, f"action:main:search-{seq}:same-call")
+            assert task["id"] in action["output"]
+
+
+@pytest.mark.parametrize("action", [
+    {"intent_index": True, "name": "bash", "input": {"command": "pwd"}},
+    {"intent_index": 1, "name": "bash", "input": {"command": "pwd"}},
+    {"intent_index": 0, "name": "task_stop", "input": {"task_id": "x"}},
+    {"intent_index": 0, "name": "bash", "input": {"command": 1}},
+    {"intent_index": 0, "name": "bash", "input": {"command": "pwd", "extra": "x"}},
+])
+def test_invalid_first_action_is_rejected(action):
+    event = {"message_id": "user:one", "user_seq": 1}
+    route = {"message_id": event["message_id"], "user_seq": 1,
+             "intents": [{"type": "chat", "instruction": "pwd"}],
+             "needs_clarification": False, "first_action": action}
+    with pytest.raises(ValueError):
+        Runtime._validate_route(route, event)
+
+
+def test_first_action_requires_a_nonempty_intent():
+    event = {"message_id": "user:one", "user_seq": 1}
+    route = {"message_id": event["message_id"], "user_seq": 1,
+             "intents": [{"type": "chat", "instruction": "  "}], "needs_clarification": False,
+             "first_action": {"intent_index": 0, "name": "bash", "input": {"command": "pwd"}}}
+    with pytest.raises(ValueError):
+        Runtime._validate_route(route, event)
+
+
+@pytest.mark.parametrize("newer_approval", [False, True])
+def test_first_action_keeps_mixed_intents_and_approval_order(isolated, newer_approval):
+    with db.new_session() as session:
+        store.initialize(session, isolated)
+        runtime = Runtime(client=FirstActionModel("bash", {"command": "pwd"}))
+        task = runtime.create_task(session, "删除 A", 1)
+        task["status"] = "waiting_user"
+        store.put(session, f"task:{task['id']}", task)
+        event = {"type": "user_event", "event_type": "message", "id": "mixed",
+                 "message_id": "user:mixed", "text": "不要删除 A，同时运行 pwd", "user_seq": 2, "status": "pending"}
+        store.put(session, "input:mixed", event)
+        approval = {"type": "approval", "request_id": "a", "task_id": task["id"],
+                    "status": "resolved" if newer_approval else "requested"}
+        if newer_approval:
+            approval.update(option_id="allowOnce", user_seq=3)
+            store.put(session, "decision:a", {"type": "user_event", "event_type": "approval", "id": "a",
+                      "task_id": task["id"], "user_seq": 3, "option_id": "allowOnce"})
+        store.put(session, "approval:a", approval)
+        route = {"message_id": event["message_id"], "user_seq": event["user_seq"],
+                 "intents": [{"type": "update", "task_id": task["id"], "instruction": "不要删除 A", "approval_ids": ["a"]},
+                             {"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": False,
+                 "first_action": {"intent_index": 1, "name": "bash", "input": {"command": "pwd"}}}
+        runtime._validate_route(route, event)
+        runtime._apply_route(session, event, route, {"a"}, "first-call")
+        direct = [t for t in store.records(session, "task_state") if t.get("direct")]
+        assert len(direct) == 1 and direct[0]["direct_phase"] == "executing"
+        assert store.get(session, "reply:mixed")["status"] == "completed"
+        assert store.records(session, "tool_execution")[0]["input"] == {"command": "pwd"}
+        updates = store.records(session, "agent_message", context_id=task["context_id"])
+        assert bool(updates) != newer_approval
+        if newer_approval:
+            assert "随后已批准" in store.visible(session)[-1]["text"]
+        runtime._apply_route(session, event, route, {"a"}, "first-call")
+        assert len(store.records(session, "tool_execution")) == 1
+
+
+def test_first_action_is_not_started_after_newer_user_message(isolated):
+    with db.new_session() as session:
+        store.initialize(session, isolated)
+        runtime = Runtime(client=FirstActionModel("bash", {"command": "pwd"}))
+        event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
+                 "text": "pwd", "user_seq": 1, "status": "pending"}
+        store.put(session, "input:old", event)
+        store.put(session, "input:new", {"type": "user_event", "event_type": "message", "id": "new",
+                  "message_id": "user:new", "text": "先不要执行", "user_seq": 2, "status": "pending"})
+        route = {"message_id": event["message_id"], "user_seq": 1,
+                 "intents": [{"type": "chat", "instruction": "pwd"}], "needs_clarification": False,
+                 "first_action": {"intent_index": 0, "name": "bash", "input": {"command": "pwd"}}}
+        runtime._apply_route(session, event, route, set(), "first-call")
+        assert not store.records(session, "tool_execution")
+
+
+def test_first_action_waits_if_intent_needs_clarification(isolated):
+    with db.new_session() as session:
+        store.initialize(session, isolated)
+        runtime = Runtime(client=FirstActionModel("bash", {"command": "pwd"}))
+        event = {"type": "user_event", "event_type": "message", "id": "unclear", "message_id": "user:unclear",
+                 "text": "先确认再运行", "user_seq": 1, "status": "pending"}
+        store.put(session, "input:unclear", event)
+        route = {"message_id": event["message_id"], "user_seq": 1,
+                 "intents": [{"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": True,
+                 "first_action": {"intent_index": 0, "name": "bash", "input": {"command": "pwd"}}}
+        blocks = [{"type": "tool_use", "id": "first-call", "name": "route_input", "input": route}]
+        runtime._apply_route(session, event, route, set(), "first-call", blocks)
+        assert not store.records(session, "tool_execution")
+        assert store.get(session, "reply:unclear")["status"] == "pending"
+        assert not store.get(session, "reply:unclear")["allow_direct"]
+        assert "首个动作未执行" in str(store.history(session, "main")[-1]["content"])
+
+
+def test_first_action_keeps_a_clear_intent_when_another_needs_clarification(isolated):
+    with db.new_session() as session:
+        store.initialize(session, isolated)
+        runtime = Runtime(client=FirstActionModel("bash", {"command": "pwd"}))
+        event = {"type": "user_event", "event_type": "message", "id": "mixed-unclear",
+                 "message_id": "user:mixed-unclear", "text": "处理之前的文件，同时运行 pwd", "user_seq": 1, "status": "pending"}
+        store.put(session, "input:mixed-unclear", event)
+        route = {"message_id": event["message_id"], "user_seq": 1,
+                 "intents": [{"type": "unclear", "instruction": "不确定要处理哪个文件"},
+                             {"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": True,
+                 "first_action": {"intent_index": 1, "name": "bash", "input": {"command": "pwd"}}}
+        runtime._validate_route(route, event)
+        runtime._apply_route(session, event, route, set(), "first-call")
+        assert store.records(session, "tool_execution")[0]["input"] == {"command": "pwd"}
+        assert "需要向用户澄清" in str(store.history(session, "main")[-1]["content"])
+
+
+def test_invalid_first_action_does_not_change_tasks_or_approvals(isolated):
+    class InvalidFirstModel(FakeModel):
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            if tool_choice and tool_choice["name"] == "route_input":
+                request = json.loads(messages[-1]["content"])
+                yield {"type": "tool_use", "id": "invalid-first", "name": "route_input", "input": {
+                    "message_id": request["message_id"], "user_seq": request["user_seq"],
+                    "intents": [{"type": "stop", "task_id": task["id"], "instruction": "停止"},
+                                {"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": False,
+                    "first_action": {"intent_index": 1, "name": "bash", "input": {"command": 123}}}}
+                return
+            async for item in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
+                yield item
+
+    async def run():
+        nonlocal task
+        runtime = Runtime(client=InvalidFirstModel())
+        await runtime.start()
+        try:
+            def setup(session):
+                current = runtime.create_task(session, "等待审批", 1)
+                current["status"] = "waiting_user"
+                store.put(session, f"task:{current['id']}", current)
+                store.put(session, "approval:pending", {"type": "approval", "request_id": "pending",
+                          "status": "requested", "task_id": current["id"]})
+                return current
+            task = await runtime.change(setup)
+            await runtime.accept("invalid-first", "停止任务并运行 pwd", None)
+            def failed():
+                with db.new_session() as session:
+                    return store.get(session, "input:invalid-first")["status"] == "failed"
+            await wait_for(failed)
+            with db.new_session() as session:
+                assert not store.get(session, f"task:{task['id']}")["stop_requested"]
+                assert store.get(session, "approval:pending")["status"] == "requested"
+                assert not store.records(session, "tool_execution")
+        finally:
+            await runtime.close()
+    task = None
+    asyncio.run(run())
+
+
+def test_first_action_started_before_restart_is_not_replayed(isolated, monkeypatch):
+    from app.agent import tools
+
+    calls = []
+    monkeypatch.setattr(tools, "capture_bash", lambda command: (calls.append(command) or "unexpected", False))
+
+    async def run():
+        model = FirstActionModel("bash", {"command": "pwd"})
+        runtime = Runtime(client=model)
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            event = {"type": "user_event", "event_type": "message", "id": "recover-first",
+                     "message_id": "user:recover-first", "text": "pwd", "user_seq": 1, "status": "pending"}
+            store.put(session, "input:recover-first", event)
+            route = {"message_id": event["message_id"], "user_seq": 1,
+                     "intents": [{"type": "chat", "instruction": "pwd"}], "needs_clarification": False,
+                     "first_action": {"intent_index": 0, "name": "bash", "input": {"command": "pwd"}}}
+            blocks = [{"type": "tool_use", "id": "first-call", "name": "route_input", "input": route}]
+            runtime._apply_route(session, event, route, set(), "first-call", blocks)
+            execution = store.records(session, "tool_execution")[0]
+            execution["status"] = "started"
+            store.put(session, f"execution:{execution['id']}", execution)
+            session.commit()
+        await runtime.start()
+        try:
+            await wait_for(lambda: bool(model.reply_messages))
+            assert not calls and model.calls == ["reply"]
+            assert "结果未知" in json.dumps(model.reply_messages, ensure_ascii=False)
+            with db.new_session() as session:
+                task = next(t for t in store.records(session, "task_state") if t.get("direct"))
+                context = store.history(session, task["context_id"])
+                blocks = [block for entry in context if isinstance(entry["content"], list) for block in entry["content"]]
+                assert any(block.get("name") == "route_input" and block.get("id") == "first-call" for block in blocks)
+                assert any(block.get("tool_use_id") == "first-call" and "结果未知" in block["content"] for block in blocks)
+        finally:
+            await runtime.close()
+    asyncio.run(run())

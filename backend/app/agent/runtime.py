@@ -13,7 +13,7 @@ from app import db
 from app.agent import agent_bus, compact, hooks
 from app.agent.llm import build_client
 from app.agent.model_call import record_model_step
-from app.agent.task_tools import DIRECT_TOOLS, MAIN_TOOLS, ROUTE, SHARED_TOOLS
+from app.agent.task_tools import DIRECT_TOOLS, FIRST_ACTION_TOOLS, MAIN_TOOLS, ROUTE, SHARED_TOOLS
 from app.config import settings, validate_llm_config
 from app.models import LocalSetting, Part, new_id
 from app.sessions import chat_store as store
@@ -356,18 +356,24 @@ class Runtime:
             visible = store.visible(session)
             current_order = next((m["order"] for m in visible if m["id"] == event["message_id"]), 0)
             recent = [m for m in visible if m["order"] <= current_order][-12:]
-        route_prompt = ("判断新消息与任务的关系；仅返回 route_input。"
+        route_prompt = (_PROMPT_PATH.read_text(encoding="utf-8") + "\n\n判断新消息与任务的关系；仅返回 route_input。"
                         "简单问答以及只需少量操作、预计可快速完成的简单任务使用 chat，由主助手直接处理。"
                         "复杂、耗时或适合并行的独立新任务使用 create，交给后台助手；instruction 要保留用户的限制。"
+                        "简单任务需要工具或历史查询需要搜索时，同时在 first_action 中给出第一个工具及完整参数，"
+                        "intent_index 指向对应的 chat 或 query 意图。无需工具的问答不填 first_action。"
+                        "create、update、stop 由系统按意图执行，不得通过 first_action 重复执行。"
+                        "存在先后依赖的工作应作为同一后台任务，不要提前执行依赖任务的动作。"
                         "对每项独立要求分别输出意图；禁止任务中的某项操作属于 update，只有明确停止整个任务才用 stop。"
                         "变更或停止必须结合审批的文件路径或命令，列出受影响的审批 ID；确认没有受影响审批时返回空数组，"
                         "无法判断时标记 unclear。任务列表是摘要，未列出或无法确定的历史任务不得猜测 ID；"
                         "历史查询使用 query，修改或停止无法确定时使用 unclear，主助手随后可搜索。"
                         f"{'部分任务已省略。' if omitted else ''}\n"
-                        f"任务：{store.dump(tasks)}\n审批：{json.dumps(approvals, ensure_ascii=False)}")
+                        f"任务：{store.dump(tasks)}\n审批：{json.dumps(approvals, ensure_ascii=False)}\n"
+                        f"首个动作可用工具：{store.dump(FIRST_ACTION_TOOLS)}")
         request = {"message_id": event["message_id"], "user_seq": event["user_seq"], "text": event["text"],
                    "recent_messages": [{"role": m["role"], "text": m["text"]} for m in recent]}
-        messages = [{"role": "user", "content": json.dumps(request, ensure_ascii=False)}]
+        messages = await compact.context_history(self, "main")
+        messages.append({"role": "user", "content": json.dumps(request, ensure_ascii=False)})
         deps = SimpleNamespace(client=self.client, recorder=SimpleNamespace(session_id="main", turn_id=event["id"]))
         with record_model_step(deps, route_prompt, messages, [ROUTE]) as reply:
             async for part in self.client.stream(system=route_prompt, messages=messages, tools=[ROUTE],
@@ -382,7 +388,8 @@ class Runtime:
         route = reply.tool_uses[0].get("input") or {}
         self._validate_route(route, event)
         known_approvals = {a["request_id"] for a in approvals}
-        result = await self.change(lambda session: self._apply_route(session, event, route, known_approvals))
+        result = await self.change(lambda session: self._apply_route(
+            session, event, route, known_approvals, reply.tool_uses[0].get("id"), reply.assistant_blocks()))
         with db.new_session() as session:
             later_pending = any(row.get("event_type") == "message" and row["status"] == "pending"
                                 and row["user_seq"] > event["user_seq"] for row in store.records(session, "user_event"))
@@ -413,13 +420,32 @@ class Runtime:
                         and (not isinstance(intent.get("task_id"), str) or not intent["task_id"]))
                     or (intent.get("type") in {"create", "update"} and not intent["instruction"].strip())):
                 raise ValueError("任务意图无效")
+        if "first_action" in route:
+            action = route["first_action"]
+            if not isinstance(action, dict):
+                raise ValueError("首个动作无效")
+            index, name, args = action.get("intent_index"), action.get("name"), action.get("input")
+            spec = next((tool for tool in FIRST_ACTION_TOOLS if tool["name"] == name), None)
+            if (type(index) is not int or not 0 <= index < len(route["intents"]) or not spec
+                    or not isinstance(args, dict) or route["intents"][index]["type"] not in {"chat", "query"}
+                    or not route["intents"][index]["instruction"].strip()
+                    or (name in {tool["name"] for tool in DIRECT_TOOLS} and route["intents"][index]["type"] != "chat")):
+                raise ValueError("首个动作与任务意图不匹配")
+            schema = spec["input_schema"]
+            properties = schema["properties"]
+            types = {"string": str, "integer": int, "array": list, "object": dict, "boolean": bool}
+            if (any(key not in args for key in schema["required"]) or any(key not in properties for key in args)
+                    or any(type(value) is not types[properties[key]["type"]] for key, value in args.items())):
+                raise ValueError("首个动作的工具参数无效")
 
-    def _apply_route(self, session, event: dict, route: dict, known_approvals: set[str] | None = None) -> dict:
+    def _apply_route(self, session, event: dict, route: dict, known_approvals: set[str] | None = None,
+                     action_id: str | None = None, model_blocks: list | None = None) -> dict:
         row = store.get(session, f"input:{event['id']}")
         if not row or row["status"] != "pending":
             return {"summary": "消息已处理", "needs_reply": False}
         store.append_history(session, "main", "user", event["text"], key=f"input:{event['id']}")
         notes = []
+        acknowledgements = []
         needs_reply = bool(route["needs_clarification"])
         decisions = [d for d in store.records(session, "user_event")
                      if d.get("event_type") == "approval" and d["user_seq"] > event["user_seq"]]
@@ -453,8 +479,7 @@ class Runtime:
                     choice = latest.get("option_id")
                     label = "批准" if choice in {"allowOnce", "allowSession"} else "拒绝" if choice == "deny" else "审批"
                     text = f"任务「{task['title']}」：你随后已{label}该操作，我会以较新的决定为准。"
-                    store.add_visible(session, "assistant", text, message_id=f"ack:{event['id']}:{index}")
-                    store.append_history(session, "main", "assistant", text, key=f"ack:{event['id']}:{index}")
+                    acknowledgements.append((index, text))
                     notes.append(f"任务 {task['title']} 有更新的审批决定，已告知用户以较新决定为准")
                     continue
                 uncertain = bool(newer and (kind == "stop" or "approval_ids" not in intent
@@ -490,10 +515,50 @@ class Runtime:
         row["status"] = "processed"
         store.put(session, f"input:{event['id']}", row)
         summary = "；".join(notes) or "继续对话"
+        action_output = None
+        action = route.get("first_action")
+        clear_action = not route["needs_clarification"] or any(intent["type"] == "unclear" for intent in route["intents"])
         if needs_reply and not later_messages:
             store.put(session, f"reply:{event['id']}", {"type": "main_reply", "id": event["id"],
                       "source_seq": event["user_seq"], "note": f"系统已处理用户消息：{summary}", "status": "pending",
-                      "allow_direct": any(intent["type"] == "chat" for intent in route["intents"])})
+                      "allow_direct": clear_action and any(intent["type"] == "chat" for intent in route["intents"])})
+            if action and not clear_action:
+                action_output = "首个动作未执行，存在需要澄清的意图。"
+            elif action:
+                if not isinstance(action_id, str) or not action_id:
+                    raise ValueError("首个动作的工具调用 ID 无效")
+                call = {"type": "tool_use", "id": action_id, "name": action["name"], "input": action["input"]}
+                if model_blocks is None:
+                    model_blocks = [{"type": "tool_use", "id": action_id, "name": "route_input", "input": route}]
+                if action["name"] in {tool["name"] for tool in DIRECT_TOOLS}:
+                    self._queue_direct(session, [call], [call], event["user_seq"], event["id"], None, None,
+                                       source_blocks=model_blocks)
+                    action_output = "首个动作正在执行，结果随后送达。"
+                else:
+                    started_at = time.monotonic()
+                    context = {"name": action["name"], "tool_call_id": action_id}
+                    hooks.trigger("PreToolUse", context)
+                    try:
+                        output = self._main_tool(session, {**call, "id": f"{event['id']}:{action_id}"}, event["user_seq"])
+                    except Exception:
+                        hooks.trigger("PostToolUse", {**context, "status": "error", "duration_ms": (time.monotonic() - started_at) * 1000})
+                        raise
+                    hooks.trigger("PostToolUse", {**context, "status": "error" if output.startswith("Error:") else "completed",
+                                                   "duration_ms": (time.monotonic() - started_at) * 1000})
+                    action_output = f"首个动作结果：{output}"
+        elif action:
+            action_output = "首个动作未执行，存在较新的用户消息。"
+        if model_blocks is not None:
+            if not isinstance(action_id, str) or not action_id:
+                raise ValueError("工具调用 ID 无效")
+            store.append_history(session, "main", "assistant", model_blocks, key=f"route-call:{event['id']}")
+            output = f"系统已处理用户消息：{summary}" + (f"\n{action_output}" if action_output else "")
+            store.append_history(session, "main", "user", [{"type": "tool_result", "tool_use_id": action_id,
+                                 "content": output, **({"is_error": True} if action_output and action_output.startswith("首个动作结果：Error:") else {})}],
+                                 key=f"route-result:{event['id']}")
+        for index, text in acknowledgements:
+            store.add_visible(session, "assistant", text, message_id=f"ack:{event['id']}:{index}")
+            store.append_history(session, "main", "assistant", text, key=f"ack:{event['id']}:{index}")
         return {"summary": summary, "needs_reply": needs_reply}
 
     def create_task(self, session, goal: str, order: int, *, key: str | None = None, title: str | None = None) -> dict:
@@ -567,7 +632,7 @@ class Runtime:
             return
         prompt = ("重新判断一条较早的任务修改或停止要求。后续用户消息和审批以先后顺序为准；"
                   "如果较早要求与较新决定冲突，返回 chat 表示不再执行；无冲突则保留原意图；"
-                  "无法判断时返回 unclear 并要求澄清。只能针对给定任务，不能创建新任务。仅调用 route_input。")
+                  "无法判断时返回 unclear 并要求澄清。只能针对给定任务，不能创建新任务或返回 first_action。仅调用 route_input。")
         request = {"message_id": event["message_id"], "user_seq": event["user_seq"], "original_intent": pending["intent"],
                    "task": task, "later_user_events": later, "approvals": approvals}
         messages = [{"role": "user", "content": json.dumps(request, ensure_ascii=False)}]
@@ -580,6 +645,8 @@ class Runtime:
             raise ValueError("重新判断未返回有效结果")
         route = reply.tool_uses[0].get("input") or {}
         self._validate_route(route, event)
+        if "first_action" in route:
+            raise ValueError("重新判断不能执行首个动作")
         if len(route["intents"]) != 1:
             raise ValueError("重新判断结果必须对应单个原意图")
         intent = route["intents"][0]
@@ -789,7 +856,8 @@ class Runtime:
         raise ValueError("主助手达到 40 步上限")
 
     def _queue_direct(self, session, blocks: list, calls: list, source_seq: int | None,
-                      reply_id: str | None, task_id: str | None, report_id: str | None) -> None:
+                      reply_id: str | None, task_id: str | None, report_id: str | None,
+                      source_blocks: list | None = None) -> None:
         row = store.get(session, f"reply:{reply_id}") if reply_id else None
         if reply_id and (not row or row["status"] != "pending"):
             return
@@ -821,27 +889,28 @@ class Runtime:
                     "context_id": task["context_id"], "run_id": task["run_id"], "call_id": call["id"],
                     "name": call["name"], "input": args, "status": "pending"})
             executions.append(identity)
-        store.append_history(session, task["context_id"], "assistant", [
+        store.append_history(session, task["context_id"], "assistant", source_blocks if source_blocks is not None else [
             block for block in blocks if block.get("type") == "tool_use" and block["name"] in names])
         store.put(session, f"group:{group_id}", {"type": "tool_group", "id": group_id,
                   "context_id": task["context_id"], "calls": executions, "status": "pending"})
         task.update(direct_phase="executing", direct_group=group_id, steps=task["steps"] + 1)
         store.put(session, f"task:{task['id']}", task)
-        results = []
-        for call in calls:
-            if call["name"] in names:
-                output = "工具正在执行，结果随后送达。"
-            else:
-                started_at = time.monotonic()
-                context = {"name": call.get("name"), "tool_call_id": call.get("id")}
-                hooks.trigger("PreToolUse", context)
-                output = self._main_tool(session, call, source_seq)
-                hooks.trigger("PostToolUse", {**context, "status": "error" if output.startswith("Error:") else "completed",
-                                               "duration_ms": (time.monotonic() - started_at) * 1000})
-            results.append({"type": "tool_result", "tool_use_id": call["id"], "content": output,
-                            **({"is_error": True} if output.startswith("Error:") else {})})
-        store.append_history(session, "main", "assistant", blocks)
-        store.append_history(session, "main", "user", results)
+        if source_blocks is None:
+            results = []
+            for call in calls:
+                if call["name"] in names:
+                    output = "工具正在执行，结果随后送达。"
+                else:
+                    started_at = time.monotonic()
+                    context = {"name": call.get("name"), "tool_call_id": call.get("id")}
+                    hooks.trigger("PreToolUse", context)
+                    output = self._main_tool(session, call, source_seq)
+                    hooks.trigger("PostToolUse", {**context, "status": "error" if output.startswith("Error:") else "completed",
+                                                   "duration_ms": (time.monotonic() - started_at) * 1000})
+                results.append({"type": "tool_result", "tool_use_id": call["id"], "content": output,
+                                **({"is_error": True} if output.startswith("Error:") else {})})
+            store.append_history(session, "main", "assistant", blocks)
+            store.append_history(session, "main", "user", results)
         if row:
             row["status"] = "completed"
             store.put(session, f"reply:{reply_id}", row)
