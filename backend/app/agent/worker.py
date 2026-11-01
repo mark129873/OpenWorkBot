@@ -22,10 +22,16 @@ _PROMPT = """你是后台工作助手，专注完成给定任务。独立保存�
 收到用户修改、停止或同伴消息时按最新要求调整；不要冒充主助手或其他助手。"""
 
 
+class AgentWaiting(Exception):
+    pass
+
+
 async def run_worker(runtime, task_id: str, helper_id: str | None = None) -> None:
     worker = Worker(runtime, task_id, helper_id)
     try:
         await worker.run()
+    except AgentWaiting:
+        return
     except asyncio.CancelledError:
         raise
     except Exception as exc:
@@ -161,6 +167,8 @@ class Worker:
                 hooks.trigger("PreToolUse", context)
                 try:
                     output = await self.execute(execution)
+                except AgentWaiting:
+                    raise
                 except Exception:
                     hooks.trigger("PostToolUse", {**context, "status": "error", "duration_ms": (time.monotonic() - started_at) * 1000})
                     raise
@@ -462,57 +470,59 @@ class Worker:
         return f"Error: 未知通信工具 {name}"
 
     async def wait_for_agent(self, target: str, identity: str) -> str:
-        with db.new_session() as session:
-            previous = store.get(session, f"wait-result:{identity}")
-            tasks = store.records(session, "task_state")
-            agents = store.records(session, "agent_run")
-        if previous:
-            return previous["content"]
-        valid = any(t["context_id"] == target for t in tasks) or any(a["context_id"] == target for a in agents)
-        if not valid or target == self.context_id:
-            return "Error: 目标助手无效"
         key = f"agent-wait:{identity}"
-        def register(session):
-            store.put(session, key, {"type": "agent_wait", "key": key, "context_id": self.context_id,
-                      "target": target, "task_id": self.task_id, "status": "waiting"})
-            cycles = agent_bus.find_cycles(agent_bus.wait_graph(session))
-            if cycles:
-                agent_bus.send(session, source="runtime", target="main", task_id=self.task_id,
-                               content=f"检测到助手等待环，请判断：{cycles}", kind="cycle", message_id=f"cycle:{identity}")
-        await self.runtime.change(register)
-        try:
-            while True:
-                task = self.task()
-                if self.stop.is_set() or task.get("stop_requested") or task.get("dependency"):
-                    return "Error: 等待已被停止或依赖变更打断。"
-                with db.new_session() as session:
-                    messages = [m for m in store.records(session, "agent_message", context_id=self.context_id)
-                                if m["delivery"] == "pending"]
-                if any(m["source"] == "main" for m in messages):
-                    return "Error: 收到新要求，请先处理再继续等待。"
-                reply = next((m for m in messages if m["source"] == target), None)
-                if reply:
-                    def consume(session):
-                        message = store.get(session, f"bus:{reply['id']}")
-                        agent_bus.processed(session, message)
-                        store.put(session, f"wait-result:{identity}", {"type": "agent_wait_result",
-                                  "context_id": self.context_id, "content": message["content"]})
-                    await self.runtime.change(consume)
-                    return reply["content"]
-                with db.new_session() as session:
-                    helper = store.get(session, f"helper:{target}")
-                    target_task = next((t for t in store.records(session, "task_state") if t["context_id"] == target), None)
-                if ((helper and helper["status"] in {"completed", "failed", "stopped"})
-                        or (target_task and target_task["status"] in {"completed", "failed", "stopped"})):
-                    return "Error: 对方助手已结束，且没有待处理回复。"
-                await asyncio.sleep(0.25)
-        finally:
-            def clear(session):
+
+        def check(session):
+            previous = store.get(session, f"wait-result:{identity}")
+            if previous:
+                return previous["content"]
+            tasks, agents = store.records(session, "task_state"), store.records(session, "agent_run")
+            task = store.get(session, f"task:{self.task_id}")
+            if not (any(t["context_id"] == target for t in tasks) or any(a["context_id"] == target for a in agents)) or target == self.context_id:
+                return "Error: 目标助手无效"
+            messages = store.records(session, "agent_message", context_id=self.context_id, delivery="pending")
+            reply = next((message for message in messages if message["source"] == target), None)
+            other = next((t for t in tasks if t["context_id"] == target), None)
+            helper = next((a for a in agents if a["context_id"] == target), None)
+            if self.stop.is_set() or task.get("stop_requested") or task.get("dependency"):
+                result = "Error: 等待已被停止或依赖变更打断。"
+            elif any(message["source"] == "main" for message in messages):
+                result = "Error: 收到新要求，请先处理再继续等待。"
+            elif reply:
+                agent_bus.processed(session, reply)
+                result = reply["content"]
+            elif ((other and other["status"] in {"completed", "failed", "stopped"})
+                  or (helper and helper["status"] in {"completed", "failed", "stopped"})):
+                result = "Error: 对方助手已结束，且没有待处理回复。"
+            else:
+                result = None
+            if result is not None:
                 wait = store.get(session, key)
                 if wait:
                     wait["status"] = "completed"
                     store.put(session, key, wait)
-            await asyncio.shield(self.runtime.change(clear))
+                store.put(session, f"wait-result:{identity}", {"type": "agent_wait_result",
+                          "context_id": self.context_id, "content": result})
+                return result
+            target_task = other or next((t for t in tasks if helper and t["id"] == helper["task_id"]), None)
+            if target_task and target_task["status"] not in {"completed", "failed", "stopped"}:
+                target_task["order"] = min(target_task["order"], task["order"])
+                store.put(session, f"task:{target_task['id']}", target_task)
+            store.put(session, key, {"type": "agent_wait", "key": key, "context_id": self.context_id,
+                      "target": target, "task_id": self.task_id, "status": "waiting"})
+            state_key = f"helper:{self.helper_id}" if self.helper_id else f"task:{self.task_id}"
+            state = store.get(session, state_key)
+            state["status"] = "waiting_agent"
+            store.put(session, state_key, state)
+            cycles = agent_bus.find_cycles(agent_bus.wait_graph(session))
+            if cycles:
+                agent_bus.send(session, source="runtime", target="main", task_id=self.task_id,
+                               content=f"检测到助手等待环，请判断：{cycles}", kind="cycle", message_id=f"cycle:{identity}")
+            return None
+        result = await self.runtime.change(check)
+        if result is None:
+            raise AgentWaiting
+        return result
 
     async def finish(self, outcome: str, content: str) -> None:
         def save(session):

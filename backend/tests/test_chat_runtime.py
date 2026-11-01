@@ -870,9 +870,109 @@ def test_review_blocks_newer_tasks_and_continue_starts_new_round(isolated):
     asyncio.run(run())
 
 
+def test_restart_regenerates_unfinished_reply_without_recreating_task(isolated):
+    class ReplyModel(FakeModel):
+        def __init__(self, interrupt):
+            super().__init__()
+            self.interrupt = interrupt
+            self.reply_started = asyncio.Event()
+            self.routes = 0
+            self.replies = 0
+            self.dialog_tools = set()
+
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            if tool_choice and tool_choice["name"] == "route_input":
+                self.routes += 1
+                async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
+                    yield event
+            elif system.startswith("你是后台工作助手"):
+                async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
+                    yield event
+            else:
+                self.replies += 1
+                self.dialog_tools = {tool["name"] for tool in tools}
+                if self.interrupt:
+                    yield {"type": "text_delta", "text": "未完成的回复"}
+                    self.reply_started.set()
+                    await asyncio.Event().wait()
+                else:
+                    yield {"type": "text_delta", "text": "恢复后的回复"}
+                    yield {"type": "stop_reason", "reason": "end_turn"}
+
+    async def run():
+        first = ReplyModel(interrupt=True)
+        runtime = Runtime(client=first)
+        await runtime.start()
+        try:
+            await runtime.accept("recover", "任务检查文件", None)
+            await asyncio.wait_for(first.reply_started.wait(), 4)
+            with db.new_session() as session:
+                assert store.get(session, "reply:recover")["status"] == "pending"
+                assert len(store.records(session, "task_state")) == 1
+        finally:
+            await runtime.close()
+
+        second = ReplyModel(interrupt=False)
+        runtime = Runtime(client=second)
+        await runtime.start()
+        try:
+            def completed():
+                with db.new_session() as session:
+                    return store.get(session, "reply:recover")["status"] == "completed"
+            await wait_for(completed)
+            with db.new_session() as session:
+                assert len(store.records(session, "task_state")) == 1
+                visible = store.visible(session)
+                assert any(m["text"] == "未完成的回复" and m["status"] == "interrupted" for m in visible)
+                assert sum(m["text"] == "恢复后的回复" for m in visible) == 1
+            assert second.routes == 0 and second.replies == 1 and "task_create" not in second.dialog_tools
+        finally:
+            await runtime.close()
+
+        third = ReplyModel(interrupt=False)
+        runtime = Runtime(client=third)
+        await runtime.start()
+        try:
+            await asyncio.sleep(0.3)
+            assert third.routes == 0 and third.replies == 0
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_pending_reply_survives_missing_model_configuration(isolated):
+    async def run():
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            store.append_history(session, "main", "user", "你好")
+            store.put(session, "reply:pending", {"type": "main_reply", "id": "pending", "source_seq": 1,
+                      "note": "继续回答", "status": "pending"})
+            session.commit()
+        runtime = Runtime(client=FakeModel())
+        runtime.client = None
+        await runtime.start()
+        try:
+            await asyncio.sleep(0.3)
+            with db.new_session() as session:
+                assert store.get(session, "reply:pending")["status"] == "pending"
+                assert any("模型配置不完整" in message["text"] for message in store.visible(session))
+        finally:
+            await runtime.close()
+        runtime = Runtime(client=FakeModel())
+        await runtime.start()
+        try:
+            def completed():
+                with db.new_session() as session:
+                    return store.get(session, "reply:pending")["status"] == "completed"
+            await wait_for(completed)
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
 def test_agent_wait_delivers_messages_before_and_after_registration(isolated):
     from app.agent import agent_bus
-    from app.agent.worker import Worker
+    from app.agent.worker import AgentWaiting, Worker
 
     async def run():
         runtime = Runtime(client=FakeModel())
@@ -889,20 +989,258 @@ def test_agent_wait_delivers_messages_before_and_after_registration(isolated):
         worker.context_id, worker.run_id = a["context_id"], "run"
         assert await worker.wait_for_agent(b["context_id"], "wait-one") == "提前回复"
         assert await worker.wait_for_agent(b["context_id"], "wait-one") == "提前回复"
-        waiting = asyncio.create_task(worker.wait_for_agent(b["context_id"], "wait-two"))
+        with pytest.raises(AgentWaiting):
+            await worker.wait_for_agent(b["context_id"], "wait-two")
+        with db.new_session() as session:
+            assert store.get(session, "agent-wait:wait-two")["status"] == "waiting"
+            assert store.get(session, f"task:{a['id']}")["status"] == "waiting_agent"
+        await runtime.change(lambda session: agent_bus.send(session, source=b["context_id"], target=a["context_id"],
+                             task_id=b["id"], content="随后回复"))
+        assert await worker.wait_for_agent(b["context_id"], "wait-two") == "随后回复"
+    asyncio.run(run())
+
+
+def test_waiting_agents_release_slots_and_resume_after_restart(isolated):
+    class WaitModel(FakeModel):
+        def __init__(self, contexts):
+            super().__init__()
+            self.contexts = contexts
+            self.d_started = asyncio.Event()
+            self.release_d = asyncio.Event()
+            self.waiters_started = 0
+            self.all_started = asyncio.Event()
+            self.release_waiters = asyncio.Event()
+
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            if not system.startswith("你是后台工作助手"):
+                async for part in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
+                    yield part
+                return
+            goal = next(m["content"].split("：", 1)[1] for m in messages
+                        if isinstance(m["content"], str) and m["content"].startswith("任务目标："))
+            results = any(isinstance(m["content"], list) and any(b.get("type") == "tool_result" for b in m["content"])
+                          for m in messages)
+            if goal in {"A", "B", "C"} and not results:
+                self.waiters_started += 1
+                if self.waiters_started == 3:
+                    self.all_started.set()
+                await self.release_waiters.wait()
+                yield {"type": "tool_use", "id": "wait", "name": "agent_wait",
+                       "input": {"context_id": self.contexts["D"]}}
+            elif goal == "D" and not results:
+                self.d_started.set()
+                await self.release_d.wait()
+                for name in ("A", "B", "C"):
+                    yield {"type": "tool_use", "id": f"send-{name}", "name": "agent_send",
+                           "input": {"context_id": self.contexts[name], "content": f"给 {name} 的回复"}}
+            elif goal == "D":
+                yield {"type": "text_delta", "text": "D 已完成"}
+            else:
+                await asyncio.Event().wait()
+            yield {"type": "stop_reason", "reason": "tool_use"}
+
+    async def run():
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            setup = Runtime(client=FakeModel())
+            tasks = {name: setup.create_task(session, name, index) for index, name in enumerate("ABCD", 1)}
+            session.commit()
+        contexts = {name: task["context_id"] for name, task in tasks.items()}
+        first = WaitModel(contexts)
+        runtime = Runtime(client=first)
+        await runtime.start()
         try:
-            def registered():
+            await asyncio.wait_for(first.all_started.wait(), 8)
+            first.release_waiters.set()
+            await asyncio.wait_for(first.d_started.wait(), 8)
+            def all_waiting():
                 with db.new_session() as session:
-                    record = store.get(session, "agent-wait:wait-two")
-                    return bool(record and record["status"] == "waiting")
-            await wait_for(registered)
-            await runtime.change(lambda session: agent_bus.send(session, source=b["context_id"], target=a["context_id"],
-                                 task_id=b["id"], content="随后回复"))
-            assert await asyncio.wait_for(waiting, 3) == "随后回复"
+                    return all(store.get(session, f"task:{tasks[name]['id']}")["status"] == "waiting_agent" for name in "ABC")
+            await wait_for(all_waiting)
+            with db.new_session() as session:
+                assert all(store.get(session, f"task:{tasks[name]['id']}")["status"] == "waiting_agent" for name in "ABC")
+                runs = {name: store.get(session, f"task:{tasks[name]['id']}")["run_id"] for name in "ABC"}
+                assert len([w for w in store.records(session, "agent_wait") if w["status"] == "waiting"]) == 3
         finally:
-            if not waiting.done():
-                waiting.cancel()
-                await asyncio.gather(waiting, return_exceptions=True)
+            await runtime.close()
+        second = WaitModel(contexts)
+        runtime = Runtime(client=second)
+        await runtime.start()
+        try:
+            await asyncio.wait_for(second.d_started.wait(), 8)
+            second.release_d.set()
+            def resumed():
+                with db.new_session() as session:
+                    waits = store.records(session, "agent_wait")
+                    return len(waits) == 3 and all(w["status"] == "completed" for w in waits)
+            await wait_for(resumed, timeout=8)
+            with db.new_session() as session:
+                for name in "ABC":
+                    task = store.get(session, f"task:{tasks[name]['id']}")
+                    assert task["run_id"] == runs[name]
+                    results = [block for message in store.history(session, contexts[name])
+                               if isinstance(message["content"], list) for block in message["content"]
+                               if block.get("type") == "tool_result"]
+                    assert len(results) == 1 and f"给 {name} 的回复" in results[0]["content"]
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("helper", [False, True])
+def test_wait_target_inherits_earliest_task_order(isolated, helper):
+    from app.agent.worker import AgentWaiting, Worker
+
+    async def run():
+        runtime = Runtime(client=FakeModel())
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            task = runtime.create_task(session, "A", 1)
+            task.update(status="running", run_id="run")
+            store.put(session, f"task:{task['id']}", task)
+            reviewing = runtime.create_task(session, "等待判断", 2)
+            reviewing["status"] = "reviewing"
+            store.put(session, f"task:{reviewing['id']}", reviewing)
+            queued = runtime.create_task(session, "其他任务", 3)
+            if helper:
+                target_context = "priority-helper"
+                store.put(session, f"helper:{target_context}", {"type": "agent_run", "task_id": task["id"],
+                          "context_id": target_context, "run_id": "helper-run", "caller": task["context_id"],
+                          "status": "queued", "steps": 0})
+                store.append_history(session, target_context, "user", "协助任务：完成 A")
+            else:
+                target = runtime.create_task(session, "依赖任务", 4)
+                target_context = target["context_id"]
+            session.commit()
+        worker = Worker(runtime, task["id"])
+        worker.context_id, worker.run_id = task["context_id"], "run"
+        with pytest.raises(AgentWaiting):
+            await worker.wait_for_agent(target_context, "wait-priority")
+        await runtime._schedule_once()
+        try:
+            await asyncio.wait_for(runtime.client.worker_started.wait(), 4)
+            with db.new_session() as session:
+                assert store.get(session, f"task:{queued['id']}")["status"] == "queued"
+                if helper:
+                    assert store.get(session, f"helper:{target_context}")["status"] == "running"
+                else:
+                    selected = store.get(session, f"task:{target['id']}")
+                    assert selected["status"] == "running" and selected["order"] == 1
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("helper", [False, True])
+@pytest.mark.parametrize("ready", [False, True])
+def test_stopping_a_waiting_agent_completes_its_tool_call(isolated, helper, ready):
+    from app.agent import agent_bus
+    from app.agent.worker import AgentWaiting, Worker
+
+    async def run():
+        runtime = Runtime(client=FakeModel())
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            task = runtime.create_task(session, "A", 1)
+            target = runtime.create_task(session, "B", 2)
+            task.update(status="running", run_id="run")
+            target["status"] = "running"
+            store.put(session, f"task:{task['id']}", task)
+            store.put(session, f"task:{target['id']}", target)
+            if ready:
+                reviewing = runtime.create_task(session, "较早任务", 0)
+                reviewing["status"] = "reviewing"
+                store.put(session, f"task:{reviewing['id']}", reviewing)
+                runtime.create_task(session, "较晚排队任务", 99)
+            context = "helper-context" if helper else task["context_id"]
+            if helper:
+                store.put(session, f"helper:{context}", {"type": "agent_run", "task_id": task["id"],
+                          "context_id": context, "run_id": "run", "caller": task["context_id"],
+                          "status": "running", "steps": 1})
+            call = {"type": "tool_use", "id": "call", "name": "agent_wait", "input": {"context_id": target["context_id"]}}
+            store.append_history(session, context, "assistant", [call])
+            store.put(session, "execution:wait", {"type": "tool_execution", "id": "wait", "call_id": "call",
+                      "task_id": task["id"], "context_id": context, "run_id": "run", "name": "agent_wait",
+                      "input": call["input"], "status": "pending"})
+            store.put(session, "group:wait", {"type": "tool_group", "id": "wait", "context_id": context,
+                      "calls": ["wait"], "status": "pending"})
+            session.commit()
+        worker = Worker(runtime, task["id"], context if helper else None)
+        worker.context_id, worker.run_id = context, "run"
+        with pytest.raises(AgentWaiting):
+            await worker.process_group("wait")
+        if ready:
+            await runtime.change(lambda session: agent_bus.send(session, source=target["context_id"], target=context,
+                                 task_id=target["id"], content="回复已到", message_id="reply-before-stop"))
+            with db.new_session() as session:
+                tasks, helpers = store.records(session, "task_state"), store.records(session, "agent_run")
+                changed, _ = runtime._resume_agent_waits(session, tasks, helpers)
+                assert changed
+                assert store.get(session, "agent-wait:wait")["status"] == "ready"
+                session.commit()
+        await runtime.change(lambda session: runtime._main_action(session, "task_stop", {"task_id": task["id"]}, None, "stop"))
+        if ready and not helper:
+            from app.agent.runtime import _task_context
+            with db.new_session() as session:
+                summary, _ = _task_context(session, task["id"])
+                assert summary[0]["stop_requested"]
+        await runtime._schedule_once()
+        try:
+            def stopped():
+                with db.new_session() as session:
+                    key = f"helper:{context}" if helper else f"task:{task['id']}"
+                    return store.get(session, key)["status"] == "stopped"
+            await wait_for(stopped)
+            with db.new_session() as session:
+                assert store.get(session, "agent-wait:wait")["status"] == "completed"
+                assert store.get(session, "group:wait")["status"] == "completed"
+                result = store.history(session, context)[-1]["content"][0]
+                assert result["is_error"] and "停止" in result["content"]
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_waiting_agent_resumes_on_user_update_and_detects_wait_cycle(isolated):
+    from app.agent import agent_bus
+    from app.agent.worker import AgentWaiting, Worker
+
+    async def run():
+        runtime = Runtime(client=FakeModel())
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            a, b = runtime.create_task(session, "A", 1), runtime.create_task(session, "B", 2)
+            for task in (a, b):
+                task.update(status="running", run_id="run")
+                store.put(session, f"task:{task['id']}", task)
+            store.put(session, "execution:wait-a", {"type": "tool_execution", "id": "wait-a", "call_id": "call-a",
+                      "task_id": a["id"], "context_id": a["context_id"], "run_id": "run", "name": "agent_wait",
+                      "input": {"context_id": b["context_id"]}, "status": "pending"})
+            store.put(session, "group:wait-a", {"type": "tool_group", "id": "wait-a", "context_id": a["context_id"],
+                      "calls": ["wait-a"], "status": "pending"})
+            session.commit()
+        wa, wb = Worker(runtime, a["id"]), Worker(runtime, b["id"])
+        wa.context_id, wa.run_id = a["context_id"], "run"
+        wb.context_id, wb.run_id = b["context_id"], "run"
+        with pytest.raises(AgentWaiting):
+            await wa.process_group("wait-a")
+        with pytest.raises(AgentWaiting):
+            await wb.wait_for_agent(a["context_id"], "wait-b")
+        with db.new_session() as session:
+            assert any(m["kind"] == "cycle" for m in store.records(session, "agent_message", context_id="main"))
+        await runtime.change(lambda session: agent_bus.send(session, source="main", target=a["context_id"],
+                             task_id=a["id"], content="修改后的要求", message_id="update"))
+        await runtime._schedule_once()
+        try:
+            await asyncio.wait_for(runtime.client.worker_started.wait(), 4)
+            with db.new_session() as session:
+                result = next(block for message in store.history(session, a["context_id"])
+                              if isinstance(message["content"], list) for block in message["content"]
+                              if block.get("type") == "tool_result")
+                assert result["is_error"] and "新要求" in result["content"]
+                assert any(message["content"] == "修改后的要求" for message in store.history(session, a["context_id"]))
+        finally:
+            await runtime.close()
     asyncio.run(run())
 
 
@@ -1012,6 +1350,177 @@ def test_saved_output_pagination_and_task_scope(isolated):
         second = read_output(session, {"output_id": "one", "offset": offset}, task_id="A")
         assert first.split("\n[继续读取", 1)[0] + second == content
         assert read_output(session, {"output_id": "one"}, task_id="B").startswith("Error:")
+
+
+def test_task_context_is_bounded_and_old_details_remain_searchable(isolated):
+    import re
+    from app.agent import agent_bus
+    from app.agent.runtime import _TASK_CONTEXT_LIMIT, _task_context
+    from app.models import Part
+
+    runtime = Runtime(client=FakeModel())
+    with db.new_session() as session:
+        store.initialize(session, isolated)
+        for index in range(70):
+            task = runtime.create_task(session, f"进行中 {index} " + "长" * 700, index + 1)
+            task.update(status="running", files=["路径" * 150] * 4)
+            store.put(session, f"task:{task['id']}", task)
+        old = runtime.create_task(session, "远古枫叶 " + "原" * 13000, 100)
+        old["status"] = "completed"
+        store.put(session, f"task:{old['id']}", old)
+        for index in range(3):
+            agent_bus.send(session, source=old["context_id"], target="main", task_id=old["id"],
+                           kind="review", content=f"较早报告 {index}", message_id=f"older-report-{index}")
+        agent_bus.send(session, source=old["context_id"], target="main", task_id=old["id"],
+                       kind="review", content="历史报告" + "结" * 12000, message_id="old-report")
+        for index in range(12):
+            task = runtime.create_task(session, f"近期关键词 {index}", 101 + index)
+            task["status"] = "completed"
+            store.put(session, f"task:{task['id']}", task)
+            session.get(Part, f"task:{task['id']}").time_updated = 1000 + index
+        session.get(Part, f"task:{old['id']}").time_updated = 1
+        session.commit()
+        summaries, omitted = _task_context(session)
+        assert omitted and len(store.dump(summaries)) <= _TASK_CONTEXT_LIMIT
+        assert any(t["status"] == "running" for t in summaries)
+        assert any(t["status"] == "completed" for t in summaries)
+        assert old["id"] not in {t["id"] for t in summaries}
+        priority, _ = _task_context(session, old["id"])
+        assert priority[0]["id"] == old["id"]
+
+        search = json.loads(runtime._main_action(session, "task_search", {"keyword": "枫叶"}, None, "search"))
+        assert [t["id"] for t in search["tasks"]] == [old["id"]]
+        first = json.loads(runtime._main_action(session, "task_search", {"keyword": "关键词"}, None, "search"))
+        second = json.loads(runtime._main_action(session, "task_search", {"keyword": "关键词", "offset": first["next_offset"]}, None, "search"))
+        assert len(first["tasks"]) == 10 and len(second["tasks"]) == 2 and second["next_offset"] is None
+        assert not ({t["id"] for t in first["tasks"]} & {t["id"] for t in second["tasks"]})
+        def read_details(report_offset):
+            chunks, offset = [], 0
+            while True:
+                part = runtime._main_action(session, "task_inspect", {
+                    "task_id": old["id"], "offset": offset, "report_offset": report_offset}, None, "inspect")
+                assert len(part) <= 8000
+                match = re.search(r"\n\[继续读取：offset=(\d+)\]$", part)
+                chunks.append(part[:match.start()] if match else part)
+                if not match:
+                    return json.loads("".join(chunks))
+                offset = int(match.group(1))
+        details = read_details(0)
+        assert details["goal"] == old["goal"]
+        assert details["reports"][0]["content"] == "历史报告" + "结" * 12000
+        assert details["reports_next_offset"] == 3
+        assert read_details(3)["reports"][0]["content"] == "较早报告 0"
+        assert runtime._main_action(session, "task_search", {"keyword": "枫叶", "offset": -1}, None, "search").startswith("Error:")
+        assert runtime._main_action(session, "task_search", {"keyword": "枫叶", "offset": 10**100}, None, "search").startswith("Error:")
+        assert runtime._main_action(session, "task_inspect", {"task_id": old["id"], "report_offset": True}, None, "inspect").startswith("Error:")
+
+
+def test_old_task_can_be_found_from_main_chat(isolated):
+    from app.agent import agent_bus
+    from app.models import Part
+
+    class SearchModel(FakeModel):
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            if tool_choice and tool_choice["name"] == "route_input":
+                request = json.loads(messages[-1]["content"])
+                assert "远古枫叶" not in system
+                yield {"type": "tool_use", "id": "route", "name": "route_input", "input": {
+                    "message_id": request["message_id"], "user_seq": request["user_seq"],
+                    "intents": [{"type": "query", "instruction": "查询枫叶任务"}], "needs_clarification": False}}
+            else:
+                blocks = [block for message in messages if isinstance(message["content"], list)
+                          for block in message["content"]]
+                names = [block.get("name") for block in blocks if block.get("type") == "tool_use"]
+                if "task_search" not in names:
+                    yield {"type": "tool_use", "id": "search", "name": "task_search", "input": {"keyword": "枫叶"}}
+                elif "task_inspect" not in names:
+                    output = next(block["content"] for block in blocks if block.get("tool_use_id") == "search")
+                    task_id = json.loads(output)["tasks"][0]["id"]
+                    yield {"type": "tool_use", "id": "inspect", "name": "task_inspect", "input": {"task_id": task_id}}
+                else:
+                    output = next(block["content"] for block in blocks if block.get("tool_use_id") == "inspect")
+                    assert "历史报告：已经完成" in output
+                    yield {"type": "text_delta", "text": "枫叶任务已经完成。"}
+            yield {"type": "stop_reason", "reason": "end_turn"}
+
+    async def run():
+        runtime = Runtime(client=SearchModel())
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            old = runtime.create_task(session, "远古枫叶", 1)
+            old["status"] = "completed"
+            store.put(session, f"task:{old['id']}", old)
+            agent_bus.send(session, source=old["context_id"], target="main", task_id=old["id"],
+                           kind="review", content="历史报告：已经完成", message_id="old-report")
+            report = store.get(session, "bus:old-report")
+            agent_bus.processed(session, report)
+            for index in range(7):
+                task = runtime.create_task(session, f"近期任务 {index}", index + 2)
+                task["status"] = "completed"
+                store.put(session, f"task:{task['id']}", task)
+                session.get(Part, f"task:{task['id']}").time_updated = 1000 + index
+            session.get(Part, f"task:{old['id']}").time_updated = 1
+            session.commit()
+        await runtime.start()
+        try:
+            await runtime.accept("old-question", "以前枫叶任务结果是什么？", None)
+            def answered():
+                with db.new_session() as session:
+                    return any(m["text"] == "枫叶任务已经完成。" for m in store.visible(session))
+            await wait_for(answered)
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_omitted_active_task_can_be_found_and_stopped(isolated):
+    class SearchAndStop(FakeModel):
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            if tool_choice and tool_choice["name"] == "route_input":
+                request = json.loads(messages[-1]["content"])
+                assert "特殊目标五十五" not in system
+                yield {"type": "tool_use", "id": "route", "name": "route_input", "input": {
+                    "message_id": request["message_id"], "user_seq": request["user_seq"],
+                    "intents": [{"type": "unclear", "instruction": "找到并停止特殊目标五十五"}],
+                    "needs_clarification": True}}
+            elif system.startswith("你是后台工作助手"):
+                async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
+                    yield event
+                return
+            else:
+                blocks = [block for message in messages if isinstance(message["content"], list)
+                          for block in message["content"]]
+                names = [block.get("name") for block in blocks if block.get("type") == "tool_use"]
+                if "task_search" not in names:
+                    yield {"type": "tool_use", "id": "search", "name": "task_search", "input": {"keyword": "特殊目标五十五"}}
+                elif "task_stop" not in names:
+                    output = next(block["content"] for block in blocks if block.get("tool_use_id") == "search")
+                    task_id = json.loads(output)["tasks"][0]["id"]
+                    yield {"type": "tool_use", "id": "stop", "name": "task_stop", "input": {"task_id": task_id}}
+                else:
+                    yield {"type": "text_delta", "text": "已停止指定任务。"}
+            yield {"type": "stop_reason", "reason": "end_turn"}
+
+    async def run():
+        runtime = Runtime(client=SearchAndStop())
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            for index in range(54):
+                runtime.create_task(session, f"普通任务 {index}", index + 1)
+            target = runtime.create_task(session, "特殊目标五十五", 55)
+            session.commit()
+        await runtime.start()
+        try:
+            await runtime.accept("stop-omitted", "停止特殊目标五十五", None)
+            def stopped():
+                with db.new_session() as session:
+                    return store.get(session, f"task:{target['id']}")["status"] == "stopped"
+            await wait_for(stopped, timeout=8)
+            with db.new_session() as session:
+                assert sum(task["status"] == "stopped" for task in store.records(session, "task_state")) == 1
+        finally:
+            await runtime.close()
+    asyncio.run(run())
 
 
 @pytest.mark.parametrize(("script", "failed"), [

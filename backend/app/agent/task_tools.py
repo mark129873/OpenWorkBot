@@ -17,7 +17,11 @@ ROUTE = _schema("route_input", "判断用户消息与任务的关系。", {
 MAIN_TOOLS = [
     _schema("task_create", "创建需要后台执行的任务。", {
         "title": {"type": "string"}, "goal": {"type": "string"}}, ["title", "goal"]),
-    _schema("task_inspect", "查看任务状态。", {"task_id": {"type": "string"}}, ["task_id"]),
+    _schema("task_inspect", "分页查看任务详情和报告；继续读取文本时保留相同 report_offset。", {
+        "task_id": {"type": "string"}, "offset": {"type": "integer", "minimum": 0},
+        "report_offset": {"type": "integer", "minimum": 0}}, ["task_id"]),
+    _schema("task_search", "按关键词查找历史任务，关键词为空时列出最近任务；结果分页。", {
+        "keyword": {"type": "string"}, "offset": {"type": "integer", "minimum": 0}}, ["keyword"]),
     _schema("task_update", "向任务传达修改要求。", {
         "task_id": {"type": "string"}, "instruction": {"type": "string"}}, ["task_id", "instruction"]),
     _schema("task_stop", "停止一个任务。", {"task_id": {"type": "string"}}, ["task_id"]),

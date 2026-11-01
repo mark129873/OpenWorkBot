@@ -7,19 +7,69 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from sqlalchemy import func, or_, select
+
 from app import db
 from app.agent import agent_bus, compact, hooks
 from app.agent.llm import build_client
 from app.agent.model_call import record_model_step
 from app.agent.task_tools import MAIN_TOOLS, ROUTE, SHARED_TOOLS
 from app.config import settings, validate_llm_config
-from app.models import LocalSetting, new_id
+from app.models import LocalSetting, Part, new_id
 from app.sessions import chat_store as store
 from app.sessions import execution_state, session_permissions
 
 logger = logging.getLogger(__name__)
 _TERMINAL = {"completed", "failed", "stopped"}
+_TASK_CONTEXT_LIMIT = 12000
+_TASK_ACTIVE_LIMIT = 50
+_TASK_RECENT_LIMIT = 5
 _PROMPT_PATH = Path(__file__).with_name("system_prompt.md")
+
+
+def _valid_offset(value) -> bool:
+    return type(value) is int and 0 <= value < 2**63
+
+
+def _task_summary(task: dict) -> dict:
+    goal = task.get("goal", "")
+    files = task.get("files", [])
+    return {"id": task["id"], "title": task["title"], "status": task["status"], "order": task["order"],
+            "stop_requested": task.get("stop_requested", False),
+            "goal": goal[:320] + ("…" if len(goal) > 320 else ""), "dependency": task.get("dependency"),
+            "files": [path[:240] for path in files[:3]], "files_omitted": len(files) > 3}
+
+
+def _task_context(session, priority: str | None = None) -> tuple[list[dict], bool]:
+    kind = func.json_extract(Part.data, "$.type")
+    status = func.json_extract(Part.data, "$.status")
+    base = select(Part).where(Part.message_id == "main:control", kind == "task_state")
+    active = list(session.scalars(base.where(status.not_in(_TERMINAL))
+                .order_by(func.json_extract(Part.data, "$.order"), Part.id).limit(_TASK_ACTIVE_LIMIT + 1)))
+    recent = list(session.scalars(base.where(status.in_(_TERMINAL))
+                .order_by(Part.time_updated.desc(), Part.id.desc()).limit(_TASK_RECENT_LIMIT + 1)))
+    omitted = len(active) > _TASK_ACTIVE_LIMIT or len(recent) > _TASK_RECENT_LIMIT
+    active, recent = active[:_TASK_ACTIVE_LIMIT], recent[:_TASK_RECENT_LIMIT]
+    if priority:
+        row = session.get(Part, f"task:{priority}")
+        if row:
+            if store.read(row)["status"] in _TERMINAL:
+                omitted |= len(recent) == _TASK_RECENT_LIMIT and all(item.id != row.id for item in recent)
+                recent = ([row] + [item for item in recent if item.id != row.id])[:_TASK_RECENT_LIMIT]
+            else:
+                omitted |= len(active) == _TASK_ACTIVE_LIMIT and all(item.id != row.id for item in active)
+                active = ([row] + [item for item in active if item.id != row.id])[:_TASK_ACTIVE_LIMIT]
+    rows = active[:5] + recent + active[5:]
+    if priority and row:
+        rows = [row] + [item for item in rows if item.id != row.id]
+    summaries = []
+    for row in rows:
+        summary = _task_summary(store.read(row))
+        if len(store.dump([*summaries, summary])) > _TASK_CONTEXT_LIMIT:
+            omitted = True
+            continue
+        summaries.append(summary)
+    return summaries, omitted
 
 
 class Conflict(ValueError):
@@ -70,17 +120,14 @@ class Runtime:
                     if row_key:
                         waiting["status"] = "completed"
                         store.put(session, row_key, waiting)
-            for waiting in store.records(session, "agent_wait"):
-                if waiting.get("status") == "waiting" and waiting.get("key"):
-                    waiting["status"] = "completed"
-                    store.put(session, waiting["key"], waiting)
             for message in store.visible(session):
                 if message["status"] == "streaming":
                     store.update_visible(session, message["id"], status="interrupted")
             meta = store.get(session, "meta")
-            unfinished = any(t["status"] not in _TERMINAL for t in store.records(session, "task_state"))
+            unfinished = (any(t["status"] not in _TERMINAL for t in store.records(session, "task_state"))
+                          or any(r["status"] == "pending" for r in store.records(session, "main_reply")))
             if self.client is None and unfinished and not meta.get("config_warned"):
-                store.add_visible(session, "assistant", "模型配置不完整，未完成的任务会保留；请检查模型配置。", status="failed")
+                store.add_visible(session, "assistant", "模型配置不完整，未完成的任务和回复会保留；请检查模型配置。", status="failed")
                 meta["config_warned"] = True
                 store.put(session, "meta", meta)
             elif self.client is not None and meta.get("config_warned"):
@@ -164,6 +211,10 @@ class Runtime:
                 if old["text"] != text or old.get("permission_mode") != mode:
                     raise Conflict("消息 ID 已用于不同内容")
                 return {"message_id": message_id, "user_seq": old["user_seq"], "replayed": True}
+            for reply in store.records(session, "main_reply"):
+                if reply["status"] == "pending":
+                    reply["status"] = "superseded"
+                    store.put(session, f"reply:{reply['id']}", reply)
             meta = store.bump(session, user_event=True)
             store.add_visible(session, "user", text, message_id=message_id)
             event = {"type": "user_event", "event_type": "message", "id": client_id,
@@ -225,6 +276,9 @@ class Runtime:
                       if row.get("event_type") == "message" and row["status"] == "pending"]
             if inputs:
                 return "user", min(inputs, key=lambda item: item["user_seq"])
+            replies = [row for row in store.records(session, "main_reply") if row["status"] == "pending"] if self.client else []
+            if replies:
+                return "reply", min(replies, key=lambda item: item["source_seq"])
             reports = [row for row in store.records(session, "agent_message", context_id="main")
                        if row["delivery"] in {"pending", "delivered"} and row.get("retry_at", 0) <= time.time()]
             return ("report", reports[0]) if reports else (None, None)
@@ -240,7 +294,9 @@ class Runtime:
                     except asyncio.TimeoutError:
                         pass
                     continue
-                self.main_call = asyncio.create_task(self._input(item) if kind == "user" else self._report(item))
+                operation = (self._input(item) if kind == "user" else self._resume_reply(item) if kind == "reply"
+                             else self._report(item))
+                self.main_call = asyncio.create_task(operation)
                 try:
                     await self.main_call
                 except asyncio.CancelledError:
@@ -266,6 +322,15 @@ class Runtime:
                 if row:
                     row["status"] = "failed"
                     store.put(session, f"input:{item['id']}", row)
+                reply = store.get(session, f"reply:{item['id']}")
+                if reply and reply["status"] == "pending":
+                    reply["status"] = "failed"
+                    store.put(session, f"reply:{item['id']}", reply)
+            elif kind == "reply":
+                reply = store.get(session, f"reply:{item['id']}")
+                if reply and reply["status"] == "pending":
+                    reply["status"] = "failed"
+                    store.put(session, f"reply:{item['id']}", reply)
             else:
                 row = store.get(session, f"bus:{item['id']}")
                 if row:
@@ -282,7 +347,7 @@ class Runtime:
             raise RuntimeError("模型配置不完整")
         generation = self.generation
         with db.new_session() as session:
-            tasks = store.records(session, "task_state")
+            tasks, omitted = _task_context(session)
             approvals = [a for a in store.records(session, "approval") if a["status"] == "requested"
                          or (a["status"] == "resolved" and a.get("user_seq", 0) > event["user_seq"])]
             visible = store.visible(session)
@@ -294,8 +359,10 @@ class Runtime:
                         "只有无需任何实际操作的常识和简单问答才使用 chat。"
                         "对每项独立要求分别输出意图；禁止任务中的某项操作属于 update，只有明确停止整个任务才用 stop。"
                         "变更或停止必须结合审批的文件路径或命令，列出受影响的审批 ID；确认没有受影响审批时返回空数组，"
-                        "无法判断时标记 unclear。\n"
-                        f"任务：{json.dumps(tasks, ensure_ascii=False)}\n审批：{json.dumps(approvals, ensure_ascii=False)}")
+                        "无法判断时标记 unclear。任务列表是摘要，未列出或无法确定的历史任务不得猜测 ID；"
+                        "历史查询使用 query，修改或停止无法确定时使用 unclear，主助手随后可搜索。"
+                        f"{'部分任务已省略。' if omitted else ''}\n"
+                        f"任务：{store.dump(tasks)}\n审批：{json.dumps(approvals, ensure_ascii=False)}")
         request = {"message_id": event["message_id"], "user_seq": event["user_seq"], "text": event["text"],
                    "recent_messages": [{"role": m["role"], "text": m["text"]} for m in recent]}
         messages = [{"role": "user", "content": json.dumps(request, ensure_ascii=False)}]
@@ -319,7 +386,13 @@ class Runtime:
                                 and row["user_seq"] > event["user_seq"] for row in store.records(session, "user_event"))
         if later_pending or not result["needs_reply"]:
             return
-        await self._dialog(f"系统已处理用户消息：{result['summary']}", source_seq=event["user_seq"])
+        with db.new_session() as session:
+            pending_reply = store.get(session, f"reply:{event['id']}")
+        if pending_reply and pending_reply["status"] == "pending":
+            await self._resume_reply(pending_reply, recovered=False)
+
+    async def _resume_reply(self, reply: dict, *, recovered: bool = True) -> None:
+        await self._dialog(reply["note"], source_seq=reply["source_seq"], reply_id=reply["id"], recovered=recovered)
 
     @staticmethod
     def _validate_route(route: dict, event: dict) -> None:
@@ -398,11 +471,7 @@ class Runtime:
                     notes.append(f"任务 {task['title']} 有更新消息或审批，需重新判断")
                     continue
                 if kind == "stop":
-                    task["stop_requested"] = True
-                    if task["status"] in {"queued", "waiting_dependency", "reviewing"}:
-                        task["status"] = "stopped"
-                        self._release_dependents(session, task)
-                    store.put(session, f"task:{task_id}", task)
+                    self._stop_task(session, task)
                 else:
                     self._send_update(session, task, intent["instruction"], f"update:{event['id']}:{index}")
                 notes.append(f"已{('停止' if kind == 'stop' else '更新')}任务 {task['title']}")
@@ -413,7 +482,11 @@ class Runtime:
                 needs_reply = True
         row["status"] = "processed"
         store.put(session, f"input:{event['id']}", row)
-        return {"summary": "；".join(notes) or "继续对话", "needs_reply": needs_reply}
+        summary = "；".join(notes) or "继续对话"
+        if needs_reply and not later_messages:
+            store.put(session, f"reply:{event['id']}", {"type": "main_reply", "id": event["id"],
+                      "source_seq": event["user_seq"], "note": f"系统已处理用户消息：{summary}", "status": "pending"})
+        return {"summary": summary, "needs_reply": needs_reply}
 
     def create_task(self, session, goal: str, order: int, *, key: str | None = None, title: str | None = None) -> dict:
         if not isinstance(goal, str) or not goal.strip():
@@ -535,19 +608,21 @@ class Runtime:
             await self._dialog(f"系统重新判断了任务【{task['title']}】的较早要求：{result}", source_seq=latest_seq)
 
     async def _dialog(self, note: str, *, source_seq: int | None = None, required_review: str | None = None,
-                      review_report_id: str | None = None) -> None:
+                      review_report_id: str | None = None, reply_id: str | None = None, recovered: bool = False) -> None:
         generation = self.generation
         unavailable_attempts = 0
         for step in range(40):
             if generation != self.generation:
                 raise asyncio.CancelledError
             with db.new_session() as session:
-                tasks = store.records(session, "task_state")
+                tasks, omitted = _task_context(session, required_review)
             messages = await compact.context_history(self, "main")
-            messages.append({"role": "user", "content": f"{note}\n当前任务：{json.dumps(tasks, ensure_ascii=False)}"})
+            task_note = ("部分任务已省略，请用 task_search 查找；" if omitted else "") + "任务为摘要，必要时用 task_inspect 查看详情。"
+            messages.append({"role": "user", "content": f"{note}\n{task_note}\n当前任务：{store.dump(tasks)}"})
             deps = SimpleNamespace(client=self.client, recorder=SimpleNamespace(session_id="main", turn_id=new_id()))
             system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
-            dialog_tools = [tool for tool in MAIN_TOOLS if required_review or tool["name"] != "task_review"] + SHARED_TOOLS
+            dialog_tools = [tool for tool in MAIN_TOOLS if (required_review or tool["name"] != "task_review")
+                            and (not recovered or tool["name"] != "task_create")] + SHARED_TOOLS
             message_id = None
             text = ""
             saved_length = 0
@@ -595,6 +670,11 @@ class Runtime:
                             text = "这条回复暂时无法完成，请重试。"
                             store.add_visible(session, "assistant", text, status="failed")
                             store.append_history(session, "main", "assistant", text)
+                            if reply_id:
+                                row = store.get(session, f"reply:{reply_id}")
+                                if row and row["status"] == "pending":
+                                    row["status"] = "failed"
+                                    store.put(session, f"reply:{reply_id}", row)
                         await self.change(acknowledge)
                         return
                     note = "刚才的工具调用没有执行，请直接回复用户；任务结果由系统送达后再判断。"
@@ -607,15 +687,29 @@ class Runtime:
                 blocks = reply.assistant_blocks()
                 if not blocks:
                     raise ValueError("主助手没有返回内容")
-                if message_id:
-                    await self.change(lambda session: store.update_visible(session, message_id, text=text, status="completed"))
                 if not reply.tool_uses:
-                    await self.change(lambda session: store.append_history(session, "main", "assistant", blocks))
                     injection = hooks.trigger("Stop", {"turn_id": deps.recorder.turn_id, "steps": step + 1})
+                    def finish_reply(session):
+                        row = store.get(session, f"reply:{reply_id}") if reply_id else None
+                        if reply_id and (not row or row["status"] != "pending"):
+                            if message_id:
+                                store.update_visible(session, message_id, text=text, status="interrupted")
+                            return False
+                        if message_id:
+                            store.update_visible(session, message_id, text=text, status="completed")
+                        store.append_history(session, "main", "assistant", blocks)
+                        if reply_id and not (isinstance(injection, str) and injection):
+                            row["status"] = "completed"
+                            store.put(session, f"reply:{reply_id}", row)
+                        return True
+                    if not await self.change(finish_reply):
+                        return
                     if isinstance(injection, str) and injection:
                         await self.change(lambda session: store.append_history(session, "main", "user", injection))
                         continue
                     return
+                if message_id:
+                    await self.change(lambda session: store.update_visible(session, message_id, text=text, status="completed"))
                 outputs = []
                 for call in reply.tool_uses:
                     if generation != self.generation:
@@ -676,12 +770,48 @@ class Runtime:
             return f"已受理任务 {task['title']}，ID：{task['id']}"
         if name == "read_tool_output":
             return read_output(session, args)
+        if name == "task_search":
+            keyword, offset = args.get("keyword"), args.get("offset", 0)
+            if not isinstance(keyword, str) or len(keyword) > 100 or not _valid_offset(offset):
+                return "Error: 查询关键词或偏移量无效"
+            query = select(Part).where(Part.message_id == "main:control",
+                                       func.json_extract(Part.data, "$.type") == "task_state")
+            if keyword.strip():
+                term = keyword.strip().casefold()
+                query = query.where(or_(func.lower(func.json_extract(Part.data, "$.title")).contains(term, autoescape=True),
+                                        func.lower(func.json_extract(Part.data, "$.goal")).contains(term, autoescape=True)))
+            rows = list(session.scalars(query.order_by(Part.time_updated.desc(), Part.id.desc()).offset(offset).limit(11)))
+            matches = []
+            for row in rows[:10]:
+                summary = _task_summary(store.read(row))
+                if len(store.dump({"tasks": [*matches, summary], "next_offset": offset + len(matches) + 1})) > _TASK_CONTEXT_LIMIT:
+                    break
+                matches.append(summary)
+            next_offset = offset + len(matches) if len(matches) < len(rows) else None
+            return store.dump({"tasks": matches, "next_offset": next_offset})
         task_id = args.get("task_id")
         task = store.get(session, f"task:{task_id}") if isinstance(task_id, str) else None
         if not task:
             return "Error: 任务不存在"
         if name == "task_inspect":
-            return json.dumps(task, ensure_ascii=False)
+            offset, report_offset = args.get("offset", 0), args.get("report_offset", 0)
+            if not _valid_offset(offset) or not _valid_offset(report_offset):
+                return "Error: 查询偏移量无效"
+            reports = list(session.scalars(select(Part).where(
+                Part.message_id == "main:control", func.json_extract(Part.data, "$.type") == "agent_message",
+                func.json_extract(Part.data, "$.task_id") == task_id,
+                func.json_extract(Part.data, "$.kind").in_(["review", "result"])
+            ).order_by(Part.sequence.desc(), Part.id.desc()).offset(report_offset).limit(4)))
+            detail = {**task, "reports": [{"kind": item["kind"], "content": item["content"],
+                                          "run_id": item.get("run_id")} for item in map(store.read, reports[:3])],
+                      "reports_next_offset": report_offset + 3 if len(reports) > 3 else None}
+            content = store.dump(detail)
+            if offset > len(content):
+                return "Error: 查询偏移量超出范围"
+            if offset + 8000 < len(content):
+                take = 7900
+                return content[offset:offset + take] + f"\n[继续读取：offset={offset + take}]"
+            return content[offset:offset + 8000]
         if task["status"] in _TERMINAL:
             return "Error: 任务已结束"
         if name in {"task_update", "task_stop"} and source_seq is not None:
@@ -700,11 +830,7 @@ class Runtime:
             self._send_update(session, task, content, identity)
             return "修改已受理，助手会在安全边界处理"
         if name == "task_stop":
-            task["stop_requested"] = True
-            if task["status"] in {"queued", "waiting_dependency", "reviewing"}:
-                task["status"] = "stopped"
-                self._release_dependents(session, task)
-            store.put(session, f"task:{task_id}", task)
+            self._stop_task(session, task)
             return "停止请求已受理，已开始的操作可能仍会结束"
         if name == "task_review":
             if task["status"] != "reviewing":
@@ -756,6 +882,22 @@ class Runtime:
             return "依赖已登记，任务将在安全边界让出执行槽位"
         return f"Error: 未知主助手工具 {name}"
 
+    def _stop_task(self, session, task: dict) -> None:
+        task["stop_requested"] = True
+        root_wait = False
+        for wait in store.records(session, "agent_wait"):
+            if wait["task_id"] == task["id"] and wait["status"] == "ready":
+                root_wait |= wait["context_id"] == task["context_id"]
+                wait["status"] = "completed"
+                store.put(session, wait["key"], wait)
+        if task["status"] in {"queued", "waiting_dependency", "reviewing"}:
+            if root_wait:
+                task["status"] = "queued"
+            else:
+                task["status"] = "stopped"
+                self._release_dependents(session, task)
+        store.put(session, f"task:{task['id']}", task)
+
     def _release_dependents(self, session, completed: dict) -> None:
         for task in store.records(session, "task_state"):
             if task.get("dependency") == completed["id"] and not task.get("stop_requested"):
@@ -785,40 +927,92 @@ class Runtime:
                 logger.exception("后台任务调度失败")
                 await asyncio.sleep(1)
 
+    def _resume_agent_waits(self, session, tasks: list[dict], helpers: list[dict]) -> tuple[bool, dict]:
+        waits = [wait for wait in store.records(session, "agent_wait") if wait.get("status") == "waiting"]
+        if not waits:
+            return False, {}
+        messages = store.records(session, "agent_message", delivery="pending")
+        changed = False
+        orders = {}
+        for wait in waits:
+            task = next((item for item in tasks if item["id"] == wait["task_id"]), None)
+            owner = (task if task and task["context_id"] == wait["context_id"]
+                     else next((item for item in helpers if item["context_id"] == wait["context_id"]), None))
+            target = next((item for item in [*tasks, *helpers] if item["context_id"] == wait["target"]), None)
+            if not task or not owner or owner["status"] in _TERMINAL:
+                wait["status"] = "completed"
+            elif (task.get("stop_requested") or task.get("dependency") or task["status"] in _TERMINAL
+                  or not target or target["status"] in _TERMINAL
+                  or any(message["context_id"] == wait["context_id"]
+                         and message["source"] in {"main", wait["target"]} for message in messages)):
+                wait["status"] = "completed" if task.get("stop_requested") or task["status"] in _TERMINAL else "ready"
+                if owner["status"] == "waiting_agent":
+                    owner["status"] = "queued"
+                    state_key = f"task:{task['id']}" if owner is task else f"helper:{owner['context_id']}"
+                    if owner is not task:
+                        owner["resume_wait"] = True
+                    store.put(session, state_key, owner)
+            else:
+                orders[wait["target"]] = min(orders.get(wait["target"], task["order"]), task["order"])
+                continue
+            store.put(session, wait["key"], wait)
+            changed = True
+        return changed, orders
+
     async def _schedule_once(self) -> None:
         from app.agent.worker import run_worker
         async with self.lock:
             with db.new_session() as session:
                 tasks = store.records(session, "task_state")
+                helpers = store.records(session, "agent_run")
+                changed, orders = self._resume_agent_waits(session, tasks, helpers)
+                if changed:
+                    store.bump(session)
+                    session.commit()
                 active = [worker for worker in self.workers.values() if not worker.done()]
                 if len(active) >= 3:
                     return
                 reviewing = [t["order"] for t in tasks if t["status"] == "reviewing"]
                 candidates = [t for t in tasks if t["status"] == "queued" and t["id"] not in self.workers
-                              and (not reviewing or t["order"] <= min(reviewing))]
+                              and (t.get("stop_requested") or not reviewing or t["order"] <= min(reviewing))]
+                helpers = [h for h in helpers if h["status"] == "queued"
+                           and f"helper:{h['context_id']}" not in self.workers]
+                urgent = [h for h in helpers if h["context_id"] in orders
+                          and (not reviewing or orders[h["context_id"]] <= min(reviewing))]
+                first_task = min(candidates, key=lambda t: t["order"]) if candidates else None
+                first_helper = min(urgent, key=lambda h: orders[h["context_id"]]) if urgent else None
                 helper_id = None
-                if candidates:
-                    task = min(candidates, key=lambda t: t["order"])
+                if first_task and (not first_helper or first_task.get("stop_requested")
+                                   or first_task["order"] <= orders[first_helper["context_id"]]):
+                    task = first_task
                     task["status"] = "running"
                     if not task.get("run_id"):
                         task["run_id"], task["steps"] = new_id(), 0
                     store.put(session, f"task:{task['id']}", task)
                     worker_key = task["id"]
                 else:
-                    if any(t["status"] == "queued" for t in tasks):
-                        return
-                    helpers = [h for h in store.records(session, "agent_run") if h["status"] == "queued"]
+                    if first_helper:
+                        helpers = [first_helper]
+                    elif any(t["status"] == "queued" for t in tasks):
+                        helpers = [h for h in helpers if h.get("resume_wait") and any(
+                            t["id"] == h["task_id"] and (t.get("stop_requested") or t["status"] in _TERMINAL)
+                            for t in tasks)]
+                    elif reviewing:
+                        helpers = [h for h in helpers if h["context_id"] not in orders
+                                   or orders[h["context_id"]] <= min(reviewing) or h.get("resume_wait")]
                     if not helpers:
                         return
                     helper = helpers[0]
                     task = next((t for t in tasks if t["id"] == helper["task_id"]), None)
-                    if not task or task["status"] in _TERMINAL or task.get("stop_requested"):
+                    if not task or ((task["status"] in _TERMINAL or task.get("stop_requested"))
+                                    and not helper.get("resume_wait")):
                         helper["status"] = "stopped"
                         store.put(session, f"helper:{helper['context_id']}", helper)
                         session.commit()
                         return
                     helper_id = helper["context_id"]
                     worker_key = f"helper:{helper_id}"
+                    helper.pop("resume_wait", None)
                     helper["status"] = "running"
                     store.put(session, worker_key, helper)
                 store.bump(session)
