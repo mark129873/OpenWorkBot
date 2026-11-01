@@ -2,9 +2,9 @@
 
 import json
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 
-from app.models import Message, Part, Session, new_id, now_ms
+from app.models import Message, Part, Session, Todo, TurnUsage, new_id, now_ms
 from app.sessions.execution_state import project_directory, project_id
 
 
@@ -24,9 +24,43 @@ def initialize(db, data_dir) -> None:
     if db.get(Message, "main:control") is None:
         db.add(Message(id="main:control", session_id="main", data=dump({"role": "control"})))
         db.flush()
-    if get(db, "meta") is None:
-        put(db, "meta", {"type": "meta", "revision": 0, "user_seq": 0})
+    meta = get(db, "meta") or {"type": "meta", "revision": 0, "user_seq": 0}
+    if not meta.get("assistant_id"):
+        meta["assistant_id"] = new_id()
+        put(db, "meta", meta)
     db.commit()
+
+
+def archive(db) -> str:
+    archive_id = f"archive-{new_id()}"
+    source = db.get(Session, "main")
+    db.add(Session(id=archive_id, project_id=source.project_id, directory=source.directory,
+                   title=source.title, time_created=source.time_created, time_updated=now_ms(),
+                   time_archived=now_ms()))
+    db.flush()
+    messages = list(db.scalars(select(Message).where(Message.session_id == "main")))
+    for message in messages:
+        db.add(Message(id=f"{archive_id}:{message.id}", session_id=archive_id,
+                       sequence=message.sequence, time_created=message.time_created,
+                       time_updated=message.time_updated, data=message.data))
+    db.flush()
+    for part in db.scalars(select(Part).where(Part.session_id == "main")):
+        if part.message_id == "main:control" and read(part).get("type") in {"meta", "agent_context", "agent_summary"}:
+            continue
+        db.add(Part(id=f"{archive_id}:{part.id}", message_id=f"{archive_id}:{part.message_id}",
+                    session_id=archive_id, sequence=part.sequence, time_created=part.time_created,
+                    time_updated=part.time_updated, data=part.data))
+    for model in (Todo, TurnUsage):
+        for row in db.scalars(select(model).where(model.session_id == "main")):
+            values = {column.name: getattr(row, column.name) for column in model.__table__.columns}
+            values["session_id"] = archive_id
+            db.add(model(**values))
+    db.flush()
+    db.execute(delete(Part).where(Part.session_id == "main", Part.id != "meta"))
+    db.execute(delete(Message).where(Message.session_id == "main", Message.id != "main:control"))
+    db.execute(delete(Todo).where(Todo.session_id == "main"))
+    db.execute(delete(TurnUsage).where(TurnUsage.session_id == "main"))
+    return archive_id
 
 
 def get(db, key: str) -> dict | None:

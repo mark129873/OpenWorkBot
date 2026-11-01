@@ -53,6 +53,14 @@ async def wait_for(check, timeout=4):
             await asyncio.sleep(0.02)
 
 
+async def accept(runtime, *args, **kwargs):
+    return await runtime.accept(*args, assistant_id=(await runtime.snapshot())["assistant_id"], **kwargs)
+
+
+async def decide(runtime, *args, **kwargs):
+    return await runtime.decide(*args, assistant_id=(await runtime.snapshot())["assistant_id"], **kwargs)
+
+
 @pytest.fixture
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
@@ -70,16 +78,16 @@ def test_background_chat_and_idempotent_acceptance(isolated):
         runtime = Runtime(client=model)
         await runtime.start()
         try:
-            first = await runtime.accept("one", "任务：整理文件", "build")
+            first = await accept(runtime, "one", "任务：整理文件", "build")
             await asyncio.wait_for(model.worker_started.wait(), 3)
             queue, before = await runtime.subscribe()
             runtime.unsubscribe(queue)
             assert before["messages"][0]["text"] == "任务：整理文件"
-            second = await runtime.accept("two", "顺便问个问题", "build")
+            second = await accept(runtime, "two", "顺便问个问题", "build")
             assert first["user_seq"] < second["user_seq"]
-            assert (await runtime.accept("one", "任务：整理文件", "build"))["replayed"]
+            assert (await accept(runtime, "one", "任务：整理文件", "build"))["replayed"]
             with pytest.raises(Conflict):
-                await runtime.accept("one", "不同内容", "build")
+                await accept(runtime, "one", "不同内容", "build")
             model.release_worker.set()
             def complete():
                 with db.new_session() as session:
@@ -112,7 +120,7 @@ def test_restart_keeps_unknown_tool_result_and_invalidates_old_approval(isolated
                 assert store.get(session, "approval:old")["status"] == "expired"
                 assert store.get(session, f"task:{task['id']}")["status"] == "queued"
             with pytest.raises(Conflict):
-                await runtime.decide("old", "allowOnce")
+                await decide(runtime, "old", "allowOnce")
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -400,7 +408,7 @@ def test_http_stream_disconnect_keeps_worker_running(isolated):
                 async with client.stream("GET", "/api/chat/events") as response:
                     assert response.status_code == 200
                     assert (await response.aiter_lines().__anext__()).startswith("data:")
-                sent = await client.post("/api/chat/messages", json={"client_message_id": "http-one", "text": "任务：后台执行"})
+                sent = await client.post("/api/chat/messages", json={"assistant_id": (await runtime.snapshot())["assistant_id"], "client_message_id": "http-one", "text": "任务：后台执行"})
                 assert sent.status_code == 202
                 await asyncio.wait_for(model.worker_started.wait(), 3)
                 model.release_worker.set()
@@ -459,16 +467,16 @@ def test_approval_stays_available_and_session_grant_is_shared(isolated):
         try:
             await wait_for(lambda: bool(runtime.approval_events))
             request_id = next(iter(runtime.approval_events))
-            message = await runtime.accept("before-approval", "不要写入", None)
+            message = await accept(runtime, "before-approval", "不要写入", None)
             assert (await runtime.snapshot())["approvals"][0]["request_id"] == request_id
-            assert (await runtime.decide(request_id, "allowSession"))["ok"]
+            assert (await decide(runtime, request_id, "allowSession"))["ok"]
             assert (await waiting)["approved"]
             assert session_permissions.allows("main", "write_file", {"path": "x", "content": "b"})
             with db.new_session() as session:
                 approval = store.get(session, f"approval:{request_id}")
                 assert approval["user_seq"] > message["user_seq"]
             with pytest.raises(Conflict):
-                await runtime.decide(request_id, "deny")
+                await decide(runtime, request_id, "deny")
         finally:
             if not waiting.done():
                 waiting.cancel()
@@ -683,7 +691,7 @@ def test_restart_reissues_pending_approval(isolated):
             assert new_request != "old"
             with db.new_session() as session:
                 assert store.get(session, "approval:old")["status"] == "expired"
-            await runtime.decide(new_request, "deny")
+            await decide(runtime, new_request, "deny")
             def execution_finished():
                 with db.new_session() as session:
                     return store.get(session, f"execution:{execution_id}")["status"] == "completed"
@@ -759,9 +767,9 @@ def test_new_message_interrupts_only_main_reply(isolated):
         runtime = Runtime(client=model)
         await runtime.start()
         try:
-            await runtime.accept("one", "第一个问题", None)
+            await accept(runtime, "one", "第一个问题", None)
             await asyncio.wait_for(model.started.wait(), 3)
-            await runtime.accept("two", "第二个问题", None)
+            await accept(runtime, "two", "第二个问题", None)
             def replied():
                 with db.new_session() as session:
                     return any(m["text"] == "收到新问题" for m in store.visible(session))
@@ -904,7 +912,7 @@ def test_restart_regenerates_unfinished_reply_without_recreating_task(isolated):
         runtime = Runtime(client=first)
         await runtime.start()
         try:
-            await runtime.accept("recover", "任务检查文件", None)
+            await accept(runtime, "recover", "任务检查文件", None)
             await asyncio.wait_for(first.reply_started.wait(), 4)
             with db.new_session() as session:
                 assert store.get(session, "reply:recover")["status"] == "pending"
@@ -1305,7 +1313,7 @@ def test_invalid_routing_keeps_pending_approval_and_does_not_act(isolated):
                           "status": "requested", "task_id": task["id"]})
                 return task
             task = await runtime.change(setup)
-            await runtime.accept("invalid-route", "停止这个任务", None)
+            await accept(runtime, "invalid-route", "停止这个任务", None)
             def failed():
                 with db.new_session() as session:
                     return store.get(session, "input:invalid-route")["status"] == "failed"
@@ -1326,7 +1334,7 @@ def test_model_log_failure_does_not_block_chat(isolated, monkeypatch):
         runtime = Runtime(client=FakeModel())
         await runtime.start()
         try:
-            await runtime.accept("logging", "简单问题", None)
+            await accept(runtime, "logging", "简单问题", None)
             def answered():
                 with db.new_session() as session:
                     return any(m["role"] == "assistant" and m["text"] == "收到。" for m in store.visible(session))
@@ -1463,7 +1471,7 @@ def test_old_task_can_be_found_from_main_chat(isolated):
             session.commit()
         await runtime.start()
         try:
-            await runtime.accept("old-question", "以前枫叶任务结果是什么？", None)
+            await accept(runtime, "old-question", "以前枫叶任务结果是什么？", None)
             def answered():
                 with db.new_session() as session:
                     return any(m["text"] == "枫叶任务已经完成。" for m in store.visible(session))
@@ -1511,7 +1519,7 @@ def test_omitted_active_task_can_be_found_and_stopped(isolated):
             session.commit()
         await runtime.start()
         try:
-            await runtime.accept("stop-omitted", "停止特殊目标五十五", None)
+            await accept(runtime, "stop-omitted", "停止特殊目标五十五", None)
             def stopped():
                 with db.new_session() as session:
                     return store.get(session, f"task:{target['id']}")["status"] == "stopped"
@@ -1616,7 +1624,7 @@ def test_quick_command_runs_without_worker_model(isolated, monkeypatch):
         runtime = Runtime(client=model)
         await runtime.start()
         try:
-            await runtime.accept("pwd", "pwd", "build")
+            await accept(runtime, "pwd", "pwd", "build")
             await wait_for(lambda: bool(model.reports))
             assert calls == ["pwd"]
             assert model.worker_calls == 0 and "bash" in model.direct_tools
@@ -1642,11 +1650,11 @@ def test_direct_command_runs_while_worker_slots_are_full(isolated, monkeypatch):
         await runtime.start()
         try:
             for index in range(3):
-                await runtime.accept(f"task-{index}", f"任务 {index}", "build")
+                await accept(runtime, f"task-{index}", f"任务 {index}", "build")
                 await wait_for(lambda: background.workers == index + 1)
             model = DirectModel("bash", {"command": "pwd"})
             runtime.client = model
-            await runtime.accept("pwd", "pwd", "build")
+            await accept(runtime, "pwd", "pwd", "build")
             await wait_for(lambda: bool(model.reports))
             assert background.workers == 3 and model.worker_calls == 0
         finally:
@@ -1680,7 +1688,7 @@ def test_direct_steps_preserve_file_version_check(isolated):
         runtime = Runtime(client=model)
         await runtime.start()
         try:
-            await runtime.accept("edit", "读取并修改文件", "build")
+            await accept(runtime, "edit", "读取并修改文件", "build")
             await asyncio.wait_for(model.read_done.wait(), 3)
             path.write_text("old changed", encoding="utf-8")
             model.continue_edit.set()
@@ -1703,17 +1711,17 @@ def test_direct_approval_does_not_block_chat(isolated, option):
         runtime = Runtime(client=model)
         await runtime.start()
         try:
-            await runtime.accept("write", "创建文件", "build")
+            await accept(runtime, "write", "创建文件", "build")
             await wait_for(lambda: bool(runtime.approval_events))
             request_id = next(iter(runtime.approval_events))
             assert not (isolated / "workspace" / "quick.txt").exists()
-            await runtime.accept("question", "另一个问题", "build")
+            await accept(runtime, "question", "另一个问题", "build")
             def answered():
                 with db.new_session() as session:
                     return any(m["text"] == "已处理新消息。" for m in store.visible(session))
             await wait_for(answered)
             assert request_id in runtime.approval_events
-            await runtime.decide(request_id, option)
+            await decide(runtime, request_id, option)
             await wait_for(lambda: bool(model.reports))
             assert (isolated / "workspace" / "quick.txt").exists() == (option == "allowOnce")
             assert model.worker_calls == 0
@@ -1740,20 +1748,20 @@ def test_direct_operation_respects_update_and_approval_order(isolated, monkeypat
         monkeypatch.setattr(Worker, "started", pause_before_start)
         await runtime.start()
         try:
-            await runtime.accept("write", "创建文件", "build")
+            await accept(runtime, "write", "创建文件", "build")
             await wait_for(lambda: bool(runtime.approval_events))
             request_id = next(iter(runtime.approval_events))
             if not update_first:
-                await runtime.decide(request_id, "allowOnce")
+                await decide(runtime, request_id, "allowOnce")
                 await asyncio.wait_for(reached_start.wait(), 3)
-            await runtime.accept("update", "不要写入", "build")
+            await accept(runtime, "update", "不要写入", "build")
             def update_delivered():
                 with db.new_session() as session:
                     return any(m.get("source") == "main" and m.get("delivery") == "pending"
                                for m in store.records(session, "agent_message"))
             await wait_for(update_delivered)
             if update_first:
-                await runtime.decide(request_id, "allowOnce")
+                await decide(runtime, request_id, "allowOnce")
                 await asyncio.wait_for(reached_start.wait(), 3)
             release_start.set()
             await wait_for(lambda: bool(model.reports))
@@ -1830,7 +1838,7 @@ def test_direct_pending_approval_is_reissued_after_restart(isolated):
             assert request != "old"
             with db.new_session() as session:
                 assert store.get(session, "approval:old")["status"] == "expired"
-            await runtime.decide(request, "allowOnce")
+            await decide(runtime, request, "allowOnce")
             await wait_for(lambda: bool(model.reports))
             assert (isolated / "workspace" / "recovered.txt").read_text(encoding="utf-8") == "ok"
             assert model.worker_calls == 0
@@ -1927,7 +1935,7 @@ def test_first_action_runs_pwd_in_two_model_calls(isolated, monkeypatch):
         runtime = Runtime(client=model)
         await runtime.start()
         try:
-            await runtime.accept("pwd-first", "pwd", "build")
+            await accept(runtime, "pwd-first", "pwd", "build")
             await wait_for(lambda: bool(model.reply_messages))
             assert model.calls == ["first", "reply"] and calls == ["pwd"]
             assert "workspace" in json.dumps(model.reply_messages, ensure_ascii=False)
@@ -1955,7 +1963,7 @@ def test_first_action_can_search_history_in_two_model_calls(isolated):
             session.commit()
         await runtime.start()
         try:
-            await runtime.accept("search-first", "查找枫叶任务", "build")
+            await accept(runtime, "search-first", "查找枫叶任务", "build")
             await wait_for(lambda: bool(model.reply_messages))
             assert model.calls == ["first", "reply"]
             assert task["id"] in json.dumps(model.reply_messages, ensure_ascii=False)
@@ -2123,7 +2131,7 @@ def test_invalid_first_action_does_not_change_tasks_or_approvals(isolated):
                           "status": "requested", "task_id": current["id"]})
                 return current
             task = await runtime.change(setup)
-            await runtime.accept("invalid-first", "停止任务并运行 pwd", None)
+            await accept(runtime, "invalid-first", "停止任务并运行 pwd", None)
             def failed():
                 with db.new_session() as session:
                     return store.get(session, "input:invalid-first")["status"] == "failed"

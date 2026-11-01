@@ -7,6 +7,7 @@ export interface ComposerProps {
   disabled?: boolean
   streaming: boolean
   permission: PermissionState
+  assistantId?: string
   onSend: (text: string, execution: ExecutionDraft, onAccepted?: () => void) => void
   onStop: () => void
 }
@@ -16,10 +17,11 @@ const MODE_META: Record<string, { label: string; icon: typeof Hand; hint: string
   yolo: { label: '完全访问', icon: ShieldWarning, hint: '允许的操作直接执行，禁止规则仍生效' },
 }
 
-export function Composer({ disabled, permission, onSend }: ComposerProps) {
+export function Composer({ disabled, permission, assistantId, onSend }: ComposerProps) {
   const [text, setText] = useState('')
   const [draftMode, setDraftMode] = useState(permission.mode)
   const [previousMode, setPreviousMode] = useState(permission.mode)
+  const [previousAssistant, setPreviousAssistant] = useState(assistantId)
   const [menuOpen, setMenuOpen] = useState(false)
   const areaRef = useRef<HTMLTextAreaElement>(null)
   const menuRef = useRef<HTMLDivElement>(null)
@@ -27,9 +29,10 @@ export function Composer({ disabled, permission, onSend }: ComposerProps) {
   // 编辑版本防止旧请求确认清空新草稿。
   const editRevisionRef = useRef(0)
 
-  // 仅服务端模式变化时重置模式草稿，保留正文。
-  if (previousMode !== permission.mode) {
+  // 助手或服务端模式变化时重置模式草稿，保留正文。
+  if (previousMode !== permission.mode || previousAssistant !== assistantId) {
     setPreviousMode(permission.mode)
+    setPreviousAssistant(assistantId)
     setDraftMode(permission.mode)
   }
   useEffect(() => {

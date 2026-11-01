@@ -85,6 +85,7 @@ class Runtime:
         self.main_call: asyncio.Task | None = None
         self.main_loop: asyncio.Task | None = None
         self.scheduler: asyncio.Task | None = None
+        self.reset_task: asyncio.Task | None = None
         self.workers: dict[str, asyncio.Task] = {}
         self.direct_calls: dict[str, asyncio.Task] = {}
         self.direct_slots = asyncio.Semaphore(3)
@@ -99,14 +100,21 @@ class Runtime:
         session_permissions.forget_session("main")
         with db.new_session() as session:
             store.initialize(session, settings.data_dir)
+            meta = store.get(session, "meta")
+            unknown = False
             for approval in store.records(session, "approval"):
                 if approval["status"] == "requested":
                     approval["status"] = "expired"
                     store.put(session, f"approval:{approval['request_id']}", approval)
             for execution in store.records(session, "tool_execution"):
                 if execution["status"] == "started":
-                    execution.update(status="completed", output="Error: 工具结果未知，可能已产生副作用；请先检查，不要自动重跑。")
+                    unknown = True
+                    execution.update(status="completed", result_unknown=True,
+                                     output="Error: 工具结果未知，可能已产生副作用；请先检查，不要自动重跑。")
                     store.put(session, f"execution:{execution['id']}", execution)
+            if meta.get("reset") and unknown:
+                meta["reset"].update(status="blocked", reason="unknown")
+                store.put(session, "meta", meta)
             for task in store.records(session, "task_state"):
                 if task["status"] in {"running", "waiting_user"}:
                     task["status"] = "stopped" if task.get("stop_requested") else "running" if task.get("direct") else "queued"
@@ -139,11 +147,13 @@ class Runtime:
             session.commit()
         self.main_loop = asyncio.create_task(self._consume(), name="main-chat")
         self.scheduler = asyncio.create_task(self._schedule(), name="task-scheduler")
+        if (meta.get("reset") or {}).get("status") == "stopping":
+            self.reset_task = asyncio.create_task(self._finish_reset(meta["reset"]["id"]))
         self.wake.set()
 
     async def close(self) -> None:
         self.closing = True
-        pending = [task for task in [self.main_call, self.main_loop, self.scheduler,
+        pending = [task for task in [self.main_call, self.main_loop, self.scheduler, self.reset_task,
                                      *self.workers.values(), *self.direct_calls.values()] if task]
         for task in pending:
             task.cancel()
@@ -160,7 +170,8 @@ class Runtime:
     def _snapshot(self, session) -> dict:
         meta = store.get(session, "meta")
         approvals = [a for a in store.records(session, "approval") if a["status"] == "requested"]
-        return {"revision": meta["revision"], "messages": store.visible(session), "approvals": approvals,
+        return {"revision": meta["revision"], "assistant_id": meta["assistant_id"], "reset": meta.get("reset"),
+                "messages": store.visible(session), "approvals": approvals,
                 "permission_mode": execution_state.load_execution_state(settings.data_dir)["mode"],
                 "context_usage": meta.get("context_usage", {"used": 0, "window": settings.context_window})}
 
@@ -201,7 +212,13 @@ class Runtime:
             self.wake.set()
             return result
 
-    async def accept(self, client_id: str, text: str, mode: str | None) -> dict:
+    @staticmethod
+    def _check_assistant(session, assistant_id: str) -> None:
+        meta = store.get(session, "meta")
+        if assistant_id != meta["assistant_id"] or meta.get("reset"):
+            raise Conflict("助手已更换或正在删除，请刷新后重试")
+
+    async def accept(self, client_id: str, text: str, mode: str | None, *, assistant_id: str) -> dict:
         if not client_id or len(client_id) > 128 or not text.strip() or len(text) > 100000:
             raise ValueError("消息 ID 或内容无效")
         if mode is not None and mode not in {"build", "edit", "yolo"}:
@@ -209,10 +226,13 @@ class Runtime:
         message_id = f"user:{client_id}"
 
         def save(session):
+            self._check_assistant(session, assistant_id)
             old = store.get(session, f"input:{client_id}")
             if old:
                 if old["text"] != text or old.get("permission_mode") != mode:
                     raise Conflict("消息 ID 已用于不同内容")
+                if old["status"] == "cancelled":
+                    raise Conflict("消息已因删除操作中断，请重新发送")
                 return {"message_id": message_id, "user_seq": old["user_seq"], "replayed": True}
             for reply in store.records(session, "main_reply"):
                 if reply["status"] == "pending":
@@ -242,11 +262,12 @@ class Runtime:
                 self.main_call.cancel()
         return accepted
 
-    async def decide(self, request_id: str, option_id: str, feedback: str | None = None) -> dict:
+    async def decide(self, request_id: str, option_id: str, feedback: str | None = None, *, assistant_id: str) -> dict:
         if option_id not in {"allowOnce", "allowSession", "deny"} or (feedback and len(feedback) > 4096):
             raise ValueError("审批选项或理由无效")
 
         def save(session):
+            self._check_assistant(session, assistant_id)
             record = store.get(session, f"approval:{request_id}")
             if not record:
                 raise Conflict("审批不存在或已失效")
@@ -273,8 +294,154 @@ class Runtime:
             event.set()
         return result
 
+    async def reset(self, assistant_id: str, reset_id: str, confirm_stopped: bool = False) -> dict:
+        if not reset_id or len(reset_id) > 128:
+            raise ValueError("删除请求 ID 无效")
+
+        def begin(session):
+            meta = store.get(session, "meta")
+            last = meta.get("last_reset") or {}
+            if last.get("id") == reset_id:
+                if last.get("assistant_id") == assistant_id:
+                    return last
+                raise Conflict("删除请求已属于旧助手")
+            if assistant_id != meta["assistant_id"]:
+                raise Conflict("助手已更换，请刷新后重试")
+            current = meta.get("reset")
+            if current:
+                if current["id"] != reset_id:
+                    raise Conflict("已有删除请求正在处理")
+                if current.get("reason") == "unknown" and not confirm_stopped:
+                    return current
+                current.update(status="stopping", reason=None)
+            else:
+                unknown = any(execution.get("result_unknown") or str(execution.get("output", "")).startswith("Error: 工具结果未知")
+                              for execution in store.records(session, "tool_execution"))
+                current = {"id": reset_id, "assistant_id": assistant_id, "status": "blocked" if unknown else "stopping"}
+                if unknown:
+                    current["reason"] = "unknown"
+                for event in store.records(session, "user_event"):
+                    if event.get("event_type") == "message" and event["status"] == "pending":
+                        event["status"] = "cancelled"
+                        store.put(session, f"input:{event['id']}", event)
+                for reply in store.records(session, "main_reply"):
+                    if reply["status"] == "pending":
+                        reply["status"] = "cancelled"
+                        store.put(session, f"reply:{reply['id']}", reply)
+                for task in store.records(session, "task_state"):
+                    if task["status"] not in _TERMINAL:
+                        task["stop_requested"] = True
+                        if task["status"] in {"queued", "waiting_dependency", "reviewing"}:
+                            task["status"] = "stopped"
+                        store.put(session, f"task:{task['id']}", task)
+                for approval in store.records(session, "approval"):
+                    if approval["status"] == "requested":
+                        approval["status"] = "expired"
+                        store.put(session, f"approval:{approval['request_id']}", approval)
+            meta["reset"] = current
+            store.put(session, "meta", meta)
+            return current
+
+        result = await self.change(begin, "reset")
+        if result["status"] in {"stopping", "blocked"}:
+            self.generation += 1
+            if self.main_call and not self.main_call.done() and not self.main_call.cancelling():
+                self.main_call.cancel()
+            if result["status"] == "stopping" and (not self.reset_task or self.reset_task.done()):
+                self.reset_task = asyncio.create_task(self._finish_reset(reset_id))
+        return result
+
+    async def cancel_reset(self, assistant_id: str, reset_id: str) -> dict:
+        def cancel(session):
+            meta = store.get(session, "meta")
+            last = meta.get("last_reset") or {}
+            if last.get("id") == reset_id:
+                if last.get("assistant_id") == assistant_id:
+                    return last, False
+                raise Conflict("删除请求已属于旧助手")
+            current = meta.get("reset")
+            if assistant_id != meta["assistant_id"] or not current or current["id"] != reset_id:
+                raise Conflict("删除请求已失效，请刷新后重试")
+            result = {"id": reset_id, "assistant_id": assistant_id, "status": "cancelled"}
+            meta.update(reset=None, last_reset=result)
+            store.put(session, "meta", meta)
+            return result, True
+        result, applied = await self.change(cancel, "reset")
+        if applied and self.reset_task:
+            self.reset_task.cancel()
+            self.reset_task = None
+        return result
+
+    async def _finish_reset(self, reset_id: str) -> None:
+        deadline = time.monotonic() + max(1, settings.bash_timeout + 5)
+        try:
+            while True:
+                with db.new_session() as session:
+                    current = store.get(session, "meta").get("reset")
+                if not current or current["id"] != reset_id or current["status"] != "stopping":
+                    return
+                active = [task for task in [self.main_call, *self.workers.values(),
+                                            *self.direct_calls.values(), *self.active_tools] if task and not task.done()]
+                if not active:
+                    break
+                if time.monotonic() >= deadline:
+                    def block(session):
+                        meta = store.get(session, "meta")
+                        if (meta.get("reset") or {}).get("id") == reset_id:
+                            meta["reset"].update(status="blocked", reason="timeout")
+                            store.put(session, "meta", meta)
+                    await self.change(block, "reset")
+                    return
+                await asyncio.sleep(0.1)
+
+            def finish(session):
+                meta = store.get(session, "meta")
+                current = meta.get("reset")
+                if not current or current["id"] != reset_id or current["status"] != "stopping":
+                    return
+                for task in store.records(session, "task_state"):
+                    if task["status"] not in _TERMINAL:
+                        task.update(status="stopped", stop_requested=True)
+                        store.put(session, f"task:{task['id']}", task)
+                for helper in store.records(session, "agent_run"):
+                    if helper["status"] not in _TERMINAL:
+                        helper["status"] = "stopped"
+                        store.put(session, f"helper:{helper['context_id']}", helper)
+                for execution in store.records(session, "tool_execution"):
+                    if execution["status"] == "started":
+                        execution.update(status="completed", result_unknown=True,
+                                         output="Error: 工具结果未知，可能已产生副作用；请先检查，不要自动重跑。")
+                        store.put(session, f"execution:{execution['id']}", execution)
+                archive_id = store.archive(session)
+                new_assistant_id = new_id()
+                store.put(session, "meta", {"type": "meta", "revision": meta["revision"],
+                          "user_seq": meta["user_seq"], "assistant_id": new_assistant_id, "reset": None,
+                          "last_reset": {**current, "status": "completed", "new_assistant_id": new_assistant_id,
+                                         "archive_id": archive_id}})
+                key = ("project", execution_state.project_id(settings.data_dir), "permission", "mode")
+                row = session.get(LocalSetting, key)
+                if row:
+                    row.value = json.dumps({"mode": "build"})
+                session_permissions.forget_session("main")
+                self.stops.clear()
+                self.file_locks.clear()
+                self.approval_events.clear()
+            await self.change(finish, "reset")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("删除助手失败")
+            def block_error(session):
+                meta = store.get(session, "meta")
+                if (meta.get("reset") or {}).get("id") == reset_id:
+                    meta["reset"].update(status="blocked", reason="error")
+                    store.put(session, "meta", meta)
+            await self.change(block_error, "reset")
+
     def _pending(self):
         with db.new_session() as session:
+            if store.get(session, "meta").get("reset"):
+                return None, None
             inputs = [row for row in store.records(session, "user_event")
                       if row.get("event_type") == "message" and row["status"] == "pending"]
             if inputs:
@@ -612,6 +779,7 @@ class Runtime:
         await self.change(lambda session: agent_bus.processed(session, store.get(session, f"bus:{report['id']}")))
 
     async def _reconcile(self, report: dict) -> None:
+        generation = self.generation
         with db.new_session() as session:
             pending = store.get(session, report["id"])
             event = store.get(session, f"input:{pending['event_id']}")
@@ -640,7 +808,11 @@ class Runtime:
         with record_model_step(deps, prompt, messages, [ROUTE]) as reply:
             async for item in self.client.stream(system=prompt, messages=messages, tools=[ROUTE],
                                                  tool_choice={"type": "tool", "name": "route_input"}):
+                if generation != self.generation:
+                    raise asyncio.CancelledError
                 reply.accept(item)
+        if generation != self.generation:
+            raise asyncio.CancelledError
         if reply.stop_reason == "max_tokens" or len(reply.tool_uses) != 1 or reply.tool_uses[0].get("name") != "route_input":
             raise ValueError("重新判断未返回有效结果")
         route = reply.tool_uses[0].get("input") or {}
@@ -656,7 +828,7 @@ class Runtime:
             raise ValueError("重新判断的任务不匹配")
 
         def apply(session):
-            if store.get(session, "meta")["user_seq"] != latest_seq:
+            if generation != self.generation or store.get(session, "meta")["user_seq"] != latest_seq:
                 return None
             record = store.get(session, report["id"])
             current = store.get(session, f"task:{record['task_id']}")
@@ -1151,7 +1323,7 @@ class Runtime:
         while not self.closing:
             try:
                 with db.new_session() as session:
-                    direct = [task for task in store.records(session, "task_state")
+                    direct = [] if store.get(session, "meta").get("reset") else [task for task in store.records(session, "task_state")
                               if task.get("direct_phase") == "executing"]
                 for task in direct:
                     group = task["direct_group"]
@@ -1209,6 +1381,8 @@ class Runtime:
         from app.agent.worker import run_worker
         async with self.lock:
             with db.new_session() as session:
+                if store.get(session, "meta").get("reset"):
+                    return
                 tasks = store.records(session, "task_state")
                 helpers = store.records(session, "agent_run")
                 changed, orders = self._resume_agent_waits(session, tasks, helpers)

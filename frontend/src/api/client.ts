@@ -48,6 +48,8 @@ export interface ChatApproval {
 
 export interface ChatSnapshot {
   revision: number
+  assistant_id: string
+  reset: { id: string; assistant_id: string; status: 'stopping' | 'blocked'; reason?: 'unknown' | 'timeout' | 'error' | null } | null
   messages: ChatMessage[]
   approvals: ChatApproval[]
   permission_mode: string
@@ -58,15 +60,27 @@ export function getChat(): Promise<ChatSnapshot> {
   return request('/api/chat')
 }
 
-export function sendChatMessage(clientMessageId: string, text: string, mode?: string): Promise<unknown> {
+export function sendChatMessage(assistantId: string, clientMessageId: string, text: string, mode?: string): Promise<unknown> {
   return request('/api/chat/messages', { method: 'POST', body: JSON.stringify({
-    client_message_id: clientMessageId, text, ...(mode ? { permission_mode: mode } : {}),
+    assistant_id: assistantId, client_message_id: clientMessageId, text, ...(mode ? { permission_mode: mode } : {}),
   }) })
 }
 
-export function decideChatApproval(requestId: string, optionId: ApprovalOptionId, feedback?: string): Promise<unknown> {
+export function decideChatApproval(assistantId: string, requestId: string, optionId: ApprovalOptionId, feedback?: string): Promise<unknown> {
   return request(`/api/chat/approvals/${encodeURIComponent(requestId)}`, { method: 'POST', body: JSON.stringify({
-    option_id: optionId, ...(feedback ? { feedback } : {}),
+    assistant_id: assistantId, option_id: optionId, ...(feedback ? { feedback } : {}),
+  }) })
+}
+
+export function resetAssistant(assistantId: string, resetId: string, confirmStopped = false): Promise<unknown> {
+  return request('/api/chat/reset', { method: 'POST', body: JSON.stringify({
+    assistant_id: assistantId, reset_id: resetId, confirm_stopped: confirmStopped,
+  }) })
+}
+
+export function cancelAssistantReset(assistantId: string, resetId: string): Promise<unknown> {
+  return request('/api/chat/reset/cancel', { method: 'POST', body: JSON.stringify({
+    assistant_id: assistantId, reset_id: resetId,
   }) })
 }
 

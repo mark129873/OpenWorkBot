@@ -15,6 +15,7 @@ React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最�
 - 进入直接显示唯一主聊天，无会话侧栏。沿用左右消息、Markdown、空聊天引导、助手名称、用量和权限模式；移除任务详情、工具过程、复制、重新生成及停止按钮。
 - 主助手判断任务规模：简单、预计可快速完成的任务直接使用工具；复杂、耗时或适合并行的任务交给 Worker。关键进展、结果及确认回到主聊天；默认隐藏 Worker。回复默认简短，用户要求时可展开，不设固定字数。
 - 用户可随时发新消息，追问、修改、停止或提出其他任务。新消息仅打断主助手当前回复，已输出文字保存并标记；Worker 继续运行。后台报告等新消息处理后，按实际发送顺序追加。
+- 设置中的“删除”需确认；先停止任务并归档聊天和已保存结果，再新建空白助手。保留工作区、项目规则、模型配置及原模型日志；执行模式恢复 build，临时授权清空。
 - 主对话与各任务上下文独立保存和压缩，不将所有 Worker 工作细节塞进主对话。
 - 只使用单个 FastAPI 进程、`asyncio`、现有模型、SQLite 与 SSE。最多三个 Worker 执行槽位；不引入 Redis、Celery、LangGraph、任务表、Kanban 或长期记忆模块。现有 todo 不负责调度。
 
@@ -49,12 +50,16 @@ React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最�
 
 | 接口 | 契约 |
 | --- | --- |
-| `GET /api/chat` | 返回 `{revision, messages, approvals, permission_mode, context_usage}`。 |
-| `POST /api/chat/messages` | 接收 `{client_message_id, text, permission_mode?}`；非空校验，保存后返回 202，不等待模型。ID、文本和权限模式相同的重试幂等，复用 ID 且参数不同时返回 409。 |
+| `GET /api/chat` | 返回 `{revision, assistant_id, reset, messages, approvals, permission_mode, context_usage}`。 |
+| `POST /api/chat/messages` | 接收 `{assistant_id, client_message_id, text, permission_mode?}`；非空校验，保存后返回 202，不等待模型。相同请求幂等；复用 ID 参数不同时或该消息已被删除中断时返回 409，后者需用新 ID 重发。 |
 | `GET /api/chat/events` | SSE 先推送一致快照，再推送 `{revision, type, data}`，事件包括消息、审批和用量。 |
-| `POST /api/chat/approvals/{request_id}` | 接收现有 `option_id`、可选拒绝理由；落盘后按现有权限规则处理，不等待主助手判断。失效请求或不同决定重复提交返回冲突。 |
+| `POST /api/chat/approvals/{request_id}` | 接收 `assistant_id`、`option_id` 和可选拒绝理由；失效请求或不同决定重复提交返回冲突。 |
+| `POST /api/chat/reset` | 接收 `{assistant_id, reset_id, confirm_stopped?}`，幂等受理删除及必要的重试。 |
+| `POST /api/chat/reset/cancel` | 接收 `{assistant_id, reset_id}`，取消未完成的删除；已停止的任务不自动恢复。 |
 
 保留 `/api/permission/state`。订阅注册、取快照与事件发布由同一写锁及持久递增版本协调；每个连接独立队列，慢连接溢出时断开并重新取快照。流式文本分批先落库再广播；新输入推进回复代号，旧流迟到片段不得覆盖新回复。已接收的后台任务不因页面或主回复中断而取消。
+
+助手 ID 随删除更换；旧页面的消息、审批和删除请求不可作用于新助手。删除状态持久化并通过快照广播，等待已启动工具及任务收口后，在同一事务中归档旧聊天、任务状态 / 报告 / 已保存输出并建立空白上下文；版本和用户操作序号持续递增。服务重启后，如工具结果未知，删除须待用户检查并确认操作已结束；不得自动重跑。归档仅保存数据，不在当前页面展示。
 
 用户消息与审批选择统一分配持久递增的 `user_seq`。同一页面按发送 / 点击顺序提交，无须等待模型；多页面并发以服务端落盘顺序为准。模型判断携带来源序号，不能让较早消息的迟到判断覆盖同一操作较新的用户决定。
 

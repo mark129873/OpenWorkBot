@@ -25,6 +25,20 @@
       "description": "持续对话、后台进展与任务审批。",
       "status": "passing",
       "evidence": "2 项测试、构建、lint 及浏览器主聊天、并发审批、刷新恢复验证通过。"
+    },
+    {
+      "id": "Backend-02",
+      "name": "删除助手并新建",
+      "description": "停止任务、归档历史和结果、隔离新助手及恢复删除流程。",
+      "status": "passing",
+      "evidence": "空库全量 102 项通过；最终调整后删除专项 13 项及原幂等测试通过。"
+    },
+    {
+      "id": "Frontend-02",
+      "name": "助手设置",
+      "description": "删除确认、停止进度及异常处理。",
+      "status": "passing",
+      "evidence": "前端 2 项测试、构建及 lint 通过；隔离浏览器验证菜单、确认、阻塞、取消与草稿。"
     }
   ]
 }
