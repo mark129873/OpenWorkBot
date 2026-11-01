@@ -44,8 +44,8 @@
       "id": "Backend-03",
       "name": "后台 RAG 知识库",
       "description": "Worker 经 MCP 管理和检索独立知识库。",
-      "status": "passing",
-      "evidence": "空库后端 116 项、RAG 10 项通过；真实模型及隔离 Milvus 导入、问答、更新、移出通过，真实 Bot 经 Worker/MCP 导入和问答通过。"
+      "status": "in_progress",
+      "evidence": "真实模型和隔离 Milvus 经 Bot 完成导入、问答、更新、移出；Worker 更新时曾误试移出并被权限拦截，仍需减少多余调用。"
     },
     {
       "id": "Frontend-03",
