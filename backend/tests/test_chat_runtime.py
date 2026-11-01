@@ -1012,3 +1012,47 @@ def test_saved_output_pagination_and_task_scope(isolated):
         second = read_output(session, {"output_id": "one", "offset": offset}, task_id="A")
         assert first.split("\n[继续读取", 1)[0] + second == content
         assert read_output(session, {"output_id": "one"}, task_id="B").startswith("Error:")
+
+
+@pytest.mark.parametrize(("script", "failed"), [
+    ("import sys; print('failure'); sys.exit(7)", True),
+    ("print('Error: ordinary output')", False),
+])
+def test_worker_bash_reports_actual_exit_status(isolated, monkeypatch, script, failed):
+    import sys
+    from app.agent import hooks, tools
+    from app.agent.worker import Worker
+
+    popen = tools.subprocess.Popen
+    monkeypatch.setattr(tools.subprocess, "Popen", lambda *_args, **kwargs: popen(
+        [sys.executable, "-c", script], **kwargs))
+    states = []
+    monkeypatch.setattr(hooks, "trigger", lambda event, data: states.append(data["status"]) if event == "PostToolUse" else None)
+
+    async def run():
+        runtime = Runtime(client=FakeModel())
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            task = runtime.create_task(session, "测试命令", 1)
+            task.update(status="running", run_id="run", steps=1)
+            store.put(session, f"task:{task['id']}", task)
+            store.put(session, "execution:one", {"type": "tool_execution", "id": "one", "call_id": "call",
+                      "task_id": task["id"], "context_id": task["context_id"], "run_id": "run",
+                      "name": "bash", "input": {"command": "ignored"}, "status": "pending"})
+            store.put(session, "group:one", {"type": "tool_group", "id": "one", "context_id": task["context_id"],
+                      "calls": ["one"], "status": "pending"})
+            session.commit()
+        worker = Worker(runtime, task["id"])
+        worker.context_id, worker.run_id = task["context_id"], "run"
+        async def allow(_execution):
+            return None
+        monkeypatch.setattr(worker, "authorize", allow)
+        await worker.process_group("one")
+        with db.new_session() as session:
+            result = store.history(session, worker.context_id)[-1]["content"][0]
+            output = store.records(session, "tool_output")[0]
+        assert bool(result.get("is_error")) is failed
+        assert states == ["error" if failed else "completed"]
+        assert "[输出 ID:" in result["content"] and output["content"] in result["content"]
+        assert len(result["content"]) <= 30000
+    asyncio.run(run())

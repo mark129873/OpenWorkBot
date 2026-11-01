@@ -17,7 +17,7 @@
       "name": "后台多助手协作",
       "description": "主助手路由、任务调度、通信、授权与恢复。",
       "status": "in_progress",
-      "evidence": "已有 48 项测试和 DeepSeek 实测；复核发现 Worker 上限及多项执行、恢复问题待处理。"
+      "evidence": "后端 51 项测试及 DeepSeek 命令失败实测通过；等待卡死、回复恢复和任务上下文增长待处理。"
     },
     {
       "id": "Frontend-01",

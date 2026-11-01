@@ -27,10 +27,27 @@ def test_bounded_output_keeps_head_and_tail(tmp_path, monkeypatch):
     popen = tools.subprocess.Popen
     monkeypatch.setattr(tools.subprocess, "Popen", lambda *_args, **kwargs: popen([
         sys.executable, "-c", "import sys; sys.stdout.buffer.write(('开头' + '中' * 400000 + '结尾').encode('utf-8'))"], **kwargs))
-    result = tools.capture_bash("ignored")
+    result, failed = tools.capture_bash("ignored")
+    assert not failed
     assert result.startswith("开头") and result.endswith("结尾") and "中段已截断" in result
     assert len(result.encode("utf-8")) <= 1024 * 1024
     assert len(tools.output_preview(result)) <= 30000
+
+
+def test_bash_capture_reports_timeout_and_start_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "workspace_root", lambda: tmp_path)
+    monkeypatch.setattr(settings, "bash_timeout", 0.1)
+    popen = tools.subprocess.Popen
+    monkeypatch.setattr(tools.subprocess, "Popen", lambda *_args, **kwargs: popen(
+        [sys.executable, "-c", "import time; time.sleep(3)"], **kwargs))
+    output, failed = tools.capture_bash("ignored")
+    assert failed and "命令超时" in output
+
+    def fail_start(*_args, **_kwargs):
+        raise OSError("启动失败")
+    monkeypatch.setattr(tools.subprocess, "Popen", fail_start)
+    output, failed = tools.capture_bash("ignored")
+    assert failed and "命令执行失败" in output
 
 
 def test_chat_records_and_cycle_detection(tmp_path, monkeypatch):

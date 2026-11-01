@@ -210,13 +210,13 @@ class Worker:
             return render_panel(items)
         if name == "bash":
             try:
-                output = await self.runtime.run_tool(tools.capture_bash, **args)
+                output, failed = await self.runtime.run_tool(tools.capture_bash, **args)
             except TypeError as exc:
                 return f"Error: 参数不匹配：{exc}"
             output_id = new_id()
             await self.runtime.change(lambda session: store.put(session, f"output:{output_id}", {
                 "type": "tool_output", "id": output_id, "task_id": self.task_id, "content": output}))
-            return f"[输出 ID: {output_id}]\n{tools.output_preview(output, limit=29900)}"
+            return f"{'Error: ' if failed else ''}[输出 ID: {output_id}]\n{tools.output_preview(output, limit=29900)}"
         return await self.runtime.run_tool(tools.execute_tool, name, args)
 
     async def authorize(self, execution: dict) -> str | None:

@@ -59,7 +59,7 @@ def _bounded_capture(text: str) -> str:
     return data[:keep].decode("utf-8", errors="ignore") + _CAPTURE_MARKER + data[-keep:].decode("utf-8", errors="ignore")
 
 
-def capture_bash(command: str) -> str:
+def capture_bash(command: str) -> tuple[str, bool]:
     """持续排空输出，最多保留首尾各半 MiB。"""
     try:
         process = subprocess.Popen(
@@ -103,12 +103,12 @@ def capture_bash(command: str) -> str:
         if reader.is_alive():
             output += "\n...（输出管道尚未关闭，采集已停止）..."
         if timed_out:
-            return _bounded_capture(f"Error: 命令超时（>{settings.bash_timeout}s）\n{output}")
+            return _bounded_capture(f"Error: 命令超时（>{settings.bash_timeout}s）\n{output}"), True
         if process.returncode != 0:
-            return _bounded_capture(f"Error: 命令退出码 {process.returncode}\n{output}\n[exit code: {process.returncode}]")
-        return _bounded_capture(output.rstrip())
+            return _bounded_capture(f"Error: 命令退出码 {process.returncode}\n{output}\n[exit code: {process.returncode}]"), True
+        return _bounded_capture(output.rstrip()), False
     except Exception as exc:
-        return f"Error: 命令执行失败：{exc}"
+        return f"Error: 命令执行失败：{exc}", True
 
 
 def output_preview(output: str, limit: int = _OUTPUT_LIMIT) -> str:
@@ -120,7 +120,8 @@ def output_preview(output: str, limit: int = _OUTPUT_LIMIT) -> str:
 
 
 def tool_bash(command: str) -> str:
-    return output_preview(capture_bash(command))
+    output, _ = capture_bash(command)
+    return output_preview(output)
 
 
 def tool_read_file(path: str, offset: int = 1, limit: int = 2000) -> str:
