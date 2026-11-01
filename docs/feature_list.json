@@ -13,11 +13,11 @@
   },
   "features": [
     {
-      "id": "xxx",
-      "name": "xxx",
-      "description": "xxx。",
+      "id": "main_chat_multi_agent",
+      "name": "主聊天与多助手协作",
+      "description": "单主聊天、后台助手及任务通信与恢复。",
       "status": "planned",
-      "evidence": "xxx"
+      "evidence": "技术设计待审批，功能尚未实施或验收。"
     }
   ]
 }
