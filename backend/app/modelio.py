@@ -1,11 +1,13 @@
 import json
 import logging
+import threading
 import time
 from pathlib import Path
 
 from app.config import settings
 
 logger = logging.getLogger(__name__)
+_write_lock = threading.Lock()
 
 
 def record_llm_call(
@@ -53,10 +55,10 @@ def record_llm_call(
         target.mkdir(parents=True, exist_ok=True)
         path = target / f"model-io-{session_id}.jsonl"
         max_bytes = max(1, int(settings.modelio_max_bytes))
-        if path.exists() and path.stat().st_size > max_bytes:
-            # 纳秒后缀避免轮转重名。
-            path.rename(target / f"model-io-{session_id}-{time.time_ns()}.jsonl")
-        with open(path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        with _write_lock:
+            if path.exists() and path.stat().st_size > max_bytes:
+                path.rename(target / f"model-io-{session_id}-{time.time_ns()}.jsonl")
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
     except Exception as exc:  # 观测失败不得阻断对话。
         logger.warning("model-io 写入失败（忽略）：%s", exc)

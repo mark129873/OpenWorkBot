@@ -7,7 +7,7 @@ from app.agent.tools import safe_path
 
 # 文件内容可变，未知参数仍须精确匹配以防扩权。
 _FILE_PAYLOADS = {
-    "read_file": (), "write_file": ("content",),
+    "read_file": ("offset", "limit"), "write_file": ("content",),
     "edit_file": ("old_text", "new_text"), "delete_file": (),
 }
 _grants: dict[str, set[tuple[str, str]]] = {}

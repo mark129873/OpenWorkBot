@@ -5,7 +5,7 @@ OpenWorkBot, 目标打造类OpenAI Dots 的自主智能员工, 面向个人与�
 ## 开始工作
 1. 读取 scripts_mini_harness/mini_harness.py, 作为此项目harness思想的参考
 2. 阅读 docs/prd.md了解功能需求与用户侧交互
-3. 阅读 docs/architecture.md，了解项目架构
+3. 阅读 docs/architecture.md，了解项目架构以及技术设计
 4. 读取 docs/progress.md，了解最新会话进度日志
 5. 读取 docs/feature_list.json，确认开发进度
 6. 读取 docs/reliability.md，了解运行与验证要求

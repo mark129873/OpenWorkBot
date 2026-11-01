@@ -1,0 +1,800 @@
+"""由应用生命周期持有的主聊天、任务与后台执行。"""
+
+import asyncio
+import json
+import logging
+import time
+from pathlib import Path
+from types import SimpleNamespace
+
+from app import db
+from app.agent import agent_bus, compact, hooks
+from app.agent.llm import build_client
+from app.agent.model_call import record_model_step
+from app.agent.task_tools import MAIN_TOOLS, ROUTE, SHARED_TOOLS
+from app.config import settings, validate_llm_config
+from app.models import LocalSetting, new_id
+from app.sessions import chat_store as store
+from app.sessions import execution_state, session_permissions
+
+logger = logging.getLogger(__name__)
+_TERMINAL = {"completed", "failed", "stopped"}
+_PROMPT_PATH = Path(__file__).with_name("system_prompt.md")
+
+
+class Conflict(ValueError):
+    pass
+
+
+class Runtime:
+    def __init__(self, client=None) -> None:
+        self.client = client if client is not None else (build_client(settings) if not validate_llm_config(settings) else None)
+        self.lock = asyncio.Lock()
+        self.wake = asyncio.Event()
+        self.subscribers: set[asyncio.Queue] = set()
+        self.main_call: asyncio.Task | None = None
+        self.main_loop: asyncio.Task | None = None
+        self.scheduler: asyncio.Task | None = None
+        self.workers: dict[str, asyncio.Task] = {}
+        self.active_tools: set[asyncio.Task] = set()
+        self.approval_events: dict[str, asyncio.Event] = {}
+        self.stops: dict[str, asyncio.Event] = {}
+        self.file_locks: dict[str, asyncio.Lock] = {}
+        self.generation = 0
+        self.closing = False
+
+    async def start(self) -> None:
+        session_permissions.forget_session("main")
+        with db.new_session() as session:
+            store.initialize(session, settings.data_dir)
+            for approval in store.records(session, "approval"):
+                if approval["status"] == "requested":
+                    approval["status"] = "expired"
+                    store.put(session, f"approval:{approval['request_id']}", approval)
+            for execution in store.records(session, "tool_execution"):
+                if execution["status"] == "started":
+                    execution.update(status="completed", output="Error: 工具结果未知，可能已产生副作用；请先检查，不要自动重跑。")
+                    store.put(session, f"execution:{execution['id']}", execution)
+            for task in store.records(session, "task_state"):
+                if task["status"] in {"running", "waiting_user"}:
+                    task["status"] = "queued" if not task.get("stop_requested") else "stopped"
+                    store.put(session, f"task:{task['id']}", task)
+            for helper in store.records(session, "agent_run"):
+                if helper["status"] in {"running", "waiting_user"}:
+                    task = store.get(session, f"task:{helper['task_id']}")
+                    helper["status"] = "stopped" if not task or task.get("stop_requested") else "queued"
+                    store.put(session, f"helper:{helper['context_id']}", helper)
+            for waiting in store.records(session, "file_wait"):
+                if waiting.get("status") == "waiting":
+                    row_key = waiting.get("key")
+                    if row_key:
+                        waiting["status"] = "completed"
+                        store.put(session, row_key, waiting)
+            for waiting in store.records(session, "agent_wait"):
+                if waiting.get("status") == "waiting" and waiting.get("key"):
+                    waiting["status"] = "completed"
+                    store.put(session, waiting["key"], waiting)
+            for message in store.visible(session):
+                if message["status"] == "streaming":
+                    store.update_visible(session, message["id"], status="interrupted")
+            meta = store.get(session, "meta")
+            unfinished = any(t["status"] not in _TERMINAL for t in store.records(session, "task_state"))
+            if self.client is None and unfinished and not meta.get("config_warned"):
+                store.add_visible(session, "assistant", "模型配置不完整，未完成的任务会保留；请检查模型配置。", status="failed")
+                meta["config_warned"] = True
+                store.put(session, "meta", meta)
+            elif self.client is not None and meta.get("config_warned"):
+                meta["config_warned"] = False
+                store.put(session, "meta", meta)
+            store.bump(session)
+            session.commit()
+        self.main_loop = asyncio.create_task(self._consume(), name="main-chat")
+        self.scheduler = asyncio.create_task(self._schedule(), name="task-scheduler")
+        self.wake.set()
+
+    async def close(self) -> None:
+        self.closing = True
+        pending = [task for task in [self.main_call, self.main_loop, self.scheduler, *self.workers.values()] if task]
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if self.active_tools:
+            await asyncio.wait(self.active_tools, timeout=max(1, settings.bash_timeout + 5))
+
+    async def run_tool(self, function, *args, **kwargs):
+        task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+        self.active_tools.add(task)
+        task.add_done_callback(self.active_tools.discard)
+        return await asyncio.shield(task)
+
+    def _snapshot(self, session) -> dict:
+        meta = store.get(session, "meta")
+        approvals = [a for a in store.records(session, "approval") if a["status"] == "requested"]
+        return {"revision": meta["revision"], "messages": store.visible(session), "approvals": approvals,
+                "permission_mode": execution_state.load_execution_state(settings.data_dir)["mode"],
+                "context_usage": meta.get("context_usage", {"used": 0, "window": settings.context_window})}
+
+    async def snapshot(self) -> dict:
+        async with self.lock:
+            with db.new_session() as session:
+                return self._snapshot(session)
+
+    async def subscribe(self) -> tuple[asyncio.Queue, dict]:
+        async with self.lock:
+            queue: asyncio.Queue = asyncio.Queue(maxsize=128)
+            self.subscribers.add(queue)
+            with db.new_session() as session:
+                return queue, self._snapshot(session)
+
+    def unsubscribe(self, queue: asyncio.Queue) -> None:
+        self.subscribers.discard(queue)
+
+    async def change(self, action, kind: str = "message"):
+        async with self.lock:
+            with db.new_session() as session:
+                result = action(session)
+                meta = store.bump(session)
+                session.commit()
+                for task in store.records(session, "task_state"):
+                    if task.get("stop_requested"):
+                        self.stops.setdefault(task["id"], asyncio.Event()).set()
+                snapshot = self._snapshot(session)
+            event = {"revision": meta["revision"], "type": kind, "data": snapshot}
+            for queue in list(self.subscribers):
+                try:
+                    queue.put_nowait(event)
+                except asyncio.QueueFull:
+                    self.subscribers.discard(queue)
+                    while not queue.empty():
+                        queue.get_nowait()
+                    queue.put_nowait(None)
+            self.wake.set()
+            return result
+
+    async def accept(self, client_id: str, text: str, mode: str | None) -> dict:
+        if not client_id or len(client_id) > 128 or not text.strip() or len(text) > 100000:
+            raise ValueError("消息 ID 或内容无效")
+        if mode is not None and mode not in {"build", "edit", "yolo"}:
+            raise ValueError("权限模式无效")
+        message_id = f"user:{client_id}"
+
+        def save(session):
+            old = store.get(session, f"input:{client_id}")
+            if old:
+                if old["text"] != text or old.get("permission_mode") != mode:
+                    raise Conflict("消息 ID 已用于不同内容")
+                return {"message_id": message_id, "user_seq": old["user_seq"], "replayed": True}
+            meta = store.bump(session, user_event=True)
+            store.add_visible(session, "user", text, message_id=message_id)
+            event = {"type": "user_event", "event_type": "message", "id": client_id,
+                     "message_id": message_id, "user_seq": meta["user_seq"], "text": text,
+                     "permission_mode": mode, "status": "pending"}
+            store.put(session, f"input:{client_id}", event)
+            if mode is not None:
+                key = ("project", execution_state.project_id(settings.data_dir), "permission", "mode")
+                row = session.get(LocalSetting, key)
+                if row is None:
+                    row = LocalSetting(scope=key[0], scope_id=key[1], namespace=key[2], key=key[3],
+                                       value=json.dumps({"mode": mode}))
+                    session.add(row)
+                else:
+                    row.value = json.dumps({"mode": mode})
+            return {"message_id": message_id, "user_seq": meta["user_seq"], "replayed": False}
+
+        accepted = await self.change(save)
+        if not accepted["replayed"]:
+            self.generation += 1
+            if self.main_call and not self.main_call.done():
+                self.main_call.cancel()
+        return accepted
+
+    async def decide(self, request_id: str, option_id: str, feedback: str | None = None) -> dict:
+        if option_id not in {"allowOnce", "allowSession", "deny"} or (feedback and len(feedback) > 4096):
+            raise ValueError("审批选项或理由无效")
+
+        def save(session):
+            record = store.get(session, f"approval:{request_id}")
+            if not record:
+                raise Conflict("审批不存在或已失效")
+            if record["status"] != "requested":
+                if record["status"] == "resolved" and record["option_id"] == option_id and record.get("feedback") == feedback:
+                    return {"ok": True, "replayed": True}
+                raise Conflict("审批已失效或决定不一致")
+            task = store.get(session, f"task:{record['task_id']}")
+            if not task or task.get("stop_requested") or task["status"] in _TERMINAL:
+                raise Conflict("任务已停止或结束")
+            if option_id == "allowSession" and record.get("scope") is None:
+                raise Conflict("当前参数不能保存会话授权")
+            meta = store.bump(session, user_event=True)
+            record.update(status="resolved", option_id=option_id, feedback=feedback, user_seq=meta["user_seq"])
+            store.put(session, f"approval:{request_id}", record)
+            store.put(session, f"decision:{request_id}", {"type": "user_event", "event_type": "approval",
+                      "id": request_id, "task_id": record["task_id"], "user_seq": meta["user_seq"],
+                      "option_id": option_id, "status": "processed"})
+            return {"ok": True, "replayed": False}
+
+        result = await self.change(save, "approval")
+        event = self.approval_events.get(request_id)
+        if event:
+            event.set()
+        return result
+
+    def _pending(self):
+        with db.new_session() as session:
+            inputs = [row for row in store.records(session, "user_event")
+                      if row.get("event_type") == "message" and row["status"] == "pending"]
+            if inputs:
+                return "user", min(inputs, key=lambda item: item["user_seq"])
+            reports = [row for row in store.records(session, "agent_message", context_id="main")
+                       if row["delivery"] in {"pending", "delivered"} and row.get("retry_at", 0) <= time.time()]
+            return ("report", reports[0]) if reports else (None, None)
+
+    async def _consume(self) -> None:
+        while not self.closing:
+            try:
+                kind, item = self._pending()
+                if item is None:
+                    self.wake.clear()
+                    try:
+                        await asyncio.wait_for(self.wake.wait(), timeout=2)
+                    except asyncio.TimeoutError:
+                        pass
+                    continue
+                self.main_call = asyncio.create_task(self._input(item) if kind == "user" else self._report(item))
+                try:
+                    await self.main_call
+                except asyncio.CancelledError:
+                    if self.closing:
+                        raise
+                except Exception:
+                    logger.exception("主助手执行失败")
+                    error = ("模型配置不完整，请检查 ANTHROPIC_API_KEY 和 MODEL_ID。" if self.client is None
+                             else "助手暂时无法处理这条消息，请稍后重试。")
+                    await self._error_item(kind, item, error)
+                finally:
+                    self.main_call = None
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("主助手调度失败")
+                await asyncio.sleep(1)
+
+    async def _error_item(self, kind: str, item: dict, text: str) -> None:
+        def save(session):
+            if kind == "user":
+                row = store.get(session, f"input:{item['id']}")
+                if row:
+                    row["status"] = "failed"
+                    store.put(session, f"input:{item['id']}", row)
+            else:
+                row = store.get(session, f"bus:{item['id']}")
+                if row:
+                    attempts = row.get("attempts", 0) + 1
+                    row.update(attempts=attempts, retry_at=time.time() + min(60, 2 ** min(attempts, 6)))
+                    store.put(session, f"bus:{item['id']}", row)
+                    if attempts > 1:
+                        return
+            store.add_visible(session, "assistant", text, status="failed")
+        await self.change(save)
+
+    async def _input(self, event: dict) -> None:
+        if self.client is None:
+            raise RuntimeError("模型配置不完整")
+        generation = self.generation
+        with db.new_session() as session:
+            tasks = store.records(session, "task_state")
+            approvals = [a for a in store.records(session, "approval") if a["status"] == "requested"
+                         or (a["status"] == "resolved" and a.get("user_seq", 0) > event["user_seq"])]
+            visible = store.visible(session)
+            current_order = next((m["order"] for m in visible if m["id"] == event["message_id"]), 0)
+            recent = [m for m in visible if m["order"] <= current_order][-12:]
+        route_prompt = ("判断新消息与任务的关系；仅返回 route_input。主助手不直接操作文件或执行实际工作。"
+                        "需要读取文件、搜索、研究、分析、编辑或执行其他实际工作的独立新要求必须使用 create，"
+                        "即使只读、禁止命令或禁止修改也必须分配给后台助手；instruction 要保留用户的限制。"
+                        "只有无需任何实际操作的常识和简单问答才使用 chat。"
+                        "对每项独立要求分别输出意图；变更或停止要列出受影响的审批 ID，不确定时标记 unclear。\n"
+                        f"任务：{json.dumps(tasks, ensure_ascii=False)}\n审批：{json.dumps(approvals, ensure_ascii=False)}")
+        request = {"message_id": event["message_id"], "user_seq": event["user_seq"], "text": event["text"],
+                   "recent_messages": [{"role": m["role"], "text": m["text"]} for m in recent]}
+        messages = [{"role": "user", "content": json.dumps(request, ensure_ascii=False)}]
+        deps = SimpleNamespace(client=self.client, recorder=SimpleNamespace(session_id="main", turn_id=event["id"]))
+        with record_model_step(deps, route_prompt, messages, [ROUTE]) as reply:
+            async for part in self.client.stream(system=route_prompt, messages=messages, tools=[ROUTE],
+                                                  tool_choice={"type": "tool", "name": "route_input"}):
+                if generation != self.generation:
+                    raise asyncio.CancelledError
+                reply.accept(part)
+        if generation != self.generation:
+            raise asyncio.CancelledError
+        if reply.stop_reason == "max_tokens" or len(reply.tool_uses) != 1 or reply.tool_uses[0].get("name") != "route_input":
+            raise ValueError("模型未返回有效任务路由")
+        route = reply.tool_uses[0].get("input") or {}
+        self._validate_route(route, event)
+        known_approvals = {a["request_id"] for a in approvals}
+        summary = await self.change(lambda session: self._apply_route(session, event, route, known_approvals))
+        with db.new_session() as session:
+            later_pending = any(row.get("event_type") == "message" and row["status"] == "pending"
+                                and row["user_seq"] > event["user_seq"] for row in store.records(session, "user_event"))
+        if later_pending:
+            return
+        await self._dialog(f"系统已处理用户消息：{summary}", source_seq=event["user_seq"])
+
+    @staticmethod
+    def _validate_route(route: dict, event: dict) -> None:
+        if (route.get("message_id") != event["message_id"] or type(route.get("user_seq")) is not int
+                or route.get("user_seq") != event["user_seq"]
+                or not isinstance(route.get("needs_clarification"), bool)
+                or not isinstance(route.get("intents"), list) or not route["intents"]):
+            raise ValueError("任务路由格式无效")
+        for intent in route["intents"]:
+            if (not isinstance(intent, dict) or intent.get("type") not in {"chat", "create", "query", "update", "stop", "unclear"}
+                    or not isinstance(intent.get("instruction"), str)
+                    or not isinstance(intent.get("approval_ids", []), list)
+                    or any(not isinstance(x, str) or not x for x in intent.get("approval_ids", []))
+                    or (intent.get("type") in {"update", "stop"}
+                        and (not isinstance(intent.get("task_id"), str) or not intent["task_id"]))
+                    or (intent.get("type") in {"create", "update"} and not intent["instruction"].strip())):
+                raise ValueError("任务意图无效")
+
+    def _apply_route(self, session, event: dict, route: dict, known_approvals: set[str] | None = None) -> str:
+        row = store.get(session, f"input:{event['id']}")
+        if not row or row["status"] != "pending":
+            return "消息已处理"
+        store.append_history(session, "main", "user", event["text"], key=f"input:{event['id']}")
+        notes = []
+        decisions = [d for d in store.records(session, "user_event")
+                     if d.get("event_type") == "approval" and d["user_seq"] > event["user_seq"]]
+        later_messages = [m for m in store.records(session, "user_event")
+                          if m.get("event_type") == "message" and m["user_seq"] > event["user_seq"]]
+        for index, intent in enumerate(route["intents"]):
+            kind = intent["type"]
+            task_id = intent.get("task_id", "")
+            if kind == "create":
+                task = self.create_task(session, intent["instruction"], event["user_seq"],
+                                        key=f"route:{event['id']}:{index}")
+                notes.append(f"已创建任务 {task['title']}（{task['id']}）")
+            elif kind in {"update", "stop"}:
+                task = store.get(session, f"task:{task_id}")
+                if not task or task["status"] in _TERMINAL:
+                    notes.append("任务不存在或已结束，请澄清")
+                    continue
+                newer = [d for d in decisions if d["task_id"] == task_id]
+                affected = intent.get("approval_ids", [])
+                if any(not (approval := store.get(session, f"approval:{request_id}")) or approval["task_id"] != task_id
+                       for request_id in affected):
+                    notes.append(f"任务 {task['title']} 的审批关联无效，请澄清")
+                    continue
+                conflict = (kind == "stop" or not affected or any(d["id"] in affected for d in newer)
+                            or any(d["id"] not in (known_approvals or set()) for d in newer))
+                if newer and conflict:
+                    notes.append(f"任务 {task['title']} 有更新的审批决定，请结合当前状态确认冲突后再调整")
+                    continue
+                if later_messages:
+                    identity = f"reconcile:{event['id']}:{index}"
+                    store.put(session, identity, {"type": "reconcile", "id": identity, "event_id": event["id"],
+                              "intent": intent, "task_id": task_id, "status": "pending"})
+                    agent_bus.send(session, source="runtime", target="main", task_id=task_id,
+                                   content=f"任务【{task['title']}】的较早修改请求需结合后续消息重新判断。",
+                                   kind="reconcile", message_id=identity)
+                    notes.append(f"任务 {task['title']} 有更新消息，需重新判断")
+                    continue
+                if kind == "stop":
+                    task["stop_requested"] = True
+                    if task["status"] in {"queued", "waiting_dependency", "reviewing"}:
+                        task["status"] = "stopped"
+                        self._release_dependents(session, task)
+                    store.put(session, f"task:{task_id}", task)
+                else:
+                    self._send_update(session, task, intent["instruction"], f"update:{event['id']}:{index}")
+                notes.append(f"已{('停止' if kind == 'stop' else '更新')}任务 {task['title']}")
+            elif kind == "unclear" or route["needs_clarification"]:
+                notes.append("需要向用户澄清")
+        row["status"] = "processed"
+        store.put(session, f"input:{event['id']}", row)
+        return "；".join(notes) or "继续对话"
+
+    def create_task(self, session, goal: str, order: int, *, key: str | None = None, title: str | None = None) -> dict:
+        if not isinstance(goal, str) or not goal.strip():
+            raise ValueError("任务目标不能为空")
+        identity = key or new_id()
+        old = store.get(session, f"task-key:{identity}")
+        if old:
+            if old["goal"] != goal or old.get("title") != title:
+                raise ValueError("相同任务调用 ID 的参数不一致")
+            return store.get(session, f"task:{old['task_id']}")
+        task_id, context_id = new_id(), new_id()
+        task = {"type": "task_state", "id": task_id, "context_id": context_id,
+                "title": (title or goal.strip().splitlines()[0])[:40], "goal": goal,
+                "order": order, "status": "queued", "stop_requested": False,
+                "dependency": None, "files": [], "run_id": None, "steps": 0}
+        store.put(session, f"task:{task_id}", task)
+        store.put(session, f"task-key:{identity}", {"type": "task_key", "task_id": task_id, "goal": goal, "title": title})
+        store.append_history(session, context_id, "user", f"任务目标：{goal}", key=f"goal:{task_id}")
+        return task
+
+    async def _report(self, report: dict) -> None:
+        def deliver(session):
+            row = store.get(session, f"bus:{report['id']}")
+            if row and row["delivery"] == "pending":
+                agent_bus.deliver(session, row)
+        await self.change(deliver)
+        with db.new_session() as session:
+            report = store.get(session, f"bus:{report['id']}")
+            task = store.get(session, f"task:{report['task_id']}")
+        if report.get("kind") == "reconcile":
+            await self._reconcile(report)
+            return
+        current_review = (report.get("kind") == "review" and task and task["status"] == "reviewing"
+                          and task.get("run_id") == report.get("run_id") and not report.get("reviewed"))
+        required = report["task_id"] if current_review else None
+        note = ("请根据后台报告判断并回复；如是一轮结束，必须调用 task_review。" if required
+                else "请根据后台报告简短回复用户；旧轮或已判断的报告不能改变当前运行状态。")
+        await self._dialog(note,
+                           required_review=required, review_report_id=report["id"] if required else None)
+        if required:
+            with db.new_session() as session:
+                task = store.get(session, f"task:{required}")
+            if task and task["status"] == "reviewing":
+                raise ValueError("任务判断未完成")
+        await self.change(lambda session: agent_bus.processed(session, store.get(session, f"bus:{report['id']}")))
+
+    async def _reconcile(self, report: dict) -> None:
+        with db.new_session() as session:
+            pending = store.get(session, report["id"])
+            event = store.get(session, f"input:{pending['event_id']}")
+            task = store.get(session, f"task:{pending['task_id']}")
+            latest_seq = store.get(session, "meta")["user_seq"]
+            later = [item for item in store.records(session, "user_event") if item["user_seq"] > event["user_seq"]]
+        if not task or task["status"] in _TERMINAL:
+            if task:
+                await self._dialog(f"任务【{task['title']}】已结束，但此前收到修改要求：{pending['intent']['instruction']}。"
+                                   "请判断是否需要继续或向用户确认。", source_seq=latest_seq)
+            def finish(session):
+                record = store.get(session, report["id"])
+                record["status"] = "processed"
+                store.put(session, report["id"], record)
+                agent_bus.processed(session, store.get(session, f"bus:{report['id']}"))
+            await self.change(finish)
+            return
+        prompt = ("重新判断一条较早的任务修改或停止要求。后续用户消息和审批以先后顺序为准；"
+                  "如果较早要求与较新决定冲突，返回 chat 表示不再执行；无冲突则保留原意图；"
+                  "无法判断时返回 unclear 并要求澄清。只能针对给定任务，不能创建新任务。仅调用 route_input。")
+        request = {"message_id": event["message_id"], "user_seq": event["user_seq"], "original_intent": pending["intent"],
+                   "task": task, "later_user_events": later}
+        messages = [{"role": "user", "content": json.dumps(request, ensure_ascii=False)}]
+        deps = SimpleNamespace(client=self.client, recorder=SimpleNamespace(session_id="main", turn_id=report["id"]))
+        with record_model_step(deps, prompt, messages, [ROUTE]) as reply:
+            async for item in self.client.stream(system=prompt, messages=messages, tools=[ROUTE],
+                                                 tool_choice={"type": "tool", "name": "route_input"}):
+                reply.accept(item)
+        if reply.stop_reason == "max_tokens" or len(reply.tool_uses) != 1 or reply.tool_uses[0].get("name") != "route_input":
+            raise ValueError("重新判断未返回有效结果")
+        route = reply.tool_uses[0].get("input") or {}
+        self._validate_route(route, event)
+        if len(route["intents"]) != 1:
+            raise ValueError("重新判断结果必须对应单个原意图")
+        intent = route["intents"][0]
+        if intent["type"] not in {"chat", "unclear", pending["intent"]["type"]}:
+            raise ValueError("重新判断不能创建新的任务意图")
+        if intent["type"] in {"update", "stop"} and intent.get("task_id") != pending["task_id"]:
+            raise ValueError("重新判断的任务不匹配")
+
+        def apply(session):
+            if store.get(session, "meta")["user_seq"] != latest_seq:
+                return None
+            record = store.get(session, report["id"])
+            current = store.get(session, f"task:{record['task_id']}")
+            result = "较早要求已被更新的决定取代"
+            if current and current["status"] not in _TERMINAL:
+                if intent["type"] == "unclear" or route["needs_clarification"]:
+                    result = "较早要求与后续消息的关系不明确，请向用户简短确认"
+                elif intent["type"] in {"update", "stop"}:
+                    decisions = [d for d in later if d.get("event_type") == "approval" and d.get("task_id") == current["id"]]
+                    affected = intent.get("approval_ids", [])
+                    if decisions and (intent["type"] == "stop" or not affected or any(d["id"] in affected for d in decisions)):
+                        result = "较早要求与更新的审批冲突，未执行该要求"
+                    else:
+                        args = {"task_id": current["id"], "instruction": intent["instruction"]}
+                        result = self._main_action(session, f"task_{intent['type']}", args, None, report["id"])
+            record["status"] = "processed"
+            store.put(session, report["id"], record)
+            agent_bus.processed(session, store.get(session, f"bus:{report['id']}"))
+            return result
+
+        result = await self.change(apply)
+        if result is not None:
+            await self._dialog(f"系统重新判断了任务【{task['title']}】的较早要求：{result}", source_seq=latest_seq)
+
+    async def _dialog(self, note: str, *, source_seq: int | None = None, required_review: str | None = None,
+                      review_report_id: str | None = None) -> None:
+        generation = self.generation
+        for step in range(40):
+            if generation != self.generation:
+                raise asyncio.CancelledError
+            with db.new_session() as session:
+                tasks = store.records(session, "task_state")
+            messages = await compact.context_history(self, "main")
+            messages.append({"role": "user", "content": f"{note}\n当前任务：{json.dumps(tasks, ensure_ascii=False)}"})
+            deps = SimpleNamespace(client=self.client, recorder=SimpleNamespace(session_id="main", turn_id=new_id()))
+            system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
+            message_id = None
+            text = ""
+            saved_length = 0
+            last_update = 0.0
+            try:
+                with record_model_step(deps, system_prompt, messages, MAIN_TOOLS + SHARED_TOOLS) as reply:
+                    choice = {"tool_choice": {"type": "tool", "name": "task_review"}} if required_review and step == 0 else {}
+                    async for event in self.client.stream(system=system_prompt, messages=messages,
+                                                          tools=MAIN_TOOLS + SHARED_TOOLS, **choice):
+                        if generation != self.generation:
+                            raise asyncio.CancelledError
+                        reply.accept(event)
+                        if event.get("type") == "text_delta" and event.get("text"):
+                            text += event["text"]
+                            if message_id is None:
+                                message_id = await self.change(lambda session: store.add_visible(session, "assistant", text, status="streaming"))
+                                saved_length, last_update = len(text), time.monotonic()
+                            elif len(text) - saved_length >= 64 or time.monotonic() - last_update >= 0.12:
+                                await self.change(lambda session: store.update_visible(session, message_id, text=text))
+                                saved_length, last_update = len(text), time.monotonic()
+                if generation != self.generation:
+                    raise asyncio.CancelledError
+                if reply.stop_reason == "max_tokens":
+                    if message_id:
+                        await self.change(lambda session: store.update_visible(session, message_id, status="failed"))
+                    raise ValueError("主助手输出达到上限")
+                if required_review and step == 0:
+                    if (len(reply.tool_uses) != 1 or reply.tool_uses[0].get("name") != "task_review"
+                            or (reply.tool_uses[0].get("input") or {}).get("task_id") != required_review):
+                        raise ValueError("模型没有对指定任务作出有效判断")
+                def update_usage(session):
+                    meta = store.get(session, "meta")
+                    meta["context_usage"] = {"used": reply.usage.get("input_tokens", 0), "window": settings.context_window}
+                    store.put(session, "meta", meta)
+                await self.change(update_usage, "usage")
+                blocks = reply.assistant_blocks()
+                if not blocks:
+                    raise ValueError("主助手没有返回内容")
+                if message_id:
+                    await self.change(lambda session: store.update_visible(session, message_id, text=text, status="completed"))
+                if not reply.tool_uses:
+                    await self.change(lambda session: store.append_history(session, "main", "assistant", blocks))
+                    injection = hooks.trigger("Stop", {"turn_id": deps.recorder.turn_id, "steps": step + 1})
+                    if isinstance(injection, str) and injection:
+                        await self.change(lambda session: store.append_history(session, "main", "user", injection))
+                        continue
+                    return
+                outputs = []
+                for call in reply.tool_uses:
+                    if generation != self.generation:
+                        raise asyncio.CancelledError
+                    started_at = time.monotonic()
+                    context = {"name": call.get("name"), "tool_call_id": call.get("id")}
+                    hooks.trigger("PreToolUse", context)
+                    try:
+                        output = await self.change(lambda session, call=call: self._main_tool(session, call, source_seq, review_report_id))
+                    except Exception:
+                        hooks.trigger("PostToolUse", {**context, "status": "error", "duration_ms": (time.monotonic() - started_at) * 1000})
+                        raise
+                    hooks.trigger("PostToolUse", {**context, "status": "error" if output.startswith("Error:") else "completed",
+                                                   "duration_ms": (time.monotonic() - started_at) * 1000})
+                    outputs.append({"type": "tool_result", "tool_use_id": call["id"], "content": output,
+                                    **({"is_error": True} if output.startswith("Error:") else {})})
+                def save_history(session):
+                    store.append_history(session, "main", "assistant", blocks)
+                    store.append_history(session, "main", "user", outputs)
+                await self.change(save_history)
+                note = "继续根据工具结果处理；不要重复创建已受理的任务。"
+            except asyncio.CancelledError:
+                if message_id:
+                    def interrupt(session):
+                        store.update_visible(session, message_id, text=text, status="interrupted")
+                        store.append_history(session, "main", "assistant", [{"type": "text", "text": text}],
+                                             key=f"interrupted:{message_id}")
+                    await asyncio.shield(self.change(interrupt))
+                raise
+            except Exception:
+                if message_id:
+                    await self.change(lambda session: store.update_visible(session, message_id, text=text, status="failed"))
+                raise
+        raise ValueError("主助手达到 40 步上限")
+
+    def _main_tool(self, session, call: dict, source_seq: int | None, review_report_id: str | None = None) -> str:
+        name, args = call.get("name"), call.get("input") or {}
+        if not isinstance(call.get("id"), str) or not call["id"] or not isinstance(args, dict):
+            return "Error: 工具调用 ID 或参数无效"
+        identity = f"main:{call.get('id', '')}"
+        old = store.get(session, f"action:{identity}")
+        if old:
+            if old["name"] != name or old["input"] != args:
+                return "Error: 相同工具调用 ID 的参数不一致"
+            return old["output"]
+        try:
+            output = self._main_action(session, name, args, source_seq, identity, review_report_id)
+        except (KeyError, TypeError, ValueError) as exc:
+            output = f"Error: {exc}"
+        store.put(session, f"action:{identity}", {"type": "agent_action", "name": name, "input": args, "output": output})
+        return output
+
+    def _main_action(self, session, name: str, args: dict, source_seq: int | None, identity: str,
+                     review_report_id: str | None = None) -> str:
+        if name == "task_create":
+            order = source_seq or store.get(session, "meta")["user_seq"]
+            task = self.create_task(session, args["goal"], order, key=identity, title=args.get("title"))
+            return f"已受理任务 {task['title']}，ID：{task['id']}"
+        if name == "read_tool_output":
+            return read_output(session, args)
+        task_id = args.get("task_id")
+        task = store.get(session, f"task:{task_id}") if isinstance(task_id, str) else None
+        if not task:
+            return "Error: 任务不存在"
+        if name == "task_inspect":
+            return json.dumps(task, ensure_ascii=False)
+        if task["status"] in _TERMINAL:
+            return "Error: 任务已结束"
+        if name in {"task_update", "task_stop"} and source_seq is not None:
+            newer = [row for row in store.records(session, "user_event") if row.get("event_type") == "approval"
+                     and row.get("task_id") == task_id and row["user_seq"] > source_seq]
+            if newer:
+                return "Error: 该任务已有更新的审批决定，请先重新判断或询问用户"
+            later_messages = [row for row in store.records(session, "user_event") if row.get("event_type") == "message"
+                              and row["user_seq"] > source_seq]
+            if later_messages:
+                return "Error: 已有更新的用户消息，请结合后续消息重新判断"
+        if name == "task_update":
+            content = args["instruction"]
+            if not isinstance(content, str) or not content.strip():
+                return "Error: 修改要求不能为空"
+            self._send_update(session, task, content, identity)
+            return "修改已受理，助手会在安全边界处理"
+        if name == "task_stop":
+            task["stop_requested"] = True
+            if task["status"] in {"queued", "waiting_dependency", "reviewing"}:
+                task["status"] = "stopped"
+                self._release_dependents(session, task)
+            store.put(session, f"task:{task_id}", task)
+            return "停止请求已受理，已开始的操作可能仍会结束"
+        if name == "task_review":
+            if task["status"] != "reviewing":
+                return "Error: 任务当前不需要判断"
+            report = store.get(session, f"bus:{review_report_id}") if review_report_id else None
+            if (not report or report.get("task_id") != task_id or report.get("delivery") != "delivered"
+                    or report.get("run_id") != task.get("run_id") or report.get("reviewed")):
+                return "Error: 任务报告尚未投递，请等待报告后再判断"
+            decision = args.get("decision")
+            if decision == "continue":
+                task.update(status="queued", run_id=None, steps=0)
+                if args.get("instruction"):
+                    agent_bus.send(session, source="main", target=task["context_id"], task_id=task_id,
+                                   content=f"主助手判断后要求继续：{args['instruction']}", message_id=identity)
+            elif decision in {"complete", "fail", "stop"}:
+                helpers = [h for h in store.records(session, "agent_run") if h["task_id"] == task_id
+                           and h["status"] not in {"completed", "failed", "stopped"}]
+                if helpers and decision == "complete":
+                    return "Error: 协助助手仍在执行，须先收口协助工作"
+                pending = store.records(session, "agent_message", context_id=task["context_id"], delivery="pending")
+                if pending and decision == "complete":
+                    return "Error: 任务还有未处理消息，请继续处理后再判断完成"
+                task["status"] = {"complete": "completed", "fail": "failed", "stop": "stopped"}[decision]
+                if decision in {"fail", "stop"}:
+                    task["stop_requested"] = True
+                self._release_dependents(session, task)
+            else:
+                return "Error: 判断无效"
+            report["reviewed"] = decision
+            store.put(session, f"bus:{review_report_id}", report)
+            store.put(session, f"task:{task_id}", task)
+            return f"任务状态已更新为 {task['status']}"
+        if name == "task_wait_for":
+            other = store.get(session, f"task:{args.get('dependency_id')}")
+            if not other or other["id"] == task_id:
+                return "Error: 依赖任务不存在或与自身相同"
+            if other["status"] in _TERMINAL:
+                return f"依赖任务已结束，状态：{other['status']}；请直接根据结果判断。"
+            task["dependency"] = other["id"]
+            if task["status"] in {"queued", "reviewing"}:
+                task["status"] = "waiting_dependency"
+            other["order"] = min(task["order"], other["order"])
+            store.put(session, f"task:{task_id}", task)
+            store.put(session, f"task:{other['id']}", other)
+            cycles = agent_bus.find_cycles(agent_bus.wait_graph(session))
+            if cycles:
+                agent_bus.send(session, source="runtime", target="main", task_id=task_id,
+                               content=f"检测到等待环，请判断：{cycles}", kind="cycle", message_id=identity)
+            return "依赖已登记，任务将在安全边界让出执行槽位"
+        return f"Error: 未知主助手工具 {name}"
+
+    def _release_dependents(self, session, completed: dict) -> None:
+        for task in store.records(session, "task_state"):
+            if task.get("dependency") == completed["id"] and not task.get("stop_requested"):
+                task["dependency"] = None
+                if task["status"] == "waiting_dependency":
+                    task["status"] = "queued"
+                store.put(session, f"task:{task['id']}", task)
+                agent_bus.send(session, source="runtime", target=task["context_id"], task_id=task["id"],
+                               content=f"依赖任务 {completed['title']} 状态：{completed['status']}。请检查结果并继续。")
+
+    def _send_update(self, session, task: dict, content: str, identity: str) -> None:
+        targets = [task["context_id"]] + [helper["context_id"] for helper in store.records(session, "agent_run")
+                  if helper["task_id"] == task["id"] and helper["status"] not in _TERMINAL]
+        for target in targets:
+            agent_bus.send(session, source="main", target=target, task_id=task["id"],
+                           content=f"用户修改要求：{content}", message_id=f"{identity}:{target}")
+
+    async def _schedule(self) -> None:
+        while not self.closing:
+            try:
+                if self.client is not None:
+                    await self._schedule_once()
+                await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("后台任务调度失败")
+                await asyncio.sleep(1)
+
+    async def _schedule_once(self) -> None:
+        from app.agent.worker import run_worker
+        async with self.lock:
+            with db.new_session() as session:
+                tasks = store.records(session, "task_state")
+                active = [worker for worker in self.workers.values() if not worker.done()]
+                if len(active) >= 3:
+                    return
+                reviewing = [t["order"] for t in tasks if t["status"] == "reviewing"]
+                candidates = [t for t in tasks if t["status"] == "queued" and t["id"] not in self.workers
+                              and (not reviewing or t["order"] <= min(reviewing))]
+                helper_id = None
+                if candidates:
+                    task = min(candidates, key=lambda t: t["order"])
+                    task["status"] = "running"
+                    if not task.get("run_id"):
+                        task["run_id"], task["steps"] = new_id(), 0
+                    store.put(session, f"task:{task['id']}", task)
+                    worker_key = task["id"]
+                else:
+                    if any(t["status"] == "queued" for t in tasks):
+                        return
+                    helpers = [h for h in store.records(session, "agent_run") if h["status"] == "queued"]
+                    if not helpers:
+                        return
+                    helper = helpers[0]
+                    task = next((t for t in tasks if t["id"] == helper["task_id"]), None)
+                    if not task or task["status"] in _TERMINAL or task.get("stop_requested"):
+                        helper["status"] = "stopped"
+                        store.put(session, f"helper:{helper['context_id']}", helper)
+                        session.commit()
+                        return
+                    helper_id = helper["context_id"]
+                    worker_key = f"helper:{helper_id}"
+                    helper["status"] = "running"
+                    store.put(session, worker_key, helper)
+                store.bump(session)
+                session.commit()
+            worker = asyncio.create_task(run_worker(self, task["id"], helper_id), name=f"worker-{worker_key}")
+            self.workers[worker_key] = worker
+            worker.add_done_callback(lambda done, key=worker_key: self._worker_done(key, done))
+
+    def _worker_done(self, task_id: str, worker: asyncio.Task) -> None:
+        self.workers.pop(task_id, None)
+        if not worker.cancelled() and worker.exception():
+            logger.error("Worker 异常 task=%s", task_id, exc_info=worker.exception())
+        self.wake.set()
+
+
+def read_output(session, args: dict, *, task_id: str | None = None) -> str:
+    output_id, offset, limit = args.get("output_id"), args.get("offset", 0), args.get("limit", 30000)
+    if (not isinstance(output_id, str) or not isinstance(offset, int) or isinstance(offset, bool) or offset < 0
+            or not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 30000):
+        return "Error: 输出 ID 或读取范围无效"
+    row = store.get(session, f"output:{output_id}")
+    if not row or (task_id and row["task_id"] != task_id):
+        return "Error: 输出不存在或不属于当前任务"
+    text = row["content"]
+    if offset + limit < len(text):
+        marker = f"\n[继续读取：offset={offset + limit}]"
+        if limit > len(marker):
+            take = limit - len(marker)
+            return text[offset:offset + take] + f"\n[继续读取：offset={offset + take}]"
+    result = text[offset:offset + limit]
+    return result or "(已到输出末尾)"

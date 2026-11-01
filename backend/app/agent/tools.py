@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+import threading
 import uuid
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Callable
@@ -40,43 +41,124 @@ def safe_glob_pattern(pattern: str) -> str:
 
 # 保留输出尾部，避免丢失末尾报错。
 _OUTPUT_LIMIT = 30000
-_READ_LIMIT = 60000
+_READ_LIMIT = 100000
+_CAPTURE_LIMIT = 1024 * 1024
+_CAPTURE_MARKER = "\n...（输出超过 1 MiB，中段已截断）...\n"
+_CAPTURE_HALF = _CAPTURE_LIMIT // 2
 
 
 def _tail(text: str, limit: int = _OUTPUT_LIMIT) -> str:
     return text if len(text) <= limit else f"...(前段已截断)...\n{text[-limit:]}"
 
 
-def tool_bash(command: str) -> str:
+def _bounded_capture(text: str) -> str:
+    data = text.encode("utf-8")
+    if len(data) <= _CAPTURE_LIMIT:
+        return text
+    keep = (_CAPTURE_LIMIT - len(_CAPTURE_MARKER.encode("utf-8"))) // 2
+    return data[:keep].decode("utf-8", errors="ignore") + _CAPTURE_MARKER + data[-keep:].decode("utf-8", errors="ignore")
+
+
+def capture_bash(command: str) -> str:
+    """持续排空输出，最多保留首尾各半 MiB。"""
     try:
-        completed = subprocess.run(
-            ["powershell", "-NoProfile", "-Command", command],
+        process = subprocess.Popen(
+            ["powershell", "-NoProfile", "-Command",
+             "[Console]::OutputEncoding = [System.Text.UTF8Encoding]::new(); " + command],
             cwd=workspace_root(),
-            capture_output=True,
-            text=True,
-            timeout=settings.bash_timeout,
-            encoding="utf-8",
-            errors="replace",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
-        output = (completed.stdout or "") + (completed.stderr or "")
-        output = _tail(output.rstrip())
-        if completed.returncode != 0:
-            # 截断后再加 Error:，保留失败标识。
-            return f"Error: 命令退出码 {completed.returncode}\n{output}\n[exit code: {completed.returncode}]"
-        return output
-    except subprocess.TimeoutExpired:
-        return f"Error: 命令超时（>{settings.bash_timeout}s）"
+        head, tail = bytearray(), bytearray()
+        total = 0
+
+        def drain() -> None:
+            nonlocal total
+            assert process.stdout is not None
+            while chunk := process.stdout.read(8192):
+                total += len(chunk)
+                missing = _CAPTURE_HALF - len(head)
+                head.extend(chunk[:missing])
+                tail.extend(chunk[missing:])
+                if len(tail) > _CAPTURE_HALF:
+                    del tail[:-_CAPTURE_HALF]
+
+        reader = threading.Thread(target=drain, daemon=True)
+        reader.start()
+        timed_out = False
+        try:
+            process.wait(timeout=settings.bash_timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            process.wait()
+        reader.join(timeout=1)
+        if total > _CAPTURE_LIMIT:
+            keep = (_CAPTURE_LIMIT - len(_CAPTURE_MARKER.encode("utf-8"))) // 2
+            output = (head[:keep].decode("utf-8", errors="ignore")
+                      + _CAPTURE_MARKER
+                      + tail[-keep:].decode("utf-8", errors="ignore"))
+        else:
+            output = (head + tail).decode("utf-8", errors="replace")
+        if reader.is_alive():
+            output += "\n...（输出管道尚未关闭，采集已停止）..."
+        if timed_out:
+            return _bounded_capture(f"Error: 命令超时（>{settings.bash_timeout}s）\n{output}")
+        if process.returncode != 0:
+            return _bounded_capture(f"Error: 命令退出码 {process.returncode}\n{output}\n[exit code: {process.returncode}]")
+        return _bounded_capture(output.rstrip())
     except Exception as exc:
         return f"Error: 命令执行失败：{exc}"
 
 
-def tool_read_file(path: str) -> str:
+def output_preview(output: str, limit: int = _OUTPUT_LIMIT) -> str:
+    if len(output) <= limit:
+        return output
+    marker = "\n...（输出较长，可按输出 ID 分段读取）...\n"
+    half = (limit - len(marker)) // 2
+    return output[:half] + marker + output[-(limit - half - len(marker)):]
+
+
+def tool_bash(command: str) -> str:
+    return output_preview(capture_bash(command))
+
+
+def tool_read_file(path: str, offset: int = 1, limit: int = 2000) -> str:
     try:
+        if (not isinstance(offset, int) or isinstance(offset, bool) or offset < 1
+                or not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= 2000):
+            return "Error: offset 必须从 1 开始，limit 必须为 1 到 2000"
         target = safe_path(path)
         if not target.is_file():
             return f"Error: 文件不存在：{path}"
-        text = target.read_text(encoding="utf-8", errors="replace")
-        return _tail(text, _READ_LIMIT)
+        rows = []
+        size = 0
+        line_no = 0
+        next_line = None
+        with target.open(encoding="utf-8", errors="replace") as source:
+            while first := source.readline(2001):
+                line_no += 1
+                long_line = not first.endswith("\n") and len(first) > 2000
+                if long_line:
+                    rest = first
+                    while rest and not rest.endswith("\n"):
+                        rest = source.readline(8192)
+                if line_no < offset:
+                    continue
+                if line_no >= offset + limit:
+                    next_line = line_no
+                    break
+                row = f"{line_no}: {first[:2000].rstrip(chr(10)).rstrip(chr(13))}"
+                if long_line:
+                    row += " …（该行超过 2000 字符，余下内容已截断）"
+                if size + len(row) + 1 > _READ_LIMIT - 100:
+                    next_line = line_no
+                    break
+                rows.append(row)
+                size += len(row) + 1
+        if next_line is not None:
+            rows.append(f"[继续读取：offset={next_line}]")
+        return "\n".join(rows) if rows else "(文件为空或已到文件末尾)"
     except Exception as exc:
         return f"Error: 读取失败：{exc}"
 
@@ -173,8 +255,10 @@ TOOLS: list[dict] = [
         {"command": {"type": "string", "description": "PowerShell 命令"}}, ["command"],
     ),
     _schema(
-        "read_file", "读取工作区内文本文件（超长截断尾部保留）。",
-        {"path": {"type": "string", "description": "工作区内相对路径"}}, ["path"],
+        "read_file", "按行读取工作区内文本文件，超长时提示下一行。",
+        {"path": {"type": "string", "description": "工作区内相对路径"},
+         "offset": {"type": "integer", "minimum": 1},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 2000}}, ["path"],
     ),
     _schema(
         "write_file", "写入/覆盖工作区内文本文件，自动创建父目录。",

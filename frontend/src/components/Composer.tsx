@@ -1,5 +1,5 @@
 /* 模式随发送生效；输入法组字时 Enter 不发送。 */
-import { ArrowUp, CaretDown, Check, Hand, ShieldCheck, ShieldWarning, Square } from '@phosphor-icons/react'
+import { ArrowUp, CaretDown, Check, Hand, ShieldCheck, ShieldWarning } from '@phosphor-icons/react'
 import { useEffect, useRef, useState } from 'react'
 import type { ExecutionDraft, PermissionState } from '../api/client'
 
@@ -16,7 +16,7 @@ const MODE_META: Record<string, { label: string; icon: typeof Hand; hint: string
   yolo: { label: '完全访问', icon: ShieldWarning, hint: '允许的操作直接执行，禁止规则仍生效' },
 }
 
-export function Composer({ disabled, streaming, permission, onSend, onStop }: ComposerProps) {
+export function Composer({ disabled, permission, onSend }: ComposerProps) {
   const [text, setText] = useState('')
   const [draftMode, setDraftMode] = useState(permission.mode)
   const [previousMode, setPreviousMode] = useState(permission.mode)
@@ -49,7 +49,7 @@ export function Composer({ disabled, streaming, permission, onSend, onStop }: Co
 
   const trySend = () => {
     const trimmed = text.trim()
-    if (!trimmed || disabled || streaming) return
+    if (!trimmed || disabled) return
     const revision = editRevisionRef.current
     onSend(trimmed, { mode: draftMode }, () => {
       if (editRevisionRef.current === revision) setText('')
@@ -58,14 +58,14 @@ export function Composer({ disabled, streaming, permission, onSend, onStop }: Co
   }
   const meta = MODE_META[draftMode] ?? MODE_META.build
   const ModeIcon = meta.icon
-  const canSend = !disabled && !streaming && text.trim().length > 0
+  const canSend = !disabled && text.trim().length > 0
 
   return (
     <div className="composer-shell">
       <div className={`composer-card ${disabled ? 'opacity-60' : ''}`}>
         <textarea ref={areaRef} value={text} onChange={(e) => { editRevisionRef.current += 1; setText(e.target.value) }} onKeyDown={(e) => {
           if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); trySend() }
-        }} rows={2} disabled={disabled} aria-label="消息" placeholder={disabled ? '新建或选择会话开始对话' : '描述你的目标，或继续这段对话…'} className="composer-input block" />
+        }} rows={2} disabled={disabled} aria-label="消息" placeholder={disabled ? '正在连接主聊天…' : '描述你的目标，或继续这段对话…'} className="composer-input block" />
         <div className="mt-3 flex items-center justify-between gap-3">
           <div className="flex min-w-0 flex-wrap items-center gap-2">
             <div ref={menuRef} className="relative" onKeyDown={(e) => {
@@ -87,11 +87,7 @@ export function Composer({ disabled, streaming, permission, onSend, onStop }: Co
               </div>}
             </div>
           </div>
-          {streaming ? (
-            <button type="button" onClick={onStop} title="停止生成" aria-label="停止生成" className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-zinc-300 text-zinc-700 transition hover:border-red-300 hover:bg-red-50 hover:text-red-700"><Square size={14} weight="fill" /></button>
-          ) : (
-            <button type="button" onClick={trySend} disabled={!canSend} title="发送" aria-label="发送" className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl transition ${canSend ? 'bg-accent-300 text-zinc-900 hover:bg-accent-400' : 'bg-zinc-100 text-zinc-500'}`}><ArrowUp size={19} weight="bold" /></button>
-          )}
+          <button type="button" onClick={trySend} disabled={!canSend} title="发送" aria-label="发送" className={`flex h-10 w-10 shrink-0 items-center justify-center rounded-xl transition ${canSend ? 'bg-accent-300 text-zinc-900 hover:bg-accent-400' : 'bg-zinc-100 text-zinc-500'}`}><ArrowUp size={19} weight="bold" /></button>
         </div>
       </div>
       <p className="mt-3 text-center text-[11px] text-zinc-500">Enter 发送 · Shift+Enter 换行</p>

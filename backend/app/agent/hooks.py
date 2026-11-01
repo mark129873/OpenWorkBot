@@ -41,5 +41,7 @@ def _log_post_tool(context: dict) -> None:
 
 
 def register_default_hooks() -> None:
-    register("PreToolUse", _log_pre_tool)
-    register("PostToolUse", _log_post_tool)
+    if _log_pre_tool not in _registry["PreToolUse"]:
+        register("PreToolUse", _log_pre_tool)
+    if _log_post_tool not in _registry["PostToolUse"]:
+        register("PostToolUse", _log_post_tool)

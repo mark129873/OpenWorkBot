@@ -137,6 +137,62 @@ async def summarize_history(client, history: list) -> str:
     return "".join(chunks).strip()
 
 
+async def prepare_history(client, history: list, config, *, on_summary=None) -> list:
+    """只压缩发送给模型的副本，不修改保存的原始记录。"""
+    projected = deepcopy(history)
+    if not needs_compact(config, projected):
+        return projected
+    results = [block for message in projected if isinstance(message.get("content"), list)
+               for block in message["content"] if block.get("type") == "tool_result"]
+    keep = max(0, config.microcompact_keep)
+    for block in results[:-keep] if keep else results:
+        block["content"] = _MICRO_PLACEHOLDER
+    if not needs_compact(config, projected):
+        return projected
+    boundaries = [i for i, message in enumerate(projected) if i > 0 and (
+        (message.get("role") == "user" and isinstance(message.get("content"), str))
+        or (message.get("role") == "assistant" and projected[i - 1].get("role") == "user"))]
+    if not boundaries:
+        raise ValueError("上下文过长且没有可压缩的完整前缀")
+    cutoff = boundaries[-1]
+    summary = await asyncio.wait_for(summarize_history(client, projected[:cutoff]), timeout=120)
+    if not summary or estimate_history_tokens([{"role": "user", "content": summary}]) >= estimate_history_tokens(projected[:cutoff]):
+        raise ValueError("上下文摘要无效，保留原始记录")
+    projected = [{"role": "user", "content": f"<此前对话摘要>\n{summary}\n</此前对话摘要>"}, *projected[cutoff:]]
+    if needs_compact(config, projected):
+        raise ValueError("压缩后上下文仍然过长")
+    if on_summary:
+        await on_summary(cutoff, summary)
+    return projected
+
+
+async def context_history(runtime, context_id: str) -> list:
+    from app import db
+    from app.config import settings
+    from app.sessions import chat_store
+
+    with db.new_session() as session:
+        rows = chat_store.records(session, "agent_context", context_id=context_id)
+        saved = chat_store.get(session, f"summary:{context_id}")
+    start = 0
+    if saved:
+        boundary = next((i for i, row in enumerate(rows) if row["id"] == saved.get("boundary_id")), None)
+        if boundary is not None:
+            start = boundary + 1
+    messages = [{"role": row["role"], "content": row["content"]} for row in rows[start:]]
+    ids = [row["id"] for row in rows[start:]]
+    if saved and start:
+        messages.insert(0, {"role": "user", "content": f"<此前对话摘要>\n{saved['summary']}\n</此前对话摘要>"})
+        ids.insert(0, saved["boundary_id"])
+
+    async def save_summary(cutoff: int, summary: str) -> None:
+        boundary_id = ids[cutoff - 1]
+        await runtime.change(lambda session: chat_store.put(session, f"summary:{context_id}", {
+            "type": "agent_summary", "context_id": context_id, "boundary_id": boundary_id, "summary": summary}))
+
+    return await prepare_history(runtime.client, messages, settings, on_summary=save_summary)
+
+
 async def maybe_compact(deps, *, force: bool = False) -> AsyncIterator[dict]:
     """仅压缩旧轮前缀，保留活跃轮及工具配对。"""
     settings, history = deps.settings, deps.history

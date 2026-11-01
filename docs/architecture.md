@@ -1,16 +1,16 @@
 # architecture.md 架构与技术设计
 
-本文第 1 节描述现有实现；第 2～10 节为主聊天与多助手改造草案，尚未实施，须经用户整体审批后开发。
+本文记录已批准并实现的主聊天与多助手架构、技术设计和运行边界。
 
 ## 1. 当前基线
 
-React / TypeScript → FastAPI 会话接口 → 主 Agent Loop → 权限与工具 → SQLite → SSE 或历史回放。主循环默认每轮最多 40 个模型步骤；现有子助手在父轮内串行执行、最多 30 步，内部历史未独立持久化。当前没有本设计的后台多任务调度和重启续跑。
+React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最多三个独立 Worker → 权限与工具 → SQLite / SSE。主助手每轮最多 40 步，Worker 每轮最多 30 步，任务和上下文独立持久化并支持恢复。
 
-主要入口：`frontend/src/App.tsx`、`backend/app/api/sessions.py`、`agent/loop.py`、`agent/subtask.py`、`sessions/recorder.py` 和 `sessions/replay.py`。Agent 与 sessions 路径相对 `backend/app/`。
+主要入口：`frontend/src/App.tsx`、`backend/app/api/chat.py`、`agent/runtime.py`、`agent/worker.py` 和 `sessions/chat_store.py`。旧会话代码保留供回归，不再注册旧接口。Agent 与 sessions 路径相对 `backend/app/`。
 
 后端使用 Python 3.12、FastAPI、Anthropic 兼容客户端、SQLAlchemy、SQLite；前端使用 React、Vite、SSE。Skills、Hooks、todo 和现有 build / edit / yolo 权限继续沿用。根目录 `uv run --no-project start.py` 启动前后端（8100 / 5173）；`/api/health` 不依赖模型配置。当前无登录或多租户，不能直接暴露公网。
 
-## 2. 目标与产品交互（待审批）
+## 2. 产品交互
 
 - 进入直接显示唯一主聊天，无会话侧栏。沿用左右消息、Markdown、空聊天引导、助手名称、用量和权限模式；移除任务详情、工具过程、复制、重新生成及停止按钮。
 - 主助手负责持续对话、简单问答、判断、协调和分配；调查、业务分析、编写、文件和命令等实际任务交给 Worker。关键进展、结果及确认回到主聊天并标明任务；默认隐藏 Worker。回复默认简短，用户要求时可展开，不设固定字数。
@@ -31,18 +31,17 @@ React / TypeScript → FastAPI 会话接口 → 主 Agent Loop → 权限与工�
 
 `Runtime` 属于 FastAPI `lifespan`，由 `app.state` 持有主循环及各 Worker 的 `asyncio.Task` 强引用；SSE 连接只订阅事件，不拥有执行任务。主助手使用单个消费循环，用户输入优先于后台报告；Worker 独立执行。同一数据目录只允许一个后端进程：启动时获取进程锁，已有进程持锁则明确报错，退出或异常时释放锁。
 
-| 拟改动 | 职责 |
+| 代码 | 职责 |
 | --- | --- |
-| `backend/app/main.py` | 启动数据库和 Runtime、恢复状态；关闭时收口任务。 |
-| `backend/app/api/chat.py`（新） | 主聊天快照、消息、审批和 SSE；调用 Runtime，替换旧会话入口。 |
-| `backend/app/agent/runtime.py`（新） | 任务、依赖、三个槽位、调度、停止信号及后台任务监督。 |
-| `backend/app/agent/agent_bus.py`（新） | 内部消息、持久化核对和重试、等待及等待环检测。 |
-| `backend/app/agent/task_tools.py`（新） | 主 / 子助手任务与通信工具，调用方身份由运行时注入。 |
-| `backend/app/agent/loop.py`、`subtask.py`、`system_prompt.md` | 主助手对话和判断；独立 Worker 循环与角色提示词。主助手不直接执行业务工具。 |
+| `backend/app/main.py`、`process_lock.py` | 启动数据库和 Runtime、获取进程锁、恢复及关闭。 |
+| `backend/app/api/chat.py` | 主聊天快照、消息、审批和 SSE。 |
+| `backend/app/agent/runtime.py`、`worker.py` | 主助手、任务调度、三个槽位及独立 Worker 循环。 |
+| `backend/app/agent/agent_bus.py`、`task_tools.py` | 持久化内部消息、重试、等待环及助手通信工具。 |
+| `backend/app/agent/system_prompt.md` | 主助手角色及简短回复要求；主助手不直接执行业务工具。 |
 | `backend/app/agent/llm.py`、`compact.py`、`tools.py` | 结构化路由、独立上下文压缩、文件分页及命令输出限制。 |
-| `backend/app/sessions/store.py`、`replay.py`、`recorder.py`、`approvals.py`、`session_permissions.py` | 短事务、上下文投影、记录及多任务审批；保持现有授权范围。 |
+| `backend/app/sessions/chat_store.py`、`approvals.py`、`session_permissions.py` | 短事务、上下文投影、多任务审批及现有授权范围。 |
 | `backend/app/models.py`、`agent/model_call.py`、`modelio.py` | 上下文及未处理消息查询索引；并发模型日志与轮转串行化，关联任务 / 运行 ID。 |
-| `frontend/src/api/client.ts`、`hooks/useSessionStream.ts`、`App.tsx` 及组件 | 接入主聊天、按消息 ID / 版本更新、关联任务审批。 |
+| `frontend/src/api/client.ts`、`App.tsx` 及组件 | 主聊天、按版本更新及任务审批。 |
 
 现有 `turn_manager.py` 的单会话单轮和 `subtask.py` 的父轮同步等待不再用于后台任务调度。Runtime 捕获 Worker 循环异常并持久化失败通知；主循环异常写入错误并恢复后续消息处理，不能把异常当成功，也不能自动重跑结果未知的外部工具。模型快照写失败仅告警；核心状态未写入时不能假报已受理。
 
@@ -68,7 +67,7 @@ React / TypeScript → FastAPI 会话接口 → 主 Agent Loop → 权限与工�
 - 根任务可处于 `queued / running / waiting_user / waiting_dependency / reviewing / completed / failed / stopped`；负责人和每个协助者另存运行状态。用户审批与任务依赖可同时存在；完成任务前须收口相关协助。
 - 文件与命令工具经权限检查后使用 `asyncio.to_thread`，不阻塞聊天；线程不共享数据库 Session 或直接操作 `asyncio.Queue`。命令合并 stdout / stderr 并持续排空，读取和等待均有界。
 
-模型工具为草案：主助手使用 `task_create / task_inspect / task_update / task_stop / task_review / task_wait_for / route_input`；Worker 使用 `agent_list / agent_send / agent_wait / agent_help / task_report`。主助手和所属任务可用 `read_tool_output` 查看已保存输出。工具返回“已受理”不等于执行完毕。
+主助手使用 `task_create / task_inspect / task_update / task_stop / task_review / task_wait_for / route_input`；Worker 使用 `agent_list / agent_send / agent_wait / agent_help / task_report`。主助手和所属任务可用 `read_tool_output` 查看已保存输出。工具返回“已受理”不等于执行完毕。
 
 Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结束后处理；请求额外工作只能分配空槽。停止或修改同时送负责人及相关协助者。等待回复登记前后均检查已保存回复，等待期间监听停止、变更和依赖暂停，避免漏唤醒；被打断的工具调用补齐结果。
 
@@ -83,9 +82,10 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 | 记录类型 | 最小内容 |
 | --- | --- |
 | `task_state` | 任务 ID、目标、标题、创建序号、状态、负责人、依赖、停止意图及文件占用。 |
-| `agent_context / agent_run` | 上下文 ID、任务 / 角色、原始模型消息、摘要边界、运行 ID、步数和运行状态。 |
+| `agent_context / agent_run / agent_summary` | 上下文 ID、任务 / 角色、原始模型消息、摘要边界、运行 ID、步数和运行状态。 |
 | `agent_message` | 消息 ID、来源 / 目标、任务 / 上下文 / 运行 ID、类型、内容、关联请求、投递状态和重试信息。 |
 | `approval / user_event / file_wait` | 审批请求及参数快照；用户消息 / 审批决定、先后序号和操作身份；文件路径、占用者和等待关系。 |
+| `tool_execution / tool_group / tool_output` | 工具执行状态、成组调用及已采集输出；恢复时未知结果不重跑。 |
 
 运行时锁和短 SQLite 事务串行化状态变更；每次事务独立创建 Session，不持锁等待模型、工具或用户。任务创建与工具受理结果、状态与待投递消息、目标上下文写入与投递标记分别原子提交。模型不得自报发送方或伪造授权；内部操作按上下文、运行及 `tool_call_id` 去重，参数不同的同 ID 重试报冲突。
 
@@ -104,7 +104,7 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 
 主助手判断用户消息时，结构化关联来源 `user_seq`、任务、受影响操作和意图；Runtime 校验后对同一操作比较较新的用户决定，过时的冲突意图不执行，其他不冲突要求仍处理。判断期间若有较新消息或审批，而冲突关系尚不明确，须结合新事件重新判断或询问用户，不能当作无冲突；审批不暂停。修改 / 停止意图及其去重记录原子保存。
 
-`route_input` 草案包含 `{message_id, user_seq, intents: [{type, task_id, instruction, approval_ids?}], needs_clarification}`，意图类型为 `chat / create / query / update / stop / unclear`。使用指定工具调用并校验结果；接口错误或结果无效时报告错误，不执行不确定的意图，审批仍可按现有规则处理。首版不增加 JSON 备用分支。
+`route_input` 包含 `{message_id, user_seq, intents: [{type, task_id, instruction, approval_ids?}], needs_clarification}`，意图类型为 `chat / create / query / update / stop / unclear`。使用指定工具调用并校验结果；较早修改遇到新的用户消息时持久化并重新判断。接口错误或结果无效时报告错误，不执行不确定的意图，审批仍可按现有规则处理。首版不增加 JSON 备用分支。
 
 首版 Worker 共享现有 `data_dir/workspace`。文件工具沿用真实路径限制；`write_file / edit_file / delete_file` 以规范化路径协调：不同任务等待首次写入该文件的任务结束；同任务协助者的写操作逐次串行。等待过或读取后被其他助手改动的文件，拒绝旧写入并要求重读；重新调用重新检查权限。暂停让出槽位不释放文件占用；PowerShell 仅设置工作目录，不是系统沙箱，其内部修改范围无法可靠识别。
 
@@ -117,7 +117,7 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 
 ## 9. 验收与未决风险
 
-开发前保持草案状态；实现后使用假模型、独立临时工作区与空 SQLite 验证：
+使用假模型、独立临时工作区与空 SQLite 验证：
 
 1. 进入主聊天、持续追问及新任务并行；三个槽位上限、30 步续跑 / 停止、原序调度及依赖让位。
 2. 跨 Worker 通信、忙碌边界投递、已知等待环、文件竞争、审批共享与按任务关联；连续消息及消息 / 审批的先后顺序均以最新有效决定为准，不丢弃无关要求；不同分页沿用同一文件授权。测试指定工具调用的无效输入及 API 错误。
@@ -125,9 +125,9 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 4. 启动本地 HTTP / SSE，接收任务后关闭页面，验证后台完成、重连快照和结果；验证同一数据目录不能启动两个后端，以及快照 / 增量交界断线、慢连接和日志失败。
 5. 检查上下文隔离与工具调用配对，文件分页、超长行提示、1 MiB 命令采集和分段读取；执行前端构建、检查和浏览器验收。
 
-本机能力检查：SQLite 3.53.1 支持 `json_extract`；当前 DeepSeek 官方 `deepseek-flash` 在非思考模式下，单次无副作用请求成功强制调用指定工具，本项目客户端尚未暴露该参数。GPT-6 官方 Responses API 文档支持指定工具；原生接入需后续适配，尚未实测。
+本机验证：后端 40 项、前端 2 项测试及前端构建、lint 通过；浏览器验证主聊天、审批期间继续发送及刷新恢复；隔离环境下 DeepSeek 非思考模式完成简单问答和只读文件任务。GPT-6 的原生 Responses 适配不在首版，尚未实测。
 
-真实模型的任务归属、结果判断与重复检测尚未充分验证。DeepSeek 的 Anthropic 兼容接口在思考模式下不支持强制指定工具；当前代码关闭思考模式，将来启用时需重新处理。模型服务不可用时，聊天中的停止 / 修改无法及时判断，已授权的后台操作仍按约定继续；旧任务反复续跑或等待判断可能让较晚任务久等。命令输出及超长单行有已确认的截断限制，持久记录长期累积。现有 `backend/tests/test_reliability.py` 有 10 项测试；此前基线曾通过，本次设计整理未运行测试，不能作为新方案验收证据。日志及干净库要求见 [reliability.md](reliability.md)。
+真实模型的复杂任务归属、结果判断与重复检测仍需更多验证。DeepSeek 的思考模式不支持当前强制指定工具方式；模型服务不可用时停止 / 修改无法及时判断，已授权操作仍继续。旧任务反复续跑可能令较晚任务久等；PowerShell 无法完整识别外部副作用；命令输出及超长单行按约定截断，持久记录持续累积。日志及干净库要求见 [reliability.md](reliability.md)。
 
 ## 10. 参考
 

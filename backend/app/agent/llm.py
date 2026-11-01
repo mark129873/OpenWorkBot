@@ -21,8 +21,9 @@ class AnthropicStreamClient:
         self._max_tokens = s.max_tokens
 
     async def stream(
-        self, *, system: str, messages: list, tools: list
+        self, *, system: str, messages: list, tools: list, tool_choice: dict | None = None
     ) -> AsyncIterator[dict]:
+        options = {"tool_choice": tool_choice} if tool_choice is not None else {}
         async with self._client.messages.stream(
             model=self.model,
             system=system,
@@ -30,6 +31,7 @@ class AnthropicStreamClient:
             tools=tools,
             max_tokens=self._max_tokens,
             thinking={"type": "disabled"},
+            **options,
         ) as stream:
             tool_meta: dict[int, dict] = {}
             json_fragments: dict[int, str] = {}

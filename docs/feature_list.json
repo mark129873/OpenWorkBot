@@ -13,11 +13,18 @@
   },
   "features": [
     {
-      "id": "main_chat_multi_agent",
-      "name": "主聊天与多助手协作",
-      "description": "单主聊天、后台助手及任务通信与恢复。",
-      "status": "planned",
-      "evidence": "审批顺序已确认，移除 JSON 备用分支；整体设计待审批，功能尚未实施或验收。"
+      "id": "Backend-01",
+      "name": "后台多助手协作",
+      "description": "主助手路由、任务调度、通信、授权与恢复。",
+      "status": "passing",
+      "evidence": "空库后端 40 项测试通过；DeepSeek 实测简单问答和只读 Worker。"
+    },
+    {
+      "id": "Frontend-01",
+      "name": "主聊天页面",
+      "description": "持续对话、后台进展与任务审批。",
+      "status": "passing",
+      "evidence": "2 项测试、构建、lint 及浏览器主聊天、并发审批、刷新恢复验证通过。"
     }
   ]
 }

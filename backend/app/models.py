@@ -46,6 +46,10 @@ class Part(Base):
     __table_args__ = (
         Index('part_message_id_id_idx', 'message_id', 'id'),
         Index('part_session_idx', 'session_id'),
+        Index('part_kind_context_idx', text("json_extract(data, '$.type')"),
+              text("json_extract(data, '$.context_id')")),
+        Index('part_delivery_idx', text("json_extract(data, '$.type')"),
+              text("json_extract(data, '$.delivery')")),
         Index('part_message_sequence_idx', 'message_id', 'sequence', 'time_created', 'id'),
         Index('part_session_message_sequence_idx', 'session_id', 'message_id', 'sequence'),)
     id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=True)

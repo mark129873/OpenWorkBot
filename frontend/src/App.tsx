@@ -1,354 +1,145 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Route, Routes, matchPath, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { ChatTeardropText, ShieldCheck } from '@phosphor-icons/react'
 
-import { ChatArea } from './components/ChatArea'
-import { Sidebar } from './components/Sidebar'
-import { SubtaskViewer, type SubtaskItem } from './components/SubtaskViewer'
-import { ApiError, createSession, getPermissionState, getSessionDetail, stopTurn, type ExecutionDraft, type PermissionState } from './api/client'
-import { ShellContext, useShell } from './ShellContext'
-import { useSessionStream, type StreamCompletion } from './hooks/useSessionStream'
-import { pendingFromDetail } from './utils/approval'
-import { ArrowRight, FileText, ListChecks, SidebarSimple, SquaresFour, TerminalWindow, UsersThree } from '@phosphor-icons/react'
+import { decideChatApproval, getChat, sendChatMessage, type ChatApproval, type ChatSnapshot, type ExecutionDraft } from './api/client'
+import { Composer } from './components/Composer'
+import { MarkdownWithCopy, UserBubble } from './components/MessageItem'
+import { TokenBadge } from './components/TokenBadge'
+import { createWriteQueue } from './utils/writeQueue'
+import type { ApprovalOptionId } from './types'
 import './workspace.css'
-import type { SessionDetail, SessionItem } from './types'
-
-const SIDEBAR_STORAGE_KEY = 'ui.sidebar'
 
 export default function App() {
-  return <AppShell />
-}
-
-function AppShell() {
-  const navigate = useNavigate()
-  const { pathname } = useLocation()
-  const currentId = matchPath('/session/:sessionId', pathname)?.params.sessionId ?? null
-  const [sessions, setSessions] = useState<SessionItem[]>([])
-  // 仅本次创建的草稿可在详情 404 时保留空对话。
-  const draftIdsRef = useRef<Set<string>>(new Set())
-
-  const [sidebarOpen, setSidebarOpen] = useState(() => {
-    try {
-      const saved = localStorage.getItem(SIDEBAR_STORAGE_KEY)
-      return saved ? saved !== 'collapsed' : !window.matchMedia('(max-width: 760px)').matches
-    } catch {
-      return true
-    }
-  })
-  const toggleSidebar = useCallback(() => {
-    setSidebarOpen((open) => {
-      const next = !open
-      try {
-        localStorage.setItem(SIDEBAR_STORAGE_KEY, next ? 'open' : 'collapsed')
-      } catch {
-        /* 持久化失败仅影响下次打开。 */
-      }
-      return next
-    })
-  }, [])
-
-  const openSession = useCallback(
-    (id: string) => navigate(`/session/${id}`),
-    [navigate],
-  )
-
-  /* 先登记草稿再导航，避免 404 被误判为未知会话。 */
-  const handleDraftCreated = useCallback(
-    (id: string) => {
-      draftIdsRef.current.add(id)
-      openSession(id)
-    },
-    [openSession],
-  )
-
-  const handleNewSession = useCallback(async () => {
-    const { id } = await createSession()
-    handleDraftCreated(id)
-  }, [handleDraftCreated])
-
-  return (
-    /* 保留 flex 容器，避免侧栏与正文纵向堆叠。 */
-    <ShellContext.Provider value={{ sidebarOpen, toggleSidebar }}>
-      <div className="app-shell flex">
-      <Sidebar
-        sessions={sessions}
-        currentId={currentId}
-        onSelect={openSession}
-        onSessionsChange={setSessions}
-        onDraftCreated={handleDraftCreated}
-        onDeleted={(id) => {
-          draftIdsRef.current.delete(id)
-          if (matchPath('/session/:sessionId', window.location.pathname)?.params.sessionId === id) {
-            navigate('/', { replace: true })
-          }
-        }}
-      />
-
-        <Routes>
-          <Route path="/" element={<WelcomePage onNewSession={handleNewSession} />} />
-          <Route
-            path="/session/:sessionId"
-            element={<SessionRoute draftIdsRef={draftIdsRef} />}
-          />
-          <Route path="*" element={<WelcomePage onNewSession={handleNewSession} />} />
-        </Routes>
-      </div>
-    </ShellContext.Provider>
-  )
-}
-
-function WelcomePage({ onNewSession }: { onNewSession: () => Promise<void> }) {
-  const { sidebarOpen, toggleSidebar } = useShell()
-  const [creating, setCreating] = useState(false)
+  const [chat, setChat] = useState<ChatSnapshot | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const start = async () => {
-    if (creating) return
-    setCreating(true)
-    setError(null)
-    try { await onNewSession() }
-    catch (e) { setError(e instanceof Error ? e.message : '新建会话失败，请重试') }
-    finally { setCreating(false) }
-  }
-  const capabilities = [
-    { icon: FileText, title: '文件工作', text: '阅读、整理与修改工作区文件' },
-    { icon: TerminalWindow, title: '命令执行', text: '按你的授权，在本地运行命令' },
-    { icon: ListChecks, title: '任务计划', text: '拆分目标，记录每一步工作进展' },
-    { icon: UsersThree, title: '子助手协作', text: '将独立工作交给专注的子助手' },
-  ]
-  return (
-    <main className="flex min-w-0 flex-1 flex-col bg-white">
-      <header className="workspace-header">
-        <SidebarToggle sidebarOpen={sidebarOpen} onToggle={toggleSidebar} />
-        <span className="text-[13px] font-medium text-zinc-600">工作台</span>
-      </header>
-      <div className="flex flex-1 overflow-y-auto">
-        <div className="welcome-content animate-enter">
-          <div className="mb-7 flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-50 text-accent-700">
-            <SquaresFour size={28} weight="duotone" />
-          </div>
-          <h1 className="welcome-title font-semibold text-zinc-900">从一个目标开始。</h1>
-          <p className="mt-4 max-w-md text-[15px] leading-7 text-zinc-600">
-            告诉助手你想完成什么。探索文件、安排任务，<br className="hidden sm:block" />
-            一起把下一步工作推进下去。
-          </p>
-          <button type="button" onClick={() => void start()} disabled={creating} className="primary-button mt-7">
-            {creating ? '正在新建…' : '新建会话'} <ArrowRight size={17} weight="bold" />
-          </button>
-          {error && <p role="alert" className="mt-3 text-sm text-red-700">{error}</p>}
-          <div className="capability-grid mt-14 border-t border-zinc-200/80 pt-8">
-            {capabilities.map(({ icon: Icon, title, text }) => (
-              <div key={title} className="flex items-start gap-3.5">
-                <Icon size={22} weight="duotone" className="mt-0.5 shrink-0 text-accent-700" />
-                <div>
-                  <h2 className="text-[14px] font-semibold text-zinc-800">{title}</h2>
-                  <p className="mt-1.5 text-[13px] leading-6 text-zinc-600">{text}</p>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-      <p className="shrink-0 px-6 pb-6 text-center text-[12px] text-zinc-500">会话保存在本机 · 对话按配置发送至模型 API</p>
-    </main>
-  )
-}
+  const [enqueue] = useState(() => createWriteQueue())
+  const retryIds = useRef(new Map<string, string>())
+  const sending = useRef(new Set<string>())
+  const bottom = useRef<HTMLDivElement>(null)
 
-function SidebarToggle({ sidebarOpen, onToggle }: { sidebarOpen: boolean; onToggle: () => void }) {
-  return (
-    <button
-      type="button"
-      onClick={onToggle}
-      className="icon-button"
-      aria-label={sidebarOpen ? '收起侧栏' : '展开侧栏'}
-      aria-pressed={sidebarOpen}
-      title={sidebarOpen ? '收起侧栏' : '展开侧栏'}
-    >
-      <SidebarSimple size={20} weight="regular" />
-    </button>
-  )
-}
-
-/* 按 sessionId 重挂载，隔离会话局部状态。 */
-function SessionRoute({
-  draftIdsRef,
-}: {
-  draftIdsRef: React.RefObject<Set<string>>
-}) {
-  const { sessionId } = useParams()
-  if (!sessionId) return null
-  return <SessionView key={sessionId} sessionId={sessionId} draftIdsRef={draftIdsRef} />
-}
-
-function SessionView({
-  sessionId,
-  draftIdsRef,
-}: {
-  sessionId: string
-  draftIdsRef: React.RefObject<Set<string>>
-}) {
-  const navigate = useNavigate()
-  const [detail, setDetail] = useState<SessionDetail | null>(null)
-  const [activeSubtask, setActiveSubtask] = useState<SubtaskItem | null>(null)
-  const [detailLoaded, setDetailLoaded] = useState(false)
-  const [detailError, setDetailError] = useState<string | null>(null)
-  const [retryDetail, setRetryDetail] = useState(0)
-  const [stopError, setStopError] = useState<string | null>(null)
-  const [permission, setPermission] = useState<PermissionState>({ mode: 'build' })
-
-  const refreshPermission = useCallback(() => {
-    getPermissionState().then(setPermission).catch(() => {})
+  const update = useCallback((next: ChatSnapshot) => {
+    setChat((current) => !current || next.revision > current.revision ? next : current)
   }, [])
 
   useEffect(() => {
-    refreshPermission()
-  }, [refreshPermission])
-
-  const {
-    turn: liveTurn,
-    isStreaming,
-    error: streamError,
-    send,
-    regenerate,
-    reconcileTurn,
-    pendingApproval,
-    replacedTurnId,
-    getStreamGeneration,
-    hasActiveStream,
-    getCompletion,
-  } = useSessionStream(sessionId)
-  // 请求号隔离并发 GET；代次隔离新旧流。
-  const detailRequestRef = useRef(0)
-
-  // 仅本次创建的草稿可保留 404；其他会话返回首页。
-  useEffect(() => {
-    let cancelled = false
-    const request = ++detailRequestRef.current
-    const generation = getStreamGeneration()
-    const isCurrent = () => !cancelled && request === detailRequestRef.current
-      && generation === getStreamGeneration()
-    getSessionDetail(sessionId)
-      .then((d) => {
-        if (isCurrent()) {
-          draftIdsRef.current.delete(sessionId)
-          setDetail(d)
-          setDetailLoaded(true)
-          setDetailError(null)
-        }
-      })
-      .catch((e) => {
-        if (!isCurrent()) return
-        if (e instanceof ApiError && e.status === 404) {
-          if (draftIdsRef.current.has(sessionId)) { setDetailLoaded(true); setDetailError(null) }
-          else navigate('/', { replace: true })
-        } else {
-          setDetailError(e instanceof Error ? e.message : '会话加载失败，请重试')
-        }
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [sessionId, navigate, draftIdsRef, getStreamGeneration, retryDetail])
-
-  /* 新请求或新流开始后丢弃旧回放。 */
-  const refreshDetail = useCallback(async (completion?: StreamCompletion) => {
-    const generation = completion?.generation ?? getStreamGeneration()
-    if (generation !== getStreamGeneration()) return
-    const request = ++detailRequestRef.current
-    try {
-      const next = await getSessionDetail(sessionId)
-      if (request !== detailRequestRef.current || generation !== getStreamGeneration()) return
-      setDetail(next)
-      setDetailLoaded(true)
-      setDetailError(null)
-      // 运行中只同步审批；终态才替换正文。
-      const current = next.turns.find((turn) => turn.turn_id === completion?.turnId)
-      if (completion && current) reconcileTurn(completion, current, pendingFromDetail(next))
-    } catch (e) {
-      if (request === detailRequestRef.current && generation === getStreamGeneration()) {
-        setDetailError(e instanceof Error ? e.message : '会话加载失败，请重试')
+    let active = true
+    void getChat().then((snapshot) => { if (active) update(snapshot) })
+      .catch((e: unknown) => { if (active) setError(e instanceof Error ? e.message : '聊天加载失败') })
+    const source = new EventSource('/api/chat/events')
+    source.onmessage = (event) => {
+      try {
+        const envelope = JSON.parse(event.data) as { data: ChatSnapshot }
+        if (active && envelope.data && typeof envelope.data.revision === 'number') update(envelope.data)
+      } catch {
+        if (active) setError('更新数据无效，正在重新连接')
       }
     }
-  }, [sessionId, reconcileTurn, getStreamGeneration])
+    source.onopen = () => { if (active) setError(null) }
+    source.onerror = () => { if (active) setError('连接中断，正在重新连接；后台任务状态待恢复') }
+    return () => { active = false; source.close() }
+  }, [update])
 
-  // 断线不取消后端执行；串行轮询至终态，旧 GET 仍校验身份。
-  const needsReplayPolling = !isStreaming && (liveTurn?.state === 'running'
-    || detail?.turns.some((turn) => turn.state === 'running'))
   useEffect(() => {
-    if (!needsReplayPolling) return
-    let cancelled = false
-    let timer: ReturnType<typeof setTimeout>
-    const poll = async () => {
-      await refreshDetail(getCompletion())
-      if (!cancelled) timer = setTimeout(() => void poll(), 1000)
-    }
-    timer = setTimeout(() => void poll(), 1000)
-    return () => { cancelled = true; clearTimeout(timer) }
-  }, [needsReplayPolling, refreshDetail, getCompletion])
+    const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    bottom.current?.scrollIntoView({ behavior: reduced ? 'instant' : 'smooth', block: 'end' })
+  }, [chat?.messages, chat?.approvals])
 
-  const refreshAfterTurn = useCallback((completion: StreamCompletion) => {
-    void refreshDetail(completion)
-    refreshPermission()
-  }, [refreshDetail, refreshPermission])
+  const send = (text: string, execution: ExecutionDraft, onAccepted?: () => void) => {
+    const key = JSON.stringify([text, execution.mode])
+    if (sending.current.has(key)) return
+    sending.current.add(key)
+    const id = retryIds.current.get(key) ?? crypto.randomUUID()
+    void enqueue(() => sendChatMessage(id, text, execution.mode)).then(() => {
+      retryIds.current.delete(key)
+      setError(null)
+      onAccepted?.()
+    }).catch((e: unknown) => {
+      retryIds.current.set(key, id)
+      setError(e instanceof Error ? e.message : '发送失败，请重试')
+    }).finally(() => { sending.current.delete(key) })
+  }
 
-  /* 活跃流拥有审批状态，禁止回放覆盖。 */
-  const refreshAfterApproval = useCallback(() => {
-    refreshPermission()
-    // 审批响应可能晚于流结束，按当前身份收尾。
-    if (!hasActiveStream()) void refreshDetail(getCompletion())
-  }, [refreshPermission, hasActiveStream, refreshDetail, getCompletion])
-
-  const handleSend = useCallback(
-    (text: string, execution: ExecutionDraft, onAccepted?: () => void) => {
-      setStopError(null)
-      void send(text, refreshAfterTurn, execution, () => {
-        draftIdsRef.current.delete(sessionId)
-        onAccepted?.()
-      })
-    },
-    [send, refreshAfterTurn, draftIdsRef, sessionId],
-  )
-
-  const handleStop = useCallback(() => {
-    setStopError(null)
-    void stopTurn(sessionId).catch((e) => {
-      setStopError(e instanceof Error ? e.message : '停止失败，请重试')
-      void refreshDetail(getCompletion())
-    })
-  }, [sessionId, refreshDetail, getCompletion])
-
-  const handleRetry = useCallback(() => {
-    // 重跑保留原用户消息；回放失败时用实时快照恢复。
-    void regenerate(liveTurn ?? detail?.turns.at(-1) ?? null, refreshAfterTurn)
-  }, [regenerate, refreshAfterTurn, liveTurn, detail])
-
-  const isRunning = isStreaming || liveTurn?.state === 'running'
-    || !!detail?.turns.some((turn) => turn.state === 'running')
+  const timeline = [
+    ...(chat?.messages ?? []).map((message) => ({ kind: 'message' as const, order: message.order, message })),
+    ...(chat?.approvals ?? []).map((approval) => ({ kind: 'approval' as const, order: approval.order, approval })),
+  ].sort((a, b) => a.order - b.order)
 
   return (
-    <>
-      <ChatArea
-        detail={detail}
-        liveTurn={liveTurn}
-        replacedTurnId={replacedTurnId}
-        isStreaming={isStreaming}
-        isRunning={isRunning}
-        detailLoaded={detailLoaded}
-        detailError={detailError}
-        currentId={sessionId}
-        streamError={stopError || streamError}
-        stopError={stopError}
-        livePendingApproval={pendingApproval}
-        permission={permission}
-        onSend={handleSend}
-        onStop={handleStop}
-        onRegenerate={handleRetry}
-        onApprovalResolved={refreshAfterApproval}
-        onOpenSubtask={setActiveSubtask}
-        onRetryDetail={() => setRetryDetail((value) => value + 1)}
-      />
+    <div className="app-shell flex">
+      <main className="flex min-w-0 flex-1 flex-col bg-white">
+        <header className="workspace-header">
+          <h1 className="min-w-0 flex-1 truncate text-[14px] font-semibold text-zinc-800">助手</h1>
+          <TokenBadge used={chat?.context_usage.used} window={chat?.context_usage.window} />
+        </header>
+        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-8 sm:px-8">
+          {chat && (chat.messages.length > 0 || chat.approvals.length > 0) ? (
+            <div className="mx-auto max-w-[800px] space-y-10">
+              {timeline.map((item) => item.kind === 'approval'
+                ? <ApprovalCard key={item.approval.request_id} approval={item.approval}
+                    decide={(option, feedback) => enqueue(() => decideChatApproval(item.approval.request_id, option, feedback))} />
+                : item.message.role === 'user'
+                ? <UserBubble key={item.message.id} text={item.message.text} />
+                : <div key={item.message.id} className="max-w-[88%]">
+                    <p className="mb-2 text-[12px] font-medium text-zinc-500">助手</p>
+                    <MarkdownWithCopy text={item.message.text} streaming={item.message.status === 'streaming'} />
+                    {item.message.status === 'interrupted' && <p className="mt-2 text-xs text-zinc-500">已中断</p>}
+                  </div>)}
+            </div>
+          ) : (
+            <div className="flex h-full flex-col items-center justify-center px-4 text-center">
+              <span className="mb-5 flex h-14 w-14 items-center justify-center rounded-2xl bg-accent-50 text-accent-700"><ChatTeardropText size={26} weight="duotone" /></span>
+              <h2 className="text-[22px] font-semibold tracking-tight text-zinc-900">这次，想完成什么？</h2>
+              <p className="mt-3 text-[14px] leading-7 text-zinc-600">描述目标，或从一个具体问题开始。</p>
+            </div>
+          )}
+          <div ref={bottom} />
+        </div>
+        {error && <div role="alert" className="mx-5 mb-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[13px] text-amber-800">{error}</div>}
+        <Composer disabled={!chat} streaming={false} permission={{ mode: chat?.permission_mode ?? 'build' }}
+          onSend={send} onStop={() => {}} />
+      </main>
+    </div>
+  )
+}
 
-      {activeSubtask && (
-        <SubtaskViewer subtask={activeSubtask} onClose={() => setActiveSubtask(null)} />
-      )}
-    </>
+function ApprovalCard({ approval, decide }: {
+  approval: ChatApproval
+  decide: (option: ApprovalOptionId, feedback?: string) => Promise<unknown>
+}) {
+  const [busy, setBusy] = useState(false)
+  const [feedback, setFeedback] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  const busyRef = useRef(false)
+  const options = approval.options.filter((option) => ['allowOnce', 'allowSession', 'deny'].includes(option.option_id))
+  const select = (option: ApprovalOptionId) => {
+    if (busyRef.current) return
+    busyRef.current = true
+    setBusy(true)
+    setError(null)
+    void decide(option, option === 'deny' ? feedback.trim() || undefined : undefined).catch((e: unknown) => {
+      setError(e instanceof Error ? e.message : '提交失败，请重试')
+      busyRef.current = false
+      setBusy(false)
+    })
+  }
+  return (
+    <section aria-label={`任务 ${approval.task_title} 的审批`} className="rounded-xl border border-amber-200 bg-amber-50/40 p-5">
+      <h2 className="flex items-center gap-2 text-[14px] font-semibold text-zinc-800"><ShieldCheck size={20} />任务「{approval.task_title}」需要确认</h2>
+      <p className="mt-2 text-[13px] leading-6 text-zinc-600">{approval.reason}（{approval.tool}）</p>
+      <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-white p-3 text-[12px] text-zinc-700">{JSON.stringify(approval.input ?? {}, null, 2)}</pre>
+      <div className="mt-3 flex flex-wrap gap-2">
+        {options.map((option) => <button key={option.option_id} type="button" disabled={busy}
+          onClick={() => select(option.option_id)} title={option.content} className="rounded-lg border border-zinc-300 bg-white px-3 py-2 text-left text-[13px] text-zinc-700 hover:bg-zinc-50 disabled:opacity-50">
+          {option.label}
+          {option.option_id === 'allowSession' && <span className="mt-1 block text-[11px] text-zinc-500">仅限当前会话，后端重启后失效</span>}
+          {option.content && <span className="mt-1 block break-all font-mono text-[11px] text-zinc-500">{option.content}</span>}
+        </button>)}
+      </div>
+      <label className="mt-3 block text-[12px] text-zinc-600">拒绝理由（可选）
+        <textarea value={feedback} onChange={(e) => setFeedback(e.target.value)} maxLength={4096} rows={2}
+          className="mt-1 block w-full resize-y rounded-lg border border-zinc-300 bg-white p-2 text-[13px]" />
+      </label>
+      {error && <p role="alert" className="mt-2 text-[13px] text-red-700">{error}</p>}
+    </section>
   )
 }

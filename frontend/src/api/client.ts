@@ -1,4 +1,4 @@
-import type { ApprovalOptionId, SessionDetail, SessionItem, SseEvent } from '../types'
+import type { ApprovalOption, ApprovalOptionId, SessionDetail, SessionItem, SseEvent } from '../types'
 
 export class ApiError extends Error {
   status: number
@@ -24,6 +24,50 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(resp.status, detail)
   }
   return resp.json() as Promise<T>
+}
+
+export interface ChatMessage {
+  id: string
+  role: 'user' | 'assistant'
+  text: string
+  status: string
+  time: number
+  order: number
+}
+
+export interface ChatApproval {
+  request_id: string
+  task_id: string
+  task_title: string
+  tool: string
+  input: unknown
+  reason: string
+  options: ApprovalOption[]
+  order: number
+}
+
+export interface ChatSnapshot {
+  revision: number
+  messages: ChatMessage[]
+  approvals: ChatApproval[]
+  permission_mode: string
+  context_usage: { used: number; window: number }
+}
+
+export function getChat(): Promise<ChatSnapshot> {
+  return request('/api/chat')
+}
+
+export function sendChatMessage(clientMessageId: string, text: string, mode?: string): Promise<unknown> {
+  return request('/api/chat/messages', { method: 'POST', body: JSON.stringify({
+    client_message_id: clientMessageId, text, ...(mode ? { permission_mode: mode } : {}),
+  }) })
+}
+
+export function decideChatApproval(requestId: string, optionId: ApprovalOptionId, feedback?: string): Promise<unknown> {
+  return request(`/api/chat/approvals/${encodeURIComponent(requestId)}`, { method: 'POST', body: JSON.stringify({
+    option_id: optionId, ...(feedback ? { feedback } : {}),
+  }) })
 }
 
 /* 仅分配 ID，首条消息才落库。 */
