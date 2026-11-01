@@ -17,7 +17,7 @@
       "name": "主聊天与多助手协作",
       "description": "单主聊天、后台助手及任务通信与恢复。",
       "status": "planned",
-      "evidence": "已确认保留 Hermes 超长单行截断；整体设计待审批，功能尚未实施或验收。"
+      "evidence": "架构、通信、权限与验收设计已合并至 architecture.md；待审批，功能尚未实施或验收。"
     }
   ]
 }
