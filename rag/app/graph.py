@@ -1,8 +1,11 @@
 import asyncio
 import json
-from typing import Any, TypedDict
+import logging
+from typing import TypedDict
 
 from langgraph.graph import END, START, StateGraph
+
+logger = logging.getLogger(__name__)
 
 
 class State(TypedDict, total=False):
@@ -10,6 +13,9 @@ class State(TypedDict, total=False):
     attempt: int
     graded: bool
     plan: dict
+    rewrites: list[str]
+    subqueries: list[str]
+    expansions: list[str]
     queries: list[str]
     seen: list[str]
     candidates: list[dict]
@@ -35,34 +41,47 @@ def build_graph(knowledge):
             '返回 {"original":true,"rewrite":false,"subquery":false,"expand":false}，策略可多选。',
             {"original": True, "rewrite": False, "subquery": False, "expand": False},
         )
-        return {"plan": result, "attempt": attempt}
+        return {"plan": result, "attempt": attempt, "rewrites": [], "subqueries": [], "expansions": []}
 
-    async def prepare(state: State) -> dict:
-        plan = state.get("plan", {})
-        queries = [state["query"]] if plan.get("original", True) else []
-        labels = {"rewrite": "改写问题", "subquery": "拆分子问题", "expand": "扩展同义词和相关术语"}
-
-        async def variant(name: str, label: str) -> list[str]:
+    async def variant(state: State, field: str, instruction: str) -> dict:
+        try:
             result = await models.structured(
-                "你是通用知识库查询生成器，保留原意及数字、名称等准确约束。只输出 JSON。",
-                f"{label}：{state['query']}\n缺口：{state.get('missing', [])}\n"
+                instruction,
+                f"问题：{state['query']}\n缺口：{state.get('missing', [])}\n"
                 '返回 {"queries":["查询"]}，最多 5 条。', {"queries": []})
             values = result.get("queries", [])
-            return [item.strip() for item in values if isinstance(item, str) and item.strip()][:5] if isinstance(values, list) else []
+        except Exception as exc:
+            logger.warning("查询变体 %s 生成失败：%s", field, type(exc).__name__)
+            return {field: []}
+        return {field: [item.strip() for item in values if isinstance(item, str) and item.strip()][:5]
+                if isinstance(values, list) else []}
 
-        selected = [(name, label) for name, label in labels.items() if plan.get(name) is True]
-        results = await asyncio.gather(*(variant(*item) for item in selected), return_exceptions=True)
-        for result in results:
-            if isinstance(result, list):
-                queries.extend(result)
+    async def rewrite(state: State) -> dict:
+        return await variant(state, "rewrites",
+                             "你是查询改写器。将问题改写为适合检索的表述，保留原意、数字和名称。只输出 JSON。")
+
+    async def subquery(state: State) -> dict:
+        return await variant(state, "subqueries",
+                             "你是子问题拆分器。按回答所需的不同证据拆分为独立查询，保留数字和名称。只输出 JSON。")
+
+    async def expand(state: State) -> dict:
+        return await variant(state, "expansions",
+                             "你是查询扩展器。补充同义词和相关术语，不改变原意或引入新事实。只输出 JSON。")
+
+    def route(state: State) -> list[str]:
+        plan = state.get("plan", {})
+        return [name for name in ("rewrite", "subquery", "expand") if plan.get(name) is True] or ["retrieve"]
+
+    async def retrieve(state: State) -> dict:
+        plan = state.get("plan", {})
+        queries = [state["query"]] if plan.get("original", True) else []
+        for name, field in (("rewrite", "rewrites"), ("subquery", "subqueries"), ("expand", "expansions")):
+            if plan.get(name) is True:
+                queries.extend(state.get(field, []))
         seen = set(state.get("seen", []))
         queries = list(dict.fromkeys(query for query in queries if query not in seen))[:8]
         if not queries and not seen:
             queries = [state["query"]]
-        return {"queries": queries, "seen": [*seen, *queries]}
-
-    async def retrieve(state: State) -> dict:
-        queries = state.get("queries", [])
         candidates = list(state.get("candidates", []))
         if queries:
             async with knowledge.catalog_lock:
@@ -95,7 +114,8 @@ def build_graph(knowledge):
         for index, item in enumerate(ranked):
             item["_rank_index"] = index
         evidence = await models.rerank(state["query"], ranked)
-        return {"candidates": candidates, "evidence": evidence, "warning": warning}
+        return {"queries": queries, "seen": [*seen, *queries],
+                "candidates": candidates, "evidence": evidence, "warning": warning}
 
     async def grade(state: State) -> dict:
         evidence = state.get("evidence", [])
@@ -134,12 +154,14 @@ def build_graph(knowledge):
                 "answer": response, "sources": sources}
 
     graph = StateGraph(State)
-    for name, node in (("plan", plan), ("prepare", prepare), ("retrieve", retrieve),
+    for name, node in (("plan", plan), ("rewrite", rewrite), ("subquery", subquery),
+                       ("expand", expand), ("retrieve", retrieve),
                        ("grade", grade), ("answer", answer)):
         graph.add_node(name, node)
     graph.add_edge(START, "plan")
-    graph.add_edge("plan", "prepare")
-    graph.add_edge("prepare", "retrieve")
+    graph.add_conditional_edges("plan", route, ["rewrite", "subquery", "expand", "retrieve"])
+    for name in ("rewrite", "subquery", "expand"):
+        graph.add_edge(name, "retrieve")
     graph.add_edge("retrieve", "grade")
     graph.add_conditional_edges("grade", lambda state: "plan" if not state.get("sufficient")
                                 and state.get("can_retry") and state.get("attempt", 0) < 1 else "answer",
