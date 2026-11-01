@@ -1565,3 +1565,325 @@ def test_worker_bash_reports_actual_exit_status(isolated, monkeypatch, script, f
         assert "[输出 ID:" in result["content"] and output["content"] in result["content"]
         assert len(result["content"]) <= 30000
     asyncio.run(run())
+
+
+class DirectModel:
+    model = "fake"
+
+    def __init__(self, tool, args):
+        self.tool, self.args = tool, args
+        self.issued = False
+        self.worker_calls = 0
+        self.reports = []
+        self.direct_tools = set()
+
+    async def stream(self, *, system, messages, tools, tool_choice=None):
+        if tool_choice and tool_choice["name"] == "route_input":
+            request = json.loads(messages[-1]["content"])
+            intent = {"type": "chat", "instruction": request["text"]}
+            if request["text"] == "不要写入":
+                with db.new_session() as session:
+                    task = next(t for t in store.records(session, "task_state") if t.get("direct"))
+                intent.update(type="update", task_id=task["id"], approval_ids=[])
+            yield {"type": "tool_use", "id": new_id(), "name": "route_input", "input": {
+                "message_id": request["message_id"], "user_seq": request["user_seq"],
+                "intents": [intent], "needs_clarification": False}}
+        elif system.startswith("你是后台工作助手"):
+            self.worker_calls += 1
+            raise AssertionError("简单任务不应启动后台助手模型")
+        elif messages[-1]["content"].startswith("请根据直接执行"):
+            report = next(m["content"] for m in reversed(messages[:-1])
+                          if isinstance(m.get("content"), str) and m["content"].startswith("直接执行【"))
+            self.reports.append(report)
+            yield {"type": "text_delta", "text": "已收到直接执行结果。"}
+        elif not self.issued:
+            self.issued = True
+            self.direct_tools = {tool["name"] for tool in tools}
+            yield {"type": "tool_use", "id": "direct-call", "name": self.tool, "input": self.args}
+        else:
+            yield {"type": "text_delta", "text": "已处理新消息。"}
+        yield {"type": "stop_reason", "reason": "end_turn"}
+
+
+def test_quick_command_runs_without_worker_model(isolated, monkeypatch):
+    from app.agent import tools
+
+    calls = []
+    monkeypatch.setattr(tools, "capture_bash", lambda command: (calls.append(command) or "workspace", False))
+
+    async def run():
+        model = DirectModel("bash", {"command": "pwd"})
+        runtime = Runtime(client=model)
+        await runtime.start()
+        try:
+            await runtime.accept("pwd", "pwd", "build")
+            await wait_for(lambda: bool(model.reports))
+            assert calls == ["pwd"]
+            assert model.worker_calls == 0 and "bash" in model.direct_tools
+            assert "workspace" in model.reports[0]
+            def completed():
+                with db.new_session() as session:
+                    tasks = store.records(session, "task_state")
+                    return len(tasks) == 1 and tasks[0]["direct"] and tasks[0]["status"] == "completed"
+            await wait_for(completed)
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_direct_command_runs_while_worker_slots_are_full(isolated, monkeypatch):
+    from app.agent import tools
+
+    monkeypatch.setattr(tools, "capture_bash", lambda command: ("workspace", False))
+
+    async def run():
+        background = FakeModel()
+        runtime = Runtime(client=background)
+        await runtime.start()
+        try:
+            for index in range(3):
+                await runtime.accept(f"task-{index}", f"任务 {index}", "build")
+                await wait_for(lambda: background.workers == index + 1)
+            model = DirectModel("bash", {"command": "pwd"})
+            runtime.client = model
+            await runtime.accept("pwd", "pwd", "build")
+            await wait_for(lambda: bool(model.reports))
+            assert background.workers == 3 and model.worker_calls == 0
+        finally:
+            background.release_worker.set()
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_direct_steps_preserve_file_version_check(isolated):
+    class MultiStepModel(DirectModel):
+        def __init__(self):
+            super().__init__("read_file", {"path": "note.txt"})
+            self.read_done, self.continue_edit = asyncio.Event(), asyncio.Event()
+
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            if messages[-1]["content"].startswith("请根据直接执行") and not self.reports:
+                self.reports.append("已读取")
+                self.read_done.set()
+                await self.continue_edit.wait()
+                yield {"type": "tool_use", "id": "edit-call", "name": "edit_file",
+                       "input": {"path": "note.txt", "old_text": "old", "new_text": "edited"}}
+                yield {"type": "stop_reason", "reason": "tool_use"}
+                return
+            async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
+                yield event
+
+    async def run():
+        path = isolated / "workspace" / "note.txt"
+        path.write_text("old", encoding="utf-8")
+        model = MultiStepModel()
+        runtime = Runtime(client=model)
+        await runtime.start()
+        try:
+            await runtime.accept("edit", "读取并修改文件", "build")
+            await asyncio.wait_for(model.read_done.wait(), 3)
+            path.write_text("old changed", encoding="utf-8")
+            model.continue_edit.set()
+            await wait_for(lambda: len(model.reports) == 2)
+            assert "文件读取后已被修改" in model.reports[-1]
+            assert path.read_text(encoding="utf-8") == "old changed"
+            with db.new_session() as session:
+                assert len(store.records(session, "task_state")) == 1
+            assert model.worker_calls == 0
+        finally:
+            model.continue_edit.set()
+            await runtime.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("option", ["allowOnce", "deny"])
+def test_direct_approval_does_not_block_chat(isolated, option):
+    async def run():
+        model = DirectModel("write_file", {"path": "quick.txt", "content": "内容"})
+        runtime = Runtime(client=model)
+        await runtime.start()
+        try:
+            await runtime.accept("write", "创建文件", "build")
+            await wait_for(lambda: bool(runtime.approval_events))
+            request_id = next(iter(runtime.approval_events))
+            assert not (isolated / "workspace" / "quick.txt").exists()
+            await runtime.accept("question", "另一个问题", "build")
+            def answered():
+                with db.new_session() as session:
+                    return any(m["text"] == "已处理新消息。" for m in store.visible(session))
+            await wait_for(answered)
+            assert request_id in runtime.approval_events
+            await runtime.decide(request_id, option)
+            await wait_for(lambda: bool(model.reports))
+            assert (isolated / "workspace" / "quick.txt").exists() == (option == "allowOnce")
+            assert model.worker_calls == 0
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("update_first", [True, False])
+def test_direct_operation_respects_update_and_approval_order(isolated, monkeypatch, update_first):
+    from app.agent.worker import Worker
+
+    async def run():
+        model = DirectModel("write_file", {"path": "ordered.txt", "content": "内容"})
+        runtime = Runtime(client=model)
+        reached_start, release_start = asyncio.Event(), asyncio.Event()
+        original_started = Worker.started
+
+        async def pause_before_start(worker, execution):
+            reached_start.set()
+            await release_start.wait()
+            return await original_started(worker, execution)
+
+        monkeypatch.setattr(Worker, "started", pause_before_start)
+        await runtime.start()
+        try:
+            await runtime.accept("write", "创建文件", "build")
+            await wait_for(lambda: bool(runtime.approval_events))
+            request_id = next(iter(runtime.approval_events))
+            if not update_first:
+                await runtime.decide(request_id, "allowOnce")
+                await asyncio.wait_for(reached_start.wait(), 3)
+            await runtime.accept("update", "不要写入", "build")
+            def update_delivered():
+                with db.new_session() as session:
+                    return any(m.get("source") == "main" and m.get("delivery") == "pending"
+                               for m in store.records(session, "agent_message"))
+            await wait_for(update_delivered)
+            if update_first:
+                await runtime.decide(request_id, "allowOnce")
+                await asyncio.wait_for(reached_start.wait(), 3)
+            release_start.set()
+            await wait_for(lambda: bool(model.reports))
+            assert (isolated / "workspace" / "ordered.txt").exists() == update_first
+            if not update_first:
+                assert "收到新的用户要求" in model.reports[0]
+            assert model.worker_calls == 0
+        finally:
+            release_start.set()
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_direct_started_tool_is_not_replayed_after_restart(isolated, monkeypatch):
+    from app.agent import tools
+
+    calls = []
+    monkeypatch.setattr(tools, "capture_bash", lambda command: (calls.append(command) or "unexpected", False))
+
+    async def run():
+        model = DirectModel("bash", {"command": "pwd"})
+        model.issued = True
+        runtime = Runtime(client=model)
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            task = runtime.create_task(session, "pwd", 1)
+            group = f"{task['id']}:run:group"
+            identity = f"{task['id']}:run:call"
+            task.update(status="running", run_id="run", direct=True, direct_phase="executing", direct_group=group)
+            store.put(session, f"task:{task['id']}", task)
+            store.append_history(session, task["context_id"], "assistant", [{
+                "type": "tool_use", "id": "call", "name": "bash", "input": {"command": "pwd"}}])
+            store.put(session, f"execution:{identity}", {"type": "tool_execution", "id": identity,
+                      "task_id": task["id"], "context_id": task["context_id"], "run_id": "run", "call_id": "call",
+                      "name": "bash", "input": {"command": "pwd"}, "status": "started"})
+            store.put(session, f"group:{group}", {"type": "tool_group", "id": group,
+                      "context_id": task["context_id"], "calls": [identity], "status": "pending"})
+            session.commit()
+        await runtime.start()
+        try:
+            await wait_for(lambda: bool(model.reports))
+            assert not calls and "结果未知" in model.reports[0]
+            assert model.worker_calls == 0
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_direct_pending_approval_is_reissued_after_restart(isolated):
+    async def run():
+        model = DirectModel("write_file", {"path": "recovered.txt", "content": "ok"})
+        model.issued = True
+        runtime = Runtime(client=model)
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            task = runtime.create_task(session, "写入文件", 1)
+            group, identity = f"{task['id']}:run:group", f"{task['id']}:run:call"
+            task.update(status="waiting_user", run_id="run", direct=True, direct_phase="executing", direct_group=group)
+            store.put(session, f"task:{task['id']}", task)
+            call = {"type": "tool_use", "id": "call", "name": "write_file",
+                    "input": {"path": "recovered.txt", "content": "ok"}}
+            store.append_history(session, task["context_id"], "assistant", [call])
+            store.put(session, f"execution:{identity}", {"type": "tool_execution", "id": identity,
+                      "task_id": task["id"], "context_id": task["context_id"], "run_id": "run", "call_id": "call",
+                      "name": call["name"], "input": call["input"], "status": "pending"})
+            store.put(session, f"group:{group}", {"type": "tool_group", "id": group,
+                      "context_id": task["context_id"], "calls": [identity], "status": "pending"})
+            store.put(session, "approval:old", {"type": "approval", "request_id": "old", "status": "requested"})
+            session.commit()
+        await runtime.start()
+        try:
+            await wait_for(lambda: bool(runtime.approval_events))
+            request = next(iter(runtime.approval_events))
+            assert request != "old"
+            with db.new_session() as session:
+                assert store.get(session, "approval:old")["status"] == "expired"
+            await runtime.decide(request, "allowOnce")
+            await wait_for(lambda: bool(model.reports))
+            assert (isolated / "workspace" / "recovered.txt").read_text(encoding="utf-8") == "ok"
+            assert model.worker_calls == 0
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_direct_step_limit_does_not_execute_unavailable_tool(isolated, monkeypatch):
+    from app.agent import agent_bus, tools
+
+    calls = []
+    monkeypatch.setattr(tools, "capture_bash", lambda command: (calls.append(command) or "unexpected", False))
+
+    class LimitModel:
+        model = "fake"
+
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            assert "bash" not in {tool["name"] for tool in tools}
+            yield {"type": "tool_use", "id": new_id(), "name": "bash", "input": {"command": "pwd"}}
+            yield {"type": "stop_reason", "reason": "tool_use"}
+
+    async def run():
+        runtime = Runtime(client=LimitModel())
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            task = runtime.create_task(session, "达到上限", 1)
+            task.update(status="running", run_id="run", direct=True, direct_phase="reporting", steps=40)
+            store.put(session, f"task:{task['id']}", task)
+            agent_bus.send(session, source=task["context_id"], target="main", task_id=task["id"],
+                           content="直接执行【达到上限】的工具结果：完成", kind="direct", message_id="limit")
+            session.commit()
+        await runtime.start()
+        try:
+            def failed():
+                with db.new_session() as session:
+                    return store.get(session, f"task:{task['id']}")["status"] == "failed"
+            await wait_for(failed)
+            assert not calls
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_direct_task_cannot_wait_for_dependency(isolated):
+    runtime = Runtime(client=DirectModel("bash", {"command": "pwd"}))
+    with db.new_session() as session:
+        store.initialize(session, isolated)
+        direct = runtime.create_task(session, "快速任务", 1)
+        direct.update(status="running", direct=True)
+        store.put(session, f"task:{direct['id']}", direct)
+        other = runtime.create_task(session, "后台任务", 2)
+        result = runtime._main_action(session, "task_wait_for", {
+            "task_id": direct["id"], "dependency_id": other["id"]}, 1, "wait")
+        assert result.startswith("Error:")
+        assert store.get(session, f"task:{direct['id']}")["dependency"] is None

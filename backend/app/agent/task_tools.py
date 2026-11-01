@@ -6,7 +6,7 @@ ROUTE = _schema("route_input", "判断用户消息与任务的关系。", {
     "user_seq": {"type": "integer"},
     "intents": {"type": "array", "items": {"type": "object", "properties": {
         "type": {"type": "string", "enum": ["chat", "create", "query", "update", "stop", "unclear"],
-                 "description": "create 用于需要读取、搜索、分析或其他实际工作的独立新任务；chat 仅用于无需操作的简单问答。"},
+                 "description": "chat 用于简单问答和预计可快速完成的简单任务；create 用于复杂、耗时或适合并行的独立任务。"},
         "task_id": {"type": "string"}, "instruction": {"type": "string"},
         "approval_ids": {"type": "array", "items": {"type": "string"},
                          "description": "受本意图影响的审批 ID，包括已决定的审批；确认无影响时为空数组。"},
@@ -38,6 +38,7 @@ SHARED_TOOLS = [_schema("read_tool_output", "分段读取已保存的命令输�
     "output_id": {"type": "string"}, "offset": {"type": "integer", "minimum": 0},
     "limit": {"type": "integer", "minimum": 1, "maximum": 30000}}, ["output_id"])]
 
+DIRECT_TOOLS = [tool for tool in TOOLS if tool["name"] != "subtask"]
 WORKER_TOOLS = [tool for tool in TOOLS if tool["name"] not in {"subtask"}] + SHARED_TOOLS + [
     _schema("agent_list", "查看可联系的后台助手。", {}, []),
     _schema("agent_send", "向后台助手发送信息。", {

@@ -207,7 +207,9 @@ class Worker:
         error = await self.authorize(execution)
         if error:
             return error
-        await self.started(execution)
+        error = await self.started(execution)
+        if error:
+            return error
         if name == "todo_write":
             from app.agent.todo import parse_items, render_panel
             from app.sessions.store import replace_todos
@@ -234,12 +236,25 @@ class Worker:
                                approver=lambda tool, inputs, reason: self.approve(execution, reason))
         return await approvals.authorize_tool(deps, name, args, data_dir=settings.data_dir)
 
-    async def started(self, execution: dict) -> None:
+    async def started(self, execution: dict) -> str | None:
         def started(session):
             current = store.get(session, f"execution:{execution['id']}")
+            task = store.get(session, f"task:{self.task_id}")
+            if task.get("stop_requested"):
+                return "Error: 用户已停止任务，工具未执行。"
+            if task.get("direct"):
+                decisions = [a.get("user_seq", 0) for a in store.records(session, "approval")
+                             if a.get("task_id") == self.task_id and a.get("tool_call_id") == execution["call_id"]
+                             and a.get("status") == "resolved"]
+                latest = max(decisions, default=0)
+                if any(item.get("user_seq", 0) > latest for item in store.records(
+                        session, "agent_message", context_id=self.context_id, delivery="pending")
+                       if item["source"] == "main"):
+                    return "Error: 收到新的用户要求，请先判断后再执行。"
             current["status"] = "started"
             store.put(session, f"execution:{execution['id']}", current)
-        await self.runtime.change(started)
+            return None
+        return await self.runtime.change(started)
 
     async def file_tool(self, execution: dict) -> str:
         name, args = execution["name"], execution["input"]
@@ -286,7 +301,9 @@ class Worker:
                 await self.runtime.change(claim)
                 if read_version and read_version["version"] != await self.runtime.run_tool(file_version, path):
                     return "Error: 审批期间文件已被修改，请重新读取并重新发起操作。"
-            await self.started(execution)
+            error = await self.started(execution)
+            if error:
+                return error
             result = await self.runtime.run_tool(tools.execute_tool, name, args)
             if not result.startswith("Error:"):
                 version = await self.runtime.run_tool(file_version, path)

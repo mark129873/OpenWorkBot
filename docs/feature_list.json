@@ -15,9 +15,9 @@
     {
       "id": "Backend-01",
       "name": "后台多助手协作",
-      "description": "主助手路由、任务调度、通信、授权与恢复。",
+      "description": "主助手分流和直接执行、后台任务调度、通信、授权与恢复。",
       "status": "passing",
-      "evidence": "后端 64 项空库测试通过；DeepSeek 实测等待让位、回复恢复及历史任务查询。"
+      "evidence": "后端 75 项空库测试通过；DeepSeek 实测快速任务直接执行、等待让位、回复恢复及历史查询。"
     },
     {
       "id": "Frontend-01",

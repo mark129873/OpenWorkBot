@@ -13,7 +13,7 @@ React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最�
 ## 2. 产品交互
 
 - 进入直接显示唯一主聊天，无会话侧栏。沿用左右消息、Markdown、空聊天引导、助手名称、用量和权限模式；移除任务详情、工具过程、复制、重新生成及停止按钮。
-- 主助手负责持续对话、简单问答、判断、协调和分配；调查、业务分析、编写、文件和命令等实际任务交给 Worker。关键进展、结果及确认回到主聊天并标明任务；默认隐藏 Worker。回复默认简短，用户要求时可展开，不设固定字数。
+- 主助手判断任务规模：简单、预计可快速完成的任务直接使用工具；复杂、耗时或适合并行的任务交给 Worker。关键进展、结果及确认回到主聊天；默认隐藏 Worker。回复默认简短，用户要求时可展开，不设固定字数。
 - 用户可随时发新消息，追问、修改、停止或提出其他任务。新消息仅打断主助手当前回复，已输出文字保存并标记；Worker 继续运行。后台报告等新消息处理后，按实际发送顺序追加。
 - 主对话与各任务上下文独立保存和压缩，不将所有 Worker 工作细节塞进主对话。
 - 只使用单个 FastAPI 进程、`asyncio`、现有模型、SQLite 与 SSE。最多三个 Worker 执行槽位；不引入 Redis、Celery、LangGraph、任务表、Kanban 或长期记忆模块。现有 todo 不负责调度。
@@ -37,7 +37,7 @@ React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最�
 | `backend/app/api/chat.py` | 主聊天快照、消息、审批和 SSE。 |
 | `backend/app/agent/runtime.py`、`worker.py` | 主助手、任务调度、三个槽位及独立 Worker 循环。 |
 | `backend/app/agent/agent_bus.py`、`task_tools.py` | 持久化内部消息、重试、等待环及助手通信工具。 |
-| `backend/app/agent/system_prompt.md` | 主助手角色及简短回复要求；主助手不直接执行业务工具。 |
+| `backend/app/agent/system_prompt.md` | 主助手角色、直接执行与分配原则及简短回复要求。 |
 | `backend/app/agent/llm.py`、`compact.py`、`tools.py` | 结构化路由、独立上下文压缩、文件分页及命令输出限制。 |
 | `backend/app/sessions/chat_store.py`、`approvals.py`、`session_permissions.py` | 短事务、上下文投影、多任务审批及现有授权范围。 |
 | `backend/app/models.py`、`agent/model_call.py`、`modelio.py` | 上下文及未处理消息查询索引；并发模型日志与轮转串行化，关联任务 / 运行 ID。 |
@@ -68,6 +68,8 @@ React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最�
 - 文件与命令工具经权限检查后使用 `asyncio.to_thread`，不阻塞聊天；线程不共享数据库 Session 或直接操作 `asyncio.Queue`。命令合并 stdout / stderr 并持续排空，读取和等待均有界。
 
 主助手使用 `task_create / task_inspect / task_search / task_update / task_stop / task_review / task_wait_for / route_input`；Worker 使用 `agent_list / agent_send / agent_wait / agent_help / task_report`。主助手和所属任务可用 `read_tool_output` 查看已保存输出。工具返回“已受理”不等于执行完毕。
+
+主助手可调用现有文件、命令等工具直接完成快速任务，不启动 Worker 模型或占用 Worker 槽位；直接工具最多三组并发，每个任务最多 40 个工具步骤，需要等待任务依赖时转交后台。工具执行沿用任务记录、权限、文件协调及结果持久化；等待工具或审批时仍可处理新消息，完成后由主助手继续回复。重启时已开始但结果未知的操作不重跑，待执行操作重新检查权限。
 
 Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结束后处理；请求额外工作只能分配空槽。停止或修改同时送负责人及相关协助者。等待回复时持久化等待并让出槽位；目标继承最早等待者的顺序，回复、对方结束、停止或变更时按原序恢复；重启后继续等待，被打断的工具调用补齐结果。
 
@@ -129,7 +131,7 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 4. 启动本地 HTTP / SSE，接收任务后关闭页面，验证后台完成、重连快照和结果；验证同一数据目录不能启动两个后端，以及快照 / 增量交界断线、慢连接和日志失败。
 5. 检查上下文隔离与工具调用配对，文件分页、超长行提示、1 MiB 命令采集和分段读取；执行前端构建、检查和浏览器验收。
 
-本机验证：后端 64 项、前端 2 项测试及前端构建、lint 通过；浏览器验证主聊天、审批期间继续发送及刷新恢复。隔离环境使用 DeepSeek 验证并行、审批、回复恢复和历史查询；预置等待记录后验证三助手通信及槽位上限。GPT-6 的原生 Responses 适配不在首版，尚未实测。
+本机验证：后端 75 项、前端 2 项测试及前端构建、lint 通过；浏览器验证主聊天、审批期间继续发送及刷新恢复。隔离环境使用 DeepSeek 验证快速命令和文件写入直接执行，以及并行、审批、回复恢复和历史查询；预置等待记录后验证三助手通信及槽位上限。GPT-6 的原生 Responses 适配不在首版，尚未实测。
 
 真实模型仍可能误解要求或误调工具；DeepSeek 思考模式不支持当前强制指定工具方式。模型服务不可用时停止 / 修改无法及时判断，已授权操作仍继续。PowerShell 无法完整识别外部副作用；Windows PowerShell 读取无 BOM 的 UTF-8 文件时可能需要 `-Encoding UTF8`。命令输出及超长单行按约定截断，持久记录持续累积。日志及干净库要求见 [reliability.md](reliability.md)。
 
