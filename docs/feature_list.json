@@ -73,7 +73,7 @@
       "name": "OpenAI 模型接入",
       "description": "支持项目使用 OpenAI API。",
       "status": "planned",
-      "evidence": "方案待用户审批；尚未实施或验收。"
+      "evidence": "验收模型为 gpt-6-luna；方案待审批，尚未实施或验收。"
     }
   ]
 }
