@@ -67,6 +67,13 @@
       "description": "按需并行改写、拆分和扩展查询，汇合后检索。",
       "status": "passing",
       "evidence": "RAG 15 项、后端关联 11 项通过；固定选择三种策略，以真实模型和隔离 Milvus 完成问答与来源验证。"
+    },
+    {
+      "id": "Backend-06",
+      "name": "OpenAI 模型接入",
+      "description": "支持项目使用 OpenAI API。",
+      "status": "planned",
+      "evidence": "方案待用户审批；尚未实施或验收。"
     }
   ]
 }
