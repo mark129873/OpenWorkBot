@@ -22,9 +22,12 @@ class Settings:
     api_key: str
     base_url: str
     model: str
+    provider: str = "anthropic"
 
 
 def settings() -> Settings:
+    provider = (os.getenv("LLM_PROVIDER") or "anthropic").strip().lower()
+    prefix = "OPENAI" if provider == "openai" else "ANTHROPIC"
     return Settings(
         workspace=Path(os.getenv("OPENWORKBOT_WORKSPACE", ROOT.parent / "backend/data/workspace")).resolve(),
         data_dir=Path(os.getenv("RAG_DATA_DIR", ROOT / "data")).resolve(),
@@ -35,7 +38,8 @@ def settings() -> Settings:
         embedding_model=os.getenv("EMBEDDING_MODEL_PATH", ""),
         rerank_url=os.getenv("RERANKER_BASE_URL", "http://127.0.0.1:11435").rstrip("/"),
         rerank_model=os.getenv("RERANKER_MODEL_PATH", ""),
-        api_key=os.getenv("ANTHROPIC_API_KEY", ""),
-        base_url=os.getenv("ANTHROPIC_BASE_URL", ""),
+        api_key=os.getenv(f"{prefix}_API_KEY", ""),
+        base_url=os.getenv(f"{prefix}_BASE_URL", ""),
         model=os.getenv("MODEL_ID", ""),
+        provider=provider,
     )

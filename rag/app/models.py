@@ -2,6 +2,7 @@ import json
 
 import httpx
 from anthropic import AsyncAnthropic
+from openai import APIError, AsyncOpenAI
 
 from app.config import Settings
 
@@ -54,11 +55,26 @@ class Models:
             raise ValueError("重排响应无效") from exc
 
     async def text(self, system: str, prompt: str) -> str:
-        if not self.config.api_key or not self.config.model:
+        if self.config.provider not in {"anthropic", "openai"} or not self.config.api_key or not self.config.model:
             raise RuntimeError("Bot 模型未配置")
         kwargs = {"api_key": self.config.api_key}
         if self.config.base_url:
             kwargs["base_url"] = self.config.base_url
+        if self.config.provider == "openai":
+            kwargs["base_url"] = self.config.base_url or "https://api.openai.com/v1"
+            try:
+                async with AsyncOpenAI(**kwargs, timeout=120.0, max_retries=1) as client:
+                    response = await client.chat.completions.create(
+                        model=self.config.model, max_completion_tokens=4096, reasoning_effort="none", store=False,
+                        messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}])
+            except APIError as exc:
+                raise RuntimeError(f"OpenAI 请求失败：{getattr(exc, 'status_code', None) or '连接错误'}") from None
+            if not response.choices or response.choices[0].finish_reason != "stop":
+                raise RuntimeError("模型响应未完成")
+            text = response.choices[0].message.content or ""
+            if not text.strip():
+                raise RuntimeError("模型没有返回内容")
+            return text.strip()
         async with AsyncAnthropic(**kwargs, timeout=120.0, max_retries=1) as client:
             response = await client.messages.create(model=self.config.model, max_tokens=4096,
                                                     thinking={"type": "disabled"}, system=system,

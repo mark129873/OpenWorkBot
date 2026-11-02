@@ -1998,6 +1998,8 @@ def test_first_action_ids_are_scoped_to_the_user_message(isolated):
     {"intent_index": 0, "name": "task_stop", "input": {"task_id": "x"}},
     {"intent_index": 0, "name": "bash", "input": {"command": 1}},
     {"intent_index": 0, "name": "bash", "input": {"command": "pwd", "extra": "x"}},
+    {"intent_index": 0, "name": "read_file", "input": {"path": "a.txt", "offset": 0}},
+    {"intent_index": 0, "name": "todo_write", "input": {"items": [{"content": "a", "status": "invalid"}]}},
 ])
 def test_invalid_first_action_is_rejected(action):
     event = {"message_id": "user:one", "user_seq": 1}

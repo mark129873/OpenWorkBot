@@ -23,8 +23,11 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass
 class Settings:
+    llm_provider: str = "anthropic"
     anthropic_api_key: str = field(default="")
     anthropic_base_url: str = field(default="")
+    openai_api_key: str = field(default="")
+    openai_base_url: str = field(default="")
     model_id: str = field(default="")
 
     max_tokens: int = 10000
@@ -55,8 +58,11 @@ def load_settings() -> Settings:
         modelio_dir = BACKEND_ROOT / modelio_dir
 
     return Settings(
+        llm_provider=_env_str("LLM_PROVIDER", "anthropic").lower(),
         anthropic_api_key=_env_str("ANTHROPIC_API_KEY"),
         anthropic_base_url=_env_str("ANTHROPIC_BASE_URL"),
+        openai_api_key=_env_str("OPENAI_API_KEY"),
+        openai_base_url=_env_str("OPENAI_BASE_URL"),
         model_id=_env_str("MODEL_ID"),
         max_tokens=_env_int("MAX_TOKENS", 10000),
         bash_timeout=_env_int("BASH_TIMEOUT", 120),
@@ -76,8 +82,12 @@ def load_settings() -> Settings:
 def validate_llm_config(s: Settings) -> list[str]:
     """发起对话时才校验，健康检查不依赖模型密钥。"""
     missing: list[str] = []
-    if not s.anthropic_api_key:
+    if s.llm_provider not in {"anthropic", "openai"}:
+        missing.append("LLM_PROVIDER")
+    elif s.llm_provider == "anthropic" and not s.anthropic_api_key:
         missing.append("ANTHROPIC_API_KEY")
+    elif s.llm_provider == "openai" and not s.openai_api_key:
+        missing.append("OPENAI_API_KEY")
     if not s.model_id:
         missing.append("MODEL_ID")
     return missing

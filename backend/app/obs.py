@@ -36,7 +36,7 @@ def setup_logging(data_dir: Path, level: str = "INFO") -> None:
     file_handler.setFormatter(formatter)
     root.addHandler(file_handler)
 
-    for noisy in ("httpx", "httpcore", "urllib3", "anthropic"):
+    for noisy in ("httpx", "httpx2", "httpcore", "urllib3", "anthropic", "openai"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
 

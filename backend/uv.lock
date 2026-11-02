@@ -64,7 +64,9 @@ source = { virtual = "." }
 dependencies = [
     { name = "anthropic" },
     { name = "fastapi" },
+    { name = "jsonschema" },
     { name = "mcp" },
+    { name = "openai" },
     { name = "python-dotenv" },
     { name = "python-multipart" },
     { name = "sqlalchemy" },
@@ -81,7 +83,9 @@ dev = [
 requires-dist = [
     { name = "anthropic", specifier = ">=0.40" },
     { name = "fastapi", specifier = ">=0.115" },
+    { name = "jsonschema", specifier = ">=4.26.0" },
     { name = "mcp", specifier = ">=1.28,<2.0" },
+    { name = "openai", specifier = ">=3.42.1" },
     { name = "python-dotenv", specifier = ">=1.0" },
     { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "sqlalchemy", specifier = ">=2.0" },
@@ -587,6 +591,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ba/93/0142dc84a666daf8ad51a34268f34c12fd6fda4f3810c4be2504eecc8212/mcp-1.30.0.tar.gz", hash = "sha256:445414625fce5c295faa505bb11bacece661ab6f4028d57c935db57820b7a3e4", size = 680511, upload-time = "2026-09-07T14:34:15.845Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f5/f4/e58bc33317c92a0203664daaf00bf6f41166cc0149e5d6870a03f7cd004a/mcp-1.30.0-py3-none-any.whl", hash = "sha256:666edb5009503e1047c9d60346a756f94b261f05cc2625f23d41c728ffc484d0", size = 234581, upload-time = "2026-09-07T14:34:14.266Z" },
+]
+
+[[package]]
+name = "openai"
+version = "3.42.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "httpx2" },
+    { name = "jiter" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9f/7b/e01d5288d13e3bae3714ed39df402f99f88f422dcd978c5ce94848037200/openai-3.42.1.tar.gz", hash = "sha256:4222d919374648ff572753626e942f26eb1ece8a5e0e9a2708c9be4d560f070f", size = 2356422, upload-time = "2026-11-01T20:57:02.607Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fd/11/37b847d8a057000193974eeea1bcc681355ae50d35865f2eb2b323de6153/openai-3.42.1-py3-none-any.whl", hash = "sha256:c1959518a8e26f81a3564357082cb684540be639a21fece35ac5619415a3eadc", size = 2397433, upload-time = "2026-11-01T20:57:00.622Z" },
 ]
 
 [[package]]

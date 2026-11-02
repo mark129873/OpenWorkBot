@@ -72,8 +72,8 @@
       "id": "Backend-06",
       "name": "OpenAI 模型接入",
       "description": "支持项目使用 OpenAI API。",
-      "status": "planned",
-      "evidence": "验收模型为 gpt-6-luna；方案待审批，尚未实施或验收。"
+      "status": "in_progress",
+      "evidence": "模拟接口与空库下后端 134 项、RAG 19 项通过；真实 gpt-6-luna 调用待用户配置。"
     }
   ]
 }

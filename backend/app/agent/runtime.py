@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 from types import SimpleNamespace
 
+from jsonschema import ValidationError, validate
 from sqlalchemy import func, or_, select
 
 from app import db
@@ -507,7 +508,7 @@ class Runtime:
                         raise
                 except Exception:
                     logger.exception("主助手执行失败")
-                    error = ("模型配置不完整，请检查 ANTHROPIC_API_KEY 和 MODEL_ID。" if self.client is None
+                    error = (f"模型配置有误，请检查 {', '.join(validate_llm_config(settings))}。" if self.client is None
                              else "助手暂时无法处理这条消息，请稍后重试。")
                     await self._error_item(kind, item, error)
                 finally:
@@ -650,6 +651,10 @@ class Runtime:
             if (any(key not in args for key in schema["required"]) or any(key not in properties for key in args)
                     or any(type(value) is not types[properties[key]["type"]] for key, value in args.items())):
                 raise ValueError("首个动作的工具参数无效")
+            try:
+                validate(args, {**schema, "additionalProperties": False})
+            except ValidationError:
+                raise ValueError("首个动作的工具参数无效") from None
 
     def _apply_route(self, session, event: dict, route: dict, known_approvals: set[str] | None = None,
                      action_id: str | None = None, model_blocks: list | None = None) -> dict:

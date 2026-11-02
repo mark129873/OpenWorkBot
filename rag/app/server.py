@@ -8,6 +8,8 @@ from app.config import settings
 from app.knowledge import Knowledge
 
 logging.basicConfig(level=logging.INFO)
+for noisy in ("httpx2", "openai"):
+    logging.getLogger(noisy).setLevel(logging.WARNING)
 mcp = FastMCP("OpenWorkBot RAG")
 knowledge = Knowledge(settings())
 operations: dict[str, asyncio.Task] = {}

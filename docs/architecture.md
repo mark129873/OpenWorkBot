@@ -8,7 +8,7 @@ React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最�
 
 主要入口：`frontend/src/App.tsx`、`backend/app/api/chat.py`、`agent/runtime.py`、`agent/worker.py` 和 `sessions/chat_store.py`。旧会话代码保留供回归，不再注册旧接口。Agent 与 sessions 路径相对 `backend/app/`。
 
-后端使用 Python 3.12、FastAPI、Anthropic 兼容客户端、SQLAlchemy、SQLite；前端使用 React、Vite、SSE。Skills、Hooks、todo 和现有 build / edit / yolo 权限继续沿用。根目录 `uv run --no-project start.py` 启动前后端（8100 / 5173）；`/api/health` 不依赖模型配置。当前无登录或多租户，不能直接暴露公网。
+后端使用 Python 3.12、FastAPI、Anthropic 兼容或 OpenAI 客户端、SQLAlchemy、SQLite；前端使用 React、Vite、SSE。Skills、Hooks、todo 和现有 build / edit / yolo 权限继续沿用。根目录 `uv run --no-project start.py` 启动前后端（8100 / 5173）；`/api/health` 不依赖模型配置。当前无登录或多租户，不能直接暴露公网。
 
 ## 2. 产品交互
 
@@ -139,7 +139,7 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 4. 启动本地 HTTP / SSE，接收任务后关闭页面，验证后台完成、重连快照和结果；验证同一数据目录不能启动两个后端，以及快照 / 增量交界断线、慢连接和日志失败。
 5. 检查上下文隔离与工具调用配对，文件分页、超长行提示、1 MiB 命令采集和分段读取；执行前端构建、检查和浏览器验收。
 
-本机验证：后端全量 90 项、首轮动作专项 16 项通过；此前前端 2 项测试、构建、lint 及浏览器主聊天验证通过。隔离环境使用 DeepSeek 验证 `pwd` 和文件写入各两次模型调用、混合意图及命令限制；此前验证并行、审批、回复恢复和历史查询。GPT-6 的原生 Responses 适配不在首版，尚未实测。
+本机验证：后端全量 90 项、首轮动作专项 16 项通过；此前前端 2 项测试、构建、lint 及浏览器主聊天验证通过。隔离环境使用 DeepSeek 验证 `pwd` 和文件写入各两次模型调用、混合意图及命令限制；此前验证并行、审批、回复恢复和历史查询。OpenAI 接入的验证状态见进度记录。
 
 真实模型仍可能误解要求或误调工具；DeepSeek 思考模式不支持当前强制指定工具方式。模型服务不可用时停止 / 修改无法及时判断，已授权操作仍继续。PowerShell 无法完整识别外部副作用；Windows PowerShell 读取无 BOM 的 UTF-8 文件时可能需要 `-Encoding UTF8`。命令输出及超长单行按约定截断，持久记录持续累积。日志及干净库要求见 [reliability.md](reliability.md)。
 
@@ -149,7 +149,7 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 - Codex `e72da2b538`：`codex-rs/core/src/unified_exec/`，参考命令输出采集。
 - [DeepSeek `6337fc823ce`](https://github.com/deepseek-ai/dsh-superagent-prototype/blob/6337fc823ce20251c8de8085948165c81aaa701e/src/app/effects.ts)：参考 Router / Worker 分工、待处理记录和失败重试；不照搬其授权或额外槽位。
 - [Anthropic 工具选择](https://platform.claude.com/docs/en/api/http/messages)：指定 `tool_choice` 可要求调用特定工具；[部分思考模式存在限制](https://platform.claude.com/docs/en/build-with-claude/thinking)，当前客户端默认关闭该模式。
-- [DeepSeek 接口](https://api-docs.deepseek.com/guides/anthropic_api/)与 [OpenAI GPT-6 工具调用](https://developers.openai.com/api/docs/guides/function-calling)：前者非思考模式支持指定工具，后者通过 Responses API 接入。
+- [DeepSeek 接口](https://api-docs.deepseek.com/guides/anthropic_api/)与 [GPT-6 Luna 接口](https://developers.openai.com/api/docs/models/gpt-6-luna)：均可在关闭额外推理时指定工具。
 
 ## 11. 受控 Agentic RAG
 
@@ -160,3 +160,10 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 - 用户自行删除 law 旧 Milvus 集合；新服务不得自动清空或接管未识别的集合。测试仅用独立临时工作区、空库和隔离集合。上传逐项反馈，任一文件失败时保留草稿、不发送消息；纯文件消息无需正文。
 - 首次执行 `uv sync --project rag`，参考 `rag/.env.example` 配置 law 的 Milvus 连接、本机模型路径及设备；安装并将 `llama` 加入 PATH。根启动脚本自动启动 Embedding / 重排服务，服务故障不停止 Bot。结果未知的操作需用户明确要求重试；已开始的云端请求可能无法撤回。
 - RAG 和模型不记录密钥；现有模型快照可能包含检索内容。无独立知识库页面、通用 MCP 管理或 OCR；证据评估及回答仍可能出错，生成后不再校验。中断或云端清理失败可能留下不可检索的旧分块，暂不自动清理。
+
+## 12. OpenAI 模型接入
+
+- `LLM_PROVIDER` 默认为 `anthropic`，可选 `openai`；OpenAI 使用 `OPENAI_API_KEY`、可选 `OPENAI_BASE_URL` 和现有 `MODEL_ID`，修改配置后重启。RAG 复用同一配置。
+- OpenAI 使用 Chat Completions，`reasoning_effort=none`、`store=false`；验收模型为 `gpt-6-luna`。不新增 Responses 接口或模型设置页面。
+- 保留现有历史格式和 SQLite 表；请求时转换消息、工具调用及结果，流式聚合完整参数，支持指定工具与用量。参数无效、流中断或输出截断时不得执行不完整工具调用。
+- 延续现有授权、上下文压缩和恢复语义，密钥不进入日志；用假服务及独立空库测试。用户填写真实配置并通知后再做真实调用。

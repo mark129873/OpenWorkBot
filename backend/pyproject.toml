@@ -11,6 +11,8 @@ dependencies = [
     "python-dotenv>=1.0",
     "mcp>=1.28,<2.0",
     "python-multipart>=0.0.9",
+    "openai>=3.42.1",
+    "jsonschema>=4.26.0",
 ]
 
 [dependency-groups]

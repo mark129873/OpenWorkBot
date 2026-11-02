@@ -590,6 +590,23 @@ wheels = [
 ]
 
 [[package]]
+name = "openai"
+version = "3.42.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "anyio" },
+    { name = "httpx2" },
+    { name = "jiter" },
+    { name = "pydantic" },
+    { name = "sniffio" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/9f/7b/e01d5288d13e3bae3714ed39df402f99f88f422dcd978c5ce94848037200/openai-3.42.1.tar.gz", hash = "sha256:4222d919374648ff572753626e942f26eb1ece8a5e0e9a2708c9be4d560f070f", size = 2356422, upload-time = "2026-11-01T20:57:02.607Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/fd/11/37b847d8a057000193974eeea1bcc681355ae50d35865f2eb2b323de6153/openai-3.42.1-py3-none-any.whl", hash = "sha256:c1959518a8e26f81a3564357082cb684540be639a21fece35ac5619415a3eadc", size = 2397433, upload-time = "2026-11-01T20:57:00.622Z" },
+]
+
+[[package]]
 name = "opentelemetry-api"
 version = "1.45.2"
 source = { registry = "https://pypi.org/simple" }
@@ -610,6 +627,7 @@ dependencies = [
     { name = "httpx" },
     { name = "langgraph" },
     { name = "mcp" },
+    { name = "openai" },
     { name = "pymilvus" },
     { name = "pypdf" },
     { name = "python-dotenv" },
@@ -627,6 +645,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.27,<1.0" },
     { name = "langgraph", specifier = ">=0.2,<2.0" },
     { name = "mcp", specifier = ">=1.28,<2.0" },
+    { name = "openai", specifier = ">=3.42.1" },
     { name = "pymilvus", specifier = ">=3.0.1" },
     { name = "pypdf", specifier = ">=5,<7" },
     { name = "python-dotenv", specifier = ">=1.0" },
