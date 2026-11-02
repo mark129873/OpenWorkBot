@@ -32,6 +32,7 @@ class AnthropicStreamClient:
             messages=messages,
             tools=tools,
             max_tokens=self._max_tokens,
+            temperature=0,
             thinking={"type": "disabled"},
             **options,
         ) as stream:
@@ -166,7 +167,8 @@ class OpenAIStreamClient:
         try:
             stream = await self._client.chat.completions.create(
                 model=self.model, messages=openai_messages(system, messages), max_completion_tokens=self._max_tokens,
-                reasoning_effort="none", store=False, stream=True, stream_options={"include_usage": True}, **options)
+                temperature=0, reasoning_effort="none", store=False, stream=True,
+                stream_options={"include_usage": True}, **options)
             async with stream:
                 async for chunk in stream:
                     if chunk.usage is not None:

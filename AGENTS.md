@@ -3,21 +3,22 @@
 OpenWorkBot, 目标打造类OpenAI Dots 的自主智能员工, 面向个人与企业提供主动执行, 多智能体协同, 长期记忆, 工作流自动化的AI原生产品, 构建可自主规划, 自动调用工具, 自主迭代的超级Agent舰队
 
 ## 开始工作
-1. 读取 scripts_mini_harness/mini_harness.py, 作为此项目harness思想的参考
+<!-- 1. 读取 scripts_mini_harness/mini_harness.py, 作为此项目harness思想的参考 -->
 2. 阅读 docs/prd.md了解功能需求与用户侧交互
 3. 阅读 docs/architecture.md，了解项目架构以及技术设计
-4. 读取 docs/progress.md，了解最新会话进度日志
+<!-- 4. 读取 docs/progress.md，了解最新会话进度日志
 5. 读取 docs/feature_list.json，确认开发进度
-6. 读取 docs/reliability.md，了解运行与验证要求
+6. 读取 docs/reliability.md，了解运行与验证要求 -->
 
 ## 结束会话前：
-- 更新 docs/progress.md
-- 更新 docs/feature_list.json
-- 更新 docs/progress.md, 记录仍未解决的风险或 blocker
+<!-- - 更新 docs/progress.md -->
+<!-- - 更新 docs/feature_list.json -->
+<!-- - 更新 docs/progress.md, 记录仍未解决的风险或 blocker -->
 - 在工作处于安全状态后，用简洁的中文提交
 
 ## 工作规则
 - 新增功能时，请**先更新对应文档，再编写代码**。
+- 只有开发以及测评任务, 才更新文档, 仅chat不更新文档。
 - 优先依赖仓库里的持久化文件，而不是聊天记录。
 - 除非为了消除当前 blocker 的窄范围修复，否则不要扩大到其他功能。
 - 数据库不做 schema 迁移（本项目仍在开发阶段, 不涉及到数据库的保留以及历史数据迁移）：改 models.py 表结构后，删除 backend/data/ 重启即全新建表；测试一律从空库开始。
@@ -43,3 +44,8 @@ OpenWorkBot, 目标打造类OpenAI Dots 的自主智能员工, 面向个人与�
 
 ## 特别规定
 - README.md 暂不修改
+
+## RAG评测相关规定
+- rag\benchmarks\bank-rag-v2-50.jsonl 目前选中的50题评测文档
+- RAG评测报告保存至 docs/evaluations/；银行评测报告保存至 rag/data/evaluations/bank-rag/report/。简洁记录基线（现状、架构、模型及参数）、样本与指标（含延迟）、结论、异常和建议；注明来源、有效数、统计口径及限制。
+- rag\data\evaluations\bank-rag\analysis 目录下保存优化建议文件md, 文件名格式为月日时分.md (例如11-03-18-41.md)

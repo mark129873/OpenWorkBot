@@ -207,6 +207,9 @@ def test_stream_emits_stop_reason():
         return SimpleNamespace(**kwargs)
 
     class Stream:
+        def __init__(self, **kwargs):
+            assert kwargs["temperature"] == 0
+
         async def __aenter__(self):
             return self
 
@@ -219,7 +222,7 @@ def test_stream_emits_stop_reason():
             yield obj(type="message_stop")
 
     client = object.__new__(AnthropicStreamClient)
-    client._client = obj(messages=obj(stream=lambda **_kwargs: Stream()))
+    client._client = obj(messages=obj(stream=Stream))
     client.model, client._max_tokens = "fake", 100
     events = collect(client.stream(system="", messages=[], tools=[]))
     snapshots = [event for event in events if event["type"] == "usage"]

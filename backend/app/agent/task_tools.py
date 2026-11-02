@@ -49,7 +49,7 @@ ROUTE = _schema("route_input", "判断用户消息的完整意图和首个动作
 }, ["message_id", "user_seq", "intents", "needs_clarification"])
 
 RAG_TOOLS = [
-    _schema("rag_search", "查询知识库并返回带来源的答案。", {"query": {"type": "string"}}, ["query"]),
+    _schema("rag_search", "查询知识库并返回答案。", {"query": {"type": "string"}}, ["query"]),
     _schema("rag_ingest", "用户明确要求时将工作区文件加入知识库或更新索引。", {"path": {"type": "string"}}, ["path"]),
     _schema("rag_list", "查看知识库中已入库的文件。", {}, []),
     _schema("rag_remove", "用户明确要求时从知识库移出文件；不删除工作区原文件。",

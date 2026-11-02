@@ -2,6 +2,56 @@
 
 打造类 OpenAI Dots 的自主智能员工，面向个人与企业提供主动执行、多智能体协同、长期记忆与工作流自动化，构建可自主规划、调用工具、根据反馈调整执行的 Agent 协作系统。
 
+## 通过 MCP 接入 LangGraph RAG 知识库
+
+RAG 作为独立 MCP 服务，供 Harness Agent 操作知识库，由 LangGraph 固定 Workflow 规划重写查询、多查询、扩展查询、子问题拆分，再通过 Milvus 进行向量和 BM25 混合检索、本地重排与证据评估；必要时补检，最终生成带文件来源的回答。
+
+![LangGraph RAG 检索流程](./readme_docs/rag_langgraph.png)
+
+
+
+### RAG 测评步骤
+```bash
+# 1.启动模型
+cd C:\Users\nnnnnn\Desktop\OpenWorkBot
+.\rag\.venv\Scripts\python.exe .\rag\run_models.py
+# 2.上传知识库
+.\rag\.venv\Scripts\python.exe .\rag\evaluations\utils\upload_bank_rag.py
+# 3.端到端生成
+.\rag\.venv\Scripts\python.exe .\rag\evaluations\utils\run_bank_rag.py --dataset .\rag\benchmarks\bank-rag-v2-50.jsonl --limit 50
+# 4.端到端评测
+.\rag\.venv\Scripts\python.exe .\rag\evaluations\utils\evaluate_bank_rag.py
+
+# 单检索评测
+.\rag\.venv\Scripts\python.exe .\rag\evaluations\evaluate_retrieval.py --dataset .\rag\benchmarks\bank-rag-v2-50.jsonl --limit 50
+# 单生成评测：将文件名替换为本次单检索生成的文件
+.\rag\.venv\Scripts\python.exe .\rag\evaluations\evaluate_generation.py --evidence .\rag\data\evaluations\bank-rag\retrieval\11-05-18-50.json --limit 50
+```
+### 离线构建
+结构化解析: 带层级关系的 Structured Document JSON: 保留来源, 名称, 格式, 标题层级、段落、表格、图片、页码和顺序。
+→
+清洗：去除确认重复的页眉页脚和多余空白，保留数字、日期、否定词及表格关系。
+→
+切块：先按标题、章节和段落切分；超过上限时再拆分500/50，并保留少量重叠。每个 Chunk 保留标题路径、页码和原文。
+→
+Embedding 
+→ 
+Milvus向量和BM25索引
+
+### 在线检索
+
+最多 6 个子查询 × RRF Top10  最多 60 条命中 → 去重选 20 个重排 → 聚合取 Top5 父文件。
+
+### 回退降级
+
+LLM的APIConnectionError
+比如 指数退避策略 重试3-5次
+比如 查询转换全部失败或为空时使用原问题
+比如 使用规则进行降级
+
+
+
+
 # 项目运行
 
 需要 Python 3.12+、uv 和 Node.js。首次运行需配置 `backend/.env`，然后启动：

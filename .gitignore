@@ -23,7 +23,9 @@ __pycache__/
 
 # 后端数据与测试目录
 backend/data/
-/rag/data/
+rag/data/
+rag/evaluations/result/analysis/
+rag/evaluations/result/report/
 backend/tests/.tmp-data/
 
 # 前端产物

@@ -43,9 +43,9 @@
     {
       "id": "Backend-03",
       "name": "后台 RAG 知识库",
-      "description": "Worker 经 MCP 管理和检索独立知识库。",
+      "description": "Worker 经 MCP 管理知识库，子块检索并回填完整父文档。",
       "status": "in_progress",
-      "evidence": "真实模型和隔离 Milvus 经 Bot 完成导入、问答、更新、移出；Worker 更新时曾误试移出并被权限拦截，仍需减少多余调用。"
+      "evidence": "断连重试通过隔离 RAG 全量 151 项；提示词回退专项 29 项通过。v2 真实 50 题目标文档 Recall@5=1，固定证据正确性 0.7555、忠实度 0.9360；存在材料及优先条件遗漏，Anthropic 参数兼容待修复。"
     },
     {
       "id": "Frontend-03",
@@ -59,21 +59,35 @@
       "name": "大文档真实入库性能",
       "description": "验证 100 MiB 文档的实际入库耗时与稳定性。",
       "status": "in_progress",
-      "evidence": "尚未用真实模型与云端处理 100 MiB 文档；上传大小边界已验证。"
+      "evidence": "上传大小边界已验证；100 份基准 PDF 共 265 页，574 个追踪块与离线重切一致。尚未实测上传/入库吞吐及真实 100 MiB 文档处理。"
     },
     {
       "id": "Backend-05",
       "name": "RAG 独立查询策略节点",
-      "description": "按需并行改写、拆分和扩展查询，汇合后检索。",
+      "description": "按需并行改写、拆分和扩展；转换无结果时使用原问题检索。",
       "status": "passing",
-      "evidence": "RAG 15 项、后端关联 11 项通过；固定选择三种策略，以真实模型和隔离 Milvus 完成问答与来源验证。"
+      "evidence": "原问题兜底和补检去重通过隔离空库 RAG 全量 136 项；真实模型和隔离 Milvus 曾完成问答，真实断链未复测。"
+    },
+    {
+      "id": "Evaluation-01",
+      "name": "RAG 独立检索与固定证据生成评测",
+      "description": "独立评估检索和固定父文档证据下的生成，题集由参数指定，生成及评分温度固定为 0，按开关上传追踪。",
+      "status": "passing",
+      "evidence": "正文评分专项 77 项、裁判重试所在全量 151 项及题集专项 9 项曾通过。已复核含 BF-012/033 修订的 v2 真实 50 题：生成与评分均有效；三批汇总及输入哈希一致，异常扣分仍缺判词。"
     },
     {
       "id": "Backend-06",
       "name": "OpenAI 模型接入",
-      "description": "主助手、后台助手及 RAG 使用 OpenAI Chat Completions。",
+      "description": "主助手、后台助手及 RAG 使用 OpenAI Chat Completions，温度固定为 0。",
       "status": "passing",
-      "evidence": "真实 gpt-6-luna 通过聊天 HTTP、工具调用、双后台助手、重启回放及 MCP RAG；检索和 Embedding 为合成替身。"
+      "evidence": "真实 gpt-6-luna 曾通过聊天、工具、双后台助手、重启回放及 MCP RAG（检索与 Embedding 为替身）；温度 0 通过隔离后端 26 项及 RAG/评测专项 80 项。"
+    },
+    {
+      "id": "Backend-07",
+      "name": "RAG 离线结构化解析与切块",
+      "description": "结构化解析、保守清洗及 500/50 字符结构切块。",
+      "status": "in_progress",
+      "evidence": "隔离全量 119 项及重建失败专项 1 项曾通过；真实新索引导入 100 份 PDF、1,277 块。v2 50 题文档 Recall@5=1、NDCG@5=0.8778；不代表条款完整或复杂题效果。"
     }
   ]
 }

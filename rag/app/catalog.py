@@ -47,6 +47,11 @@ class Catalog:
             row = db.execute("SELECT * FROM documents WHERE id = ?", (document_id,)).fetchone()
             return dict(row) if row else None
 
+    def get_by_path(self, path: str) -> dict | None:
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM documents WHERE path = ?", (path,)).fetchone()
+            return dict(row) if row else None
+
     def versions(self) -> list[str]:
         with self.connect() as db:
             return [row["version"] for row in db.execute("SELECT version FROM documents WHERE status = 'ready'")]

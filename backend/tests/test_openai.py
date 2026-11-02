@@ -94,6 +94,7 @@ def test_openai_stream_aggregates_and_validates_before_emitting():
 
     events = asyncio.run(run())
     request = captured[0]
+    assert request["temperature"] == 0
     assert request["reasoning_effort"] == "none" and request["store"] is False
     assert request["tool_choice"] == {"type": "function", "function": {"name": "read_file"}}
     assert request["tools"][0]["function"]["strict"] is False
@@ -212,6 +213,8 @@ def test_rag_process_receives_selected_provider(tmp_path, monkeypatch, provider,
     monkeypatch.setattr(settings, f"{provider}_api_key", "test-key")
     monkeypatch.setattr(settings, f"{provider}_base_url", "http://test.invalid/v1")
     monkeypatch.setattr(settings, "model_id", "model-test")
+    monkeypatch.setenv("RAG_REASONING_EFFORT", "high")
+    monkeypatch.setenv("RAG_TEMPERATURE", "none")
     captured = []
 
     @asynccontextmanager
@@ -246,6 +249,8 @@ def test_rag_process_receives_selected_provider(tmp_path, monkeypatch, provider,
     assert captured[0][f"{prefix}_API_KEY"] == "test-key"
     assert captured[0][f"{prefix}_BASE_URL"] == "http://test.invalid/v1"
     assert captured[0]["MODEL_ID"] == "model-test"
+    assert captured[0]["RAG_REASONING_EFFORT"] == "high"
+    assert captured[0]["RAG_TEMPERATURE"] == "none"
 
 
 def test_main_direct_action_with_mock_openai(tmp_path, monkeypatch):

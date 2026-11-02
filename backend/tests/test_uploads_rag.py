@@ -265,7 +265,7 @@ def test_simple_rag_answer_is_delivered_without_main_model(isolated):
             store.put(session, "execution:rag", {"type": "tool_execution", "id": "rag", "task_id": task["id"],
                       "context_id": task["context_id"], "run_id": "run-one", "name": "rag_search",
                       "status": "completed", "output": json.dumps({"status": "success",
-                      "answer": "事实。参考来源：a.txt"}, ensure_ascii=False)})
+                      "answer": "事实。"}, ensure_ascii=False)})
             session.commit()
         worker = Worker(runtime, task["id"])
         worker.context_id, worker.run_id = task["context_id"], "run-one"
@@ -275,7 +275,7 @@ def test_simple_rag_answer_is_delivered_without_main_model(isolated):
             assert report["kind"] == "rag_answer"
         await runtime._report(report)
         snapshot = await runtime.snapshot()
-        assert snapshot["messages"][-1]["text"] == "事实。参考来源：a.txt"
+        assert snapshot["messages"][-1]["text"] == "事实。"
         with db.new_session() as session:
             assert store.get(session, f"task:{task['id']}")["status"] == "completed"
         await runtime.close()

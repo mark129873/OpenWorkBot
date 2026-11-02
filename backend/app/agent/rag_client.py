@@ -37,7 +37,8 @@ class RagClient:
                 env.update(OPENAI_API_KEY=settings.openai_api_key, OPENAI_BASE_URL=settings.openai_base_url)
             else:
                 env.update(ANTHROPIC_API_KEY=settings.anthropic_api_key, ANTHROPIC_BASE_URL=settings.anthropic_base_url)
-            for key in ("RAG_DATA_DIR", "MILVUS_CLOUD_URI", "MILVUS_CLOUD_TOKEN", "MILVUS_COLLECTION_NAME"):
+            for key in ("RAG_DATA_DIR", "RAG_REASONING_EFFORT", "RAG_TEMPERATURE", "MILVUS_CLOUD_URI",
+                        "MILVUS_CLOUD_TOKEN", "MILVUS_COLLECTION_NAME"):
                 if key in os.environ:
                     env[key] = os.environ[key]
             params = StdioServerParameters(command=str(python), args=["-m", "app.server"],

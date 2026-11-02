@@ -8,6 +8,7 @@ from pymilvus import AnnSearchRequest, DataType, Function, FunctionType, MilvusC
 
 from app.catalog import Catalog
 from app.config import Settings
+from app import rag_parameters as params, tracing
 
 
 class VectorStore:
@@ -51,13 +52,15 @@ class VectorStore:
         schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
         schema.add_field("chunk_id", DataType.VARCHAR, is_primary=True, max_length=64)
         schema.add_field("document_id", DataType.VARCHAR, max_length=64)
-        schema.add_field("content", DataType.VARCHAR, max_length=65535,
+        schema.add_field("content", DataType.VARCHAR, max_length=65535)
+        schema.add_field("search_text", DataType.VARCHAR, max_length=65535,
                          enable_analyzer=True, analyzer_params={"tokenizer": "jieba"})
         schema.add_field("chunk_index", DataType.INT64)
         schema.add_field("filename", DataType.VARCHAR, max_length=512)
+        schema.add_field("metadata", DataType.JSON)
         schema.add_field("dense", DataType.FLOAT_VECTOR, dim=dimension)
         schema.add_field("sparse", DataType.SPARSE_FLOAT_VECTOR)
-        schema.add_function(Function(name="content_bm25", input_field_names=["content"],
+        schema.add_function(Function(name="content_bm25", input_field_names=["search_text"],
                                      output_field_names=["sparse"], function_type=FunctionType.BM25))
         indexes = client.prepare_index_params()
         indexes.add_index(field_name="dense", index_type="AUTOINDEX", metric_type="COSINE")
@@ -74,34 +77,48 @@ class VectorStore:
             return await asyncio.to_thread(self._check)
 
     async def add(self, version: str, filename: str, start: int,
-                  texts: list[str], vectors: list[list[float]]) -> None:
-        if not texts or len(texts) != len(vectors):
+                  chunks: list[dict], vectors: list[list[float]]) -> None:
+        if not chunks or len(chunks) != len(vectors):
             raise ValueError("文档分块与向量数量不匹配")
-        rows = [{"chunk_id": uuid.uuid4().hex, "document_id": version, "content": text,
-                 "chunk_index": start + index, "filename": filename, "dense": vectors[index]}
-                for index, text in enumerate(texts)]
+        rows = [{"chunk_id": uuid.uuid4().hex, "document_id": version,
+                 "content": chunk["content"], "search_text": chunk["search_text"],
+                 "chunk_index": start + index, "filename": filename, "dense": vectors[index],
+                 "metadata": {"heading_path": chunk["heading_path"], "pages": chunk["pages"]}}
+                for index, chunk in enumerate(chunks)]
         async with self.lock:
             await asyncio.to_thread(self._check, dimension=len(vectors[0]))
             await asyncio.to_thread(self.client.insert, self.config.collection, rows)
 
     async def search(self, query: str, vector: list[float], versions: list[str]) -> list[dict]:
-        async with self.lock:
-            exists = await asyncio.to_thread(self._check)
-            if not exists or not versions:
-                return []
-        expression = f"document_id in {json.dumps(versions)}"
-        requests = [
-            AnnSearchRequest(data=[vector], anns_field="dense", param={"metric_type": "COSINE"},
-                             limit=30, filter=expression),
-            AnnSearchRequest(data=[query], anns_field="sparse", param={"metric_type": "BM25"},
-                             limit=30, filter=expression),
-        ]
-        results = await asyncio.to_thread(self.client.hybrid_search, self.config.collection,
-                                          reqs=requests, ranker=RRFRanker(60), limit=30,
-                                          output_fields=["document_id", "content", "filename", "chunk_index"],
-                                          consistency_level="Strong")
-        return [{"id": str(hit["chunk_id"]), **hit.get("entity", {}), "score": float(hit["distance"])}
-                for hit in results[0]]
+        with tracing.observation("milvus_hybrid_search", as_type="retriever", input={"query": query},
+                                 metadata={"collection": self.config.collection, "dense_limit": params.DENSE_TOP_K,
+                                           "bm25_limit": params.BM25_TOP_K, "rrf_k": params.RRF_K,
+                                           "limit": params.FUSED_TOP_K}) as span:
+            async with self.lock:
+                exists = await asyncio.to_thread(self._check)
+                if not exists or not versions:
+                    tracing.update(span, output=[])
+                    return []
+            expression = f"document_id in {json.dumps(versions)}"
+            requests = [
+                AnnSearchRequest(data=[vector], anns_field="dense", param={"metric_type": "COSINE"},
+                                 limit=params.DENSE_TOP_K, filter=expression),
+                AnnSearchRequest(data=[query], anns_field="sparse", param={"metric_type": "BM25"},
+                                 limit=params.BM25_TOP_K, filter=expression),
+            ]
+            results = await asyncio.to_thread(self.client.hybrid_search, self.config.collection,
+                                              reqs=requests, ranker=RRFRanker(params.RRF_K), limit=params.FUSED_TOP_K,
+                                              output_fields=["document_id", "content", "search_text", "filename",
+                                                             "chunk_index", "metadata"],
+                                              consistency_level="Strong")
+            hits = []
+            for hit in results[0]:
+                entity = dict(hit.get("entity", {}))
+                metadata = entity.pop("metadata", {})
+                hits.append({"id": str(hit["chunk_id"]), **entity, **metadata,
+                             "score": float(hit["distance"])})
+            tracing.update(span, output=hits)
+            return hits
 
     async def delete(self, version: str) -> None:
         async with self.lock:
