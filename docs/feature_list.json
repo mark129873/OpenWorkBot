@@ -71,9 +71,9 @@
     {
       "id": "Backend-06",
       "name": "OpenAI 模型接入",
-      "description": "支持项目使用 OpenAI API。",
-      "status": "in_progress",
-      "evidence": "模拟接口与空库下后端 134 项、RAG 19 项通过；真实 gpt-6-luna 调用待用户配置。"
+      "description": "主助手、后台助手及 RAG 使用 OpenAI Chat Completions。",
+      "status": "passing",
+      "evidence": "真实 gpt-6-luna 通过聊天 HTTP、工具调用、双后台助手、重启回放及 MCP RAG；检索和 Embedding 为合成替身。"
     }
   ]
 }
