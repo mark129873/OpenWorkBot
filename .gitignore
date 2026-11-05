@@ -26,6 +26,7 @@ backend/data/
 rag/data/
 rag/evaluations/result/analysis/
 rag/evaluations/result/report/
+rag/evaluations/origin_benchmark/
 backend/tests/.tmp-data/
 
 # 前端产物

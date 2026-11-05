@@ -4,37 +4,47 @@
 
 ## 通过 MCP 接入 LangGraph RAG 知识库
 
-RAG 作为独立 MCP 服务，供 Harness Agent 操作知识库，由 LangGraph 固定 Workflow 规划重写查询、多查询、扩展查询、子问题拆分，再通过 Milvus 进行向量和 BM25 混合检索、本地重排与证据评估；必要时补检，最终生成带文件来源的回答。
+RAG 作为独立 MCP 服务，由后台 Worker 调用。LangGraph 按问题规划查询，通过 Milvus 稠密向量和 BM25 混合检索、本地重排及证据评估生成回答；证据不足时并通过 Grounding 反馈加入了 Reflection/自我纠错进行补检。
 
 ![LangGraph RAG 检索流程](./readme_docs/rag_langgraph.png)
 
 ### 离线构建
-结构化解析: 带层级关系的 Structured Document JSON: 保留来源, 名称, 格式, 标题层级、段落、表格、图片、页码和顺序。
-→
-清洗：去除确认重复的页眉页脚和多余空白，保留数字、日期、否定词及表格关系。
-→
-切块：先按标题、章节和段落切分；超过上限时再拆分500/50，并保留少量重叠。每个 Chunk 保留标题路径、页码和原文。
-→
-Embedding 
-→ 
-Milvus向量和BM25索引
+
+1. **结构化解析**：提取 带层级关系的 Structured Document JSON: 保留来源,名称,格式,标题层级、段落、表格、页码和顺序。
+2. **清洗**：去除重复的页眉页脚和多余空白，保留数字、日期、否定词及表格关系。
+3. **切块**：先按标题、章节和段落切分；超过上限时再拆分500/50重叠。每个 Chunk 保留标题层级关系。
+4. **建立索引**：标题与正文参与 Embedding，写入 Milvus 稠密向量和 BM25 索引。
 
 ### 在线检索
-
-最多 6 个子查询 × RRF Top10  最多 60 条命中 → 去重选 20 个重排 → 聚合取 Top5 父文件。
+```
+问题 → 检索规划 → 按需并行生成查询
+     → 向量检索 + BM25 → RRF 融合 → 子块重排
+     → 回填父文档 → 判断证据 → 生成回答
+                           └─ 不足时最多补检一轮
+```
+1. 根据问题重写, 多查询, 查询扩展, 问题拆分等RAG增强策略, 每轮最多 6 个子查询；
+2. 稠稠密检索和 BM25 各取 20 条，经 RRF 融合后每个查询保留 10 条；
+3. 共 60 条合并去重后Top 20 条重排，聚合取 Top5 父Chunk供证据评估和回答。
 
 ### 回退降级
 
-LLM的APIConnectionError
-比如 指数退避策略 重试3-5次
-比如 查询转换全部失败或为空时使用原问题
-比如 使用规则进行降级
+比如LLM的APIConnectionError
 
+1. 指数退避策略 重试3-5次
+2. 查询转换全部失败或为空时使用原问题
+3. 使用规则进行降级
 
 ### RAG 测评结果
 
+| 指标                 |              基线结果 |  作用 |
+| ------------------ | ----------------: | --- |
+| 文档 Recall\@10      |             0.880 --→ 1.00 | 找全了没|
+| 文档 NDCG\@10        |             0.776 --→ 0.886 |排序好不好|
+| Faithfulness       |             0.710 --→ 0.970 |有没有编造|
+| Answer Correctness |             0.473 --→ 0.802 |回答对不对|
+| MCP 平均延迟 / P95     | 28.09 秒 / 35.47 秒 --→ 32.25 秒 / 43.27 秒 | 响应时间 |
 
-
+- 生成为 gpt-6-luna；测评为 gpt-6.1-terra
 
 ### RAG 测评步骤
 ```bash
@@ -48,8 +58,6 @@ cd C:\Users\nnnnnn\Desktop\OpenWorkBot
 # 4.生成评测
 .\rag\.venv\Scripts\python.exe .\rag\evaluations\evaluate_generation.py --evidence .\rag\evaluations\result\retrieval_11-05-18-50.json --limit 50
 ```
-
-
 
 # 项目运行
 
