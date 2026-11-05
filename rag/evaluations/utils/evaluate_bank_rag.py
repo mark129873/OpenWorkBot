@@ -254,7 +254,7 @@ async def main(run_path: Path | None = None) -> Path:
         raise SystemExit("请在 rag/.env 中配置 OpenAI、Embedding 和 EVAL_MODEL_ID")
     latest = run_path is None
     if latest:
-        paths = list((ROOT / "data" / "evaluations" / "bank-rag" / "runs").glob("*.jsonl"))
+        paths = list((ROOT / "evaluations" / "result" / "runs").glob("*.jsonl"))
         if not paths:
             raise SystemExit("未找到 RAG 批次，请先运行 rag/evaluations/utils/run_bank_rag.py")
         run_path = max(paths, key=lambda path: path.stat().st_mtime_ns)
@@ -263,7 +263,7 @@ async def main(run_path: Path | None = None) -> Path:
     if latest and len(cases) != len(parameters["cases"]):
         raise SystemExit("最新 RAG 批次未完成；如需评测已有题目，请使用 --run 指定批次文件")
     batch_id = run_path.stem if LEGACY_ID.fullmatch(run_id) and TIME_ID.fullmatch(run_path.stem) else run_id
-    output_dir = ROOT / "data" / "evaluations" / "bank-rag"
+    output_dir = ROOT / "evaluations" / "result"
     completed = {case["id"] for case in cases}
     report = {"run_id": run_id, "batch_id": batch_id, "model": cases[0]["model"],
               "parameters": {**parameters, "top_documents": 5, "trace_wait_seconds": 30, "langfuse_enabled": True,

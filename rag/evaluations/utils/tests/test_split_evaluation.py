@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 from contextlib import contextmanager
+from datetime import datetime
 from types import SimpleNamespace
 
 import httpx
@@ -267,7 +268,7 @@ async def test_retrieval_checks_langfuse_before_running(tmp_path, monkeypatch, o
     with pytest.raises(SystemExit, match="Langfuse (连接|认证)失败") as exc:
         await retrieval.main(dataset, 1)
     assert "secret" not in str(exc.value)
-    assert not (tmp_path / "data" / "evaluations").exists()
+    assert not (tmp_path / "evaluations" / "result").exists()
 
 
 @pytest.mark.asyncio
@@ -351,8 +352,17 @@ def test_failed_json_update_preserves_completed_cases(tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("trace_enabled", [False, True])
 async def test_separate_scripts_save_and_replay_fixed_evidence(tmp_path, monkeypatch, request, trace_enabled):
+    class Clock:
+        @staticmethod
+        def now():
+            return datetime(2026, 11, 5, 18, 50)
+
+    monkeypatch.setattr(retrieval, "datetime", Clock)
+    monkeypatch.setattr(generation, "datetime", Clock)
     dataset = tmp_path / "input-cases.jsonl"
-    dataset.write_text(json.dumps(case(), ensure_ascii=False) + "\n", encoding="utf-8")
+    item = case()
+    item.pop("behavior")
+    dataset.write_text(json.dumps(item, ensure_ascii=False) + "\n", encoding="utf-8")
     data_dir = tmp_path / "isolated"
     data_dir.mkdir()
     (data_dir / "catalog.sqlite3").touch()
@@ -387,6 +397,12 @@ async def test_separate_scripts_save_and_replay_fixed_evidence(tmp_path, monkeyp
     input_path = await retrieval.main(dataset, 1)
     snapshot = input_path.read_bytes()
     retrieval_summary = json.loads(snapshot)
+    assert input_path == tmp_path / "evaluations" / "result" / "retrieval_11-05-18-50.json"
+    assert retrieval_summary["run_id"] == "11-05-18-50"
+    second_input = await retrieval.main(dataset, 1)
+    assert second_input.name == "retrieval_11-05-18-50-02.json"
+    assert input_path.read_bytes() == snapshot
+    assert json.loads(second_input.read_bytes())["run_id"] == "11-05-18-50-02"
     assert retrieval_summary["dataset"] == dataset.name
     assert retrieval_summary["summary"]["scores"]["recall_at_5"]["mean"] == 1
     assert retrieval_summary["langfuse_enabled"] is trace_enabled
@@ -421,6 +437,8 @@ async def test_separate_scripts_save_and_replay_fixed_evidence(tmp_path, monkeyp
     monkeypatch.setenv("EVAL_TEMPERATURE", "none")
     output_path = await generation.main(input_path, 1)
     summary = json.loads(output_path.read_text(encoding="utf-8"))
+    assert output_path == tmp_path / "evaluations" / "result" / "generation_11-05-18-50.json"
+    assert summary["run_id"] == "11-05-18-50"
     assert summary["answer_format"] == "citation_free_v1"
     assert summary["temperature"] is None and summary["judge_temperature"] is None
     assert summary["rag_reasoning_effort"] == "high" and summary["judge_reasoning_effort"] == "medium"
@@ -428,6 +446,7 @@ async def test_separate_scripts_save_and_replay_fixed_evidence(tmp_path, monkeyp
     result = summary["cases"][0]
     assert input_path.read_bytes() == snapshot
     assert result["status"] == "success" and result["evidence"][0]["content"] == "原文依据"
+    assert result["expected_behavior"] == ""
     assert "部分查询失败" in result["answer"]
     assert summary["summary"]["scores"]["faithfulness"]["scored"] == 1
     assert summary["evidence_sha256"] == hashlib.sha256(snapshot).hexdigest()
@@ -436,6 +455,9 @@ async def test_separate_scripts_save_and_replay_fixed_evidence(tmp_path, monkeyp
                                         "evidence": [{"filename": "资料.pdf", "content": "原文"}]}],
                                       ensure_ascii=False), encoding="utf-8")
     manual_output = await generation.main(manual_path, 1)
+    assert manual_output.name == "generation_11-05-18-50-02.json"
+    assert json.loads(output_path.read_text(encoding="utf-8")) == summary
+    assert json.loads(manual_output.read_text(encoding="utf-8"))["run_id"] == "11-05-18-50-02"
     assert json.loads(manual_output.read_text(encoding="utf-8"))["cases"][0]["status"] == "success"
 
 

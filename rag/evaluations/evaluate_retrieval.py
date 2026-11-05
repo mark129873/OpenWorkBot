@@ -112,8 +112,9 @@ async def main(dataset: Path, limit: int = 1) -> Path:
         if not valid:
             raise SystemExit("Langfuse 认证失败")
     graph = build_graph(knowledge)
-    directory = ROOT / "data" / "evaluations" / "bank-rag" / "retrieval"
-    run_id, path, output = create_output(directory, datetime.now().strftime("%m-%d-%H-%M"), ".json")
+    directory = ROOT / "evaluations" / "result"
+    run_id, path, output = create_output(directory, datetime.now().strftime("retrieval_%m-%d-%H-%M"), ".json")
+    run_id = run_id.removeprefix("retrieval_")
     metadata = {"run_id": run_id, "langfuse_enabled": tracing.enabled(), "dataset": dataset.name,
                 "temperature": config.temperature,
                 "dataset_sha256": hashlib.sha256(dataset.read_bytes()).hexdigest(),

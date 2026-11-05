@@ -168,9 +168,9 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 - 银行基准评测按最终前 5 份父文档统计文档 Recall@5 / NDCG@5，并计算回答质量和 MCP 延迟；保留有效数及失败耗时。Langfuse 保留追踪及证据读取；评测分数仅保存本地，不调用其评分接口。文档命中不代表条款覆盖。
 - 独立检索评测直接复用 RAG 检索图，在回答前停止；按 `LANGFUSE_ENABLED` 上传逐题追踪和完整候选，本地保留题目、最终证据、警告、参数、耗时、指标和追踪标识，供独立生成评测使用。开启时先验证 Langfuse 配置与连接，运行中检测到的上传异常单独记录；关闭追踪或上传失败时不保留过程和完整候选。按目标文件编号计分，不代表条款覆盖；失败题单独记录。
 - 独立生成和端到端评测使用去掉已知纯引用的正文作为展示和两项评分的唯一回答；旧追踪先核对原答案再清理，保留必要事实和警告，评测结果不另存原始回答。既有模型及历史追踪仍按原策略保留。生成评测从 JSON 读取固定问题、参考答案和原文证据，不依赖端到端脚本、Milvus、重排或 Langfuse；评分需要 Embedding 服务。新口径与旧分数需区分，固定评判模型和评分 Embedding 后才能比较。
-- 两种评测的配置、证据、逐题结果和汇总分别保存于 `rag/data/evaluations/bank-rag/retrieval/` 和 `generation/` 的 JSON，逐题原子更新；默认不入 Git。银行评测报告写入 `rag/data/evaluations/bank-rag/report/`；证据可能包含资料正文，分享前检查敏感信息。
-- 端到端生成和独立检索通过 `--dataset` 指定题集，当前选用原始题库前 50 题的 `bank-rag-v2-50.jsonl`；独立生成使用传入的固定证据，旧 v1 结果保留。
-- `rag/evaluations/` 保留四个命令：`utils/run_bank_rag.py`、`utils/evaluate_bank_rag.py`、`evaluate_retrieval.py`、`evaluate_generation.py`。前者及独立检索指定 `--dataset .\rag\benchmarks\bank-rag-v2-50.jsonl --limit 50`；端到端评分默认使用最新批次，可用 `--run` 指定旧批次；独立生成指定 `--evidence <检索结果.json> --limit 50`。路径相对当前目录，默认只运行 1 题。
+- 独立检索和生成结果分别保存为 `rag/evaluations/result/retrieval_<月日时分>.json` 和 `generation_<月日时分>.json`；端到端批次保存在 `result/runs/`，评分结果保存在 `result/`。JSON 结果逐题原子更新；银行评测报告和建议分别写入 `result/report/` 和 `result/analysis/`。结果可能包含资料正文，提交或分享前检查敏感信息。
+- 端到端生成和独立检索通过 `--dataset` 指定题集，当前选用原始题库前 50 题的 `bank-rag-v2-50.jsonl`；题目未提供 `behavior` 时记为空字符串。独立生成使用传入的固定证据，旧 v1 结果保留。
+- `rag/evaluations/` 保留四个命令：`utils/run_bank_rag.py`、`utils/evaluate_bank_rag.py`、`evaluate_retrieval.py`、`evaluate_generation.py`。前者及独立检索指定 `--dataset .\rag\evaluations\benchmarks\bank-rag-v2-50.jsonl --limit 50`；端到端评分默认使用新目录中的最新批次，可用 `--run` 指定其他批次；独立生成指定 `--evidence <检索结果.json> --limit 50`。路径相对当前目录，默认只运行 1 题。
 - 人工证据 JSON 可为题目数组或含 `cases` 数组的对象；每题至少包含 `id`、`question`、`reference`、`evidence`。`evidence` 为含 `filename` 和 `content` 的数组，允许空数组表示无证据。生成时只把问题和证据交给 RAG，参考答案仅供评分。
 
 ## 12. OpenAI 模型接入

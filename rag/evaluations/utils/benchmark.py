@@ -51,13 +51,14 @@ def load_benchmark(path: Path, limit: int | None = 1) -> list[dict]:
                     or any(not isinstance(case.get(key), str) or not case[key].strip()
                            for key in ("id", "question", "reference"))
                     or case["id"] != case["id"].strip()
-                    or not isinstance(case.get("behavior"), str)
+                    or not isinstance(case.get("behavior", ""), str)
                     or not isinstance(case.get("targets"), list) or not case["targets"]
                     or any(not isinstance(name, str) or document_number(name) is None for name in case["targets"])):
                 raise ValueError(f"评测数据第 {line_number} 行内容无效")
             if case["id"] in seen:
                 raise ValueError(f"评测数据第 {line_number} 行编号重复")
             seen.add(case["id"])
+            case.setdefault("behavior", "")
             cases.append(case)
     if not cases:
         raise ValueError("评测数据为空")

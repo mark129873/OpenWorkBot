@@ -45,7 +45,7 @@ async def main(dataset: Path, limit: int = 1) -> Path:
             or not config.embedding_model or not config.rerank_model or not config.milvus_uri or not config.milvus_token):
         raise SystemExit("请在 rag/.env 中配置 OpenAI、Milvus、Embedding 和重排模型")
     cases = load_benchmark(dataset, limit)
-    output_dir = ROOT / "data" / "evaluations" / "bank-rag"
+    output_dir = ROOT / "evaluations" / "result"
     parameters = {"dataset": dataset.name, "cases": [case["id"] for case in cases], "temperature": config.temperature,
                   "rag_reasoning_effort": config.reasoning_effort,
                   "embedding_model": Path(config.embedding_model).name,

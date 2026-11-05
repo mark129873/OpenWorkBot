@@ -23,7 +23,7 @@ from evaluations.utils.benchmark import create_output
 def test_evaluation_entry_roots_remain_the_rag_directory():
     root = Path(__file__).resolve().parents[3]
     assert all(module.ROOT == root for module in (evaluate_generation, evaluate_retrieval, evaluation, runner, upload))
-    assert (root / "benchmarks" / "bank-rag-v2-50.jsonl").is_file()
+    assert (root / "evaluations" / "benchmarks" / "bank-rag-v2-50.jsonl").is_file()
 
 
 @pytest.mark.parametrize("script", ["evaluate_retrieval.py", "evaluate_generation.py",
@@ -58,7 +58,7 @@ def test_load_jsonl_selects_requested_number_of_cases(tmp_path):
         evaluation.load_benchmark(path, 0)
 
 
-@pytest.mark.parametrize("problem", ["empty", "json", "duplicate", "target", "id", "id_whitespace"])
+@pytest.mark.parametrize("problem", ["empty", "json", "duplicate", "target", "behavior", "id", "id_whitespace"])
 def test_load_jsonl_rejects_invalid_records(tmp_path, problem):
     path = tmp_path / "cases.jsonl"
     item = case()
@@ -69,6 +69,8 @@ def test_load_jsonl_rejects_invalid_records(tmp_path, problem):
     else:
         if problem == "target":
             item["targets"] = ["invalid.pdf"]
+        if problem == "behavior":
+            item["behavior"] = None
         if problem == "id":
             item["id"] = ""
         if problem == "id_whitespace":
@@ -81,24 +83,20 @@ def test_load_jsonl_rejects_invalid_records(tmp_path, problem):
         evaluation.load_benchmark(path, 50)
 
 
-def test_v1_dataset_contains_50_unique_original_ids():
-    path = evaluation.ROOT / "benchmarks" / "bank-rag-v1-50.jsonl"
-    cases = evaluation.load_benchmark(path, 50)
-    assert len(cases) == len({item["id"] for item in cases}) == 50
-    assert cases[0]["id"] == "BF-001"
-    assert all(item["source"] == "Bank RAG Benchmark" and item["license"] == "CC BY 4.0" for item in cases)
-    assert {prefix: sum(item["id"].startswith(prefix + "-") for item in cases)
-            for prefix in ("BF", "MH", "SIM", "VER", "LR")} == {
-                "BF": 10, "MH": 10, "SIM": 10, "VER": 10, "LR": 10}
+def test_load_jsonl_allows_missing_behavior(tmp_path):
+    path = tmp_path / "cases.jsonl"
+    item = case()
+    item.pop("behavior")
+    path.write_text(json.dumps(item, ensure_ascii=False) + "\n", encoding="utf-8")
+    assert evaluation.load_benchmark(path) == [{**item, "behavior": ""}]
 
 
 def test_v2_dataset_contains_first_50_original_cases():
-    path = evaluation.ROOT / "benchmarks" / "bank-rag-v2-50.jsonl"
+    path = evaluation.ROOT / "evaluations" / "benchmarks" / "bank-rag-v2-50.jsonl"
     cases = evaluation.load_benchmark(path, None)
     assert [item["id"] for item in cases] == [f"BF-{index:03}" for index in range(1, 51)]
     assert all(item["source"] == "Bank RAG Benchmark" and item["license"] == "CC BY 4.0"
-               and item["category"] == "基础事实" and item["difficulty"] == "简单"
-               and item["behavior"] == "直接回答" for item in cases)
+               and item["behavior"] == "" for item in cases)
     assert [[name[:3] for name in cases[index]["targets"]] for index in (22, 23)] == [["A10", "A23"], ["A11", "A12"]]
 
 
@@ -433,6 +431,7 @@ async def test_run_then_score_the_same_cases_without_uploads(tmp_path, monkeypat
 
     run_path = await runner.main(dataset, limit)
     records = [json.loads(line) for line in run_path.read_text(encoding="utf-8").splitlines()]
+    assert run_path.parent == tmp_path / "evaluations" / "result" / "runs"
     assert re.fullmatch(r"\d{2}-\d{2}-\d{2}-\d{2}", run_path.stem)
     assert records[0]["run_id"] == run_path.stem
     assert records[0]["parameters"]["temperature"] == 0.5
@@ -443,6 +442,7 @@ async def test_run_then_score_the_same_cases_without_uploads(tmp_path, monkeypat
 
     report_path = await evaluation.main()
     report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report_path.parent == tmp_path / "evaluations" / "result"
     assert report_path.stem == run_path.stem == report["batch_id"] == report["evaluation_id"]
     assert report["model"] == "gpt-6-luna"
     assert report["parameters"]["judge_model"] == "gpt-6.1-terra"
@@ -578,7 +578,7 @@ async def test_runner_keeps_completed_case_if_trace_flush_fails(tmp_path, monkey
     monkeypatch.setattr(runner, "ClientSession", Session)
     with pytest.raises(RuntimeError):
         await runner.main(tmp_path / "input-cases.jsonl")
-    run_path = next((tmp_path / "data" / "evaluations" / "bank-rag" / "runs").glob("*.jsonl"))
+    run_path = next((tmp_path / "evaluations" / "result" / "runs").glob("*.jsonl"))
     assert evaluation.load_run(run_path)[0]["id"] == "BF-001"
 
 

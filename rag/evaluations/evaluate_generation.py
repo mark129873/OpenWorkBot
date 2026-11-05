@@ -122,8 +122,9 @@ async def main(evidence_path: Path, limit: int = 1) -> Path:
             or not config.embedding_model or not judge_model or not judge_key):
         raise SystemExit("请在 rag/.env 中配置生成模型、评分 Embedding、OPENAI_API_KEY 和 EVAL_MODEL_ID")
     models = Models(config)
-    directory = ROOT / "data" / "evaluations" / "bank-rag" / "generation"
-    run_id, path, output = create_output(directory, datetime.now().strftime("%m-%d-%H-%M"), ".json")
+    directory = ROOT / "evaluations" / "result"
+    run_id, path, output = create_output(directory, datetime.now().strftime("generation_%m-%d-%H-%M"), ".json")
+    run_id = run_id.removeprefix("generation_")
     metadata = {"run_id": run_id, "evidence_file": evidence_path.name,
                 "evidence_sha256": hashlib.sha256(raw).hexdigest(), "model": config.model,
                 "case_ids": [case["id"] for case in cases], "ragas_version": version("ragas"),

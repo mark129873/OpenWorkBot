@@ -46,6 +46,6 @@ OpenWorkBot, 目标打造类OpenAI Dots 的自主智能员工, 面向个人与�
 - README.md 暂不修改
 
 ## RAG评测相关规定
-- rag\benchmarks\bank-rag-v2-50.jsonl 目前选中的50题评测文档
-- RAG评测报告保存至 docs/evaluations/；银行评测报告保存至 rag/data/evaluations/bank-rag/report/。简洁记录基线（现状、架构、模型及参数）、样本与指标（含延迟）、结论、异常和建议；注明来源、有效数、统计口径及限制。
-- rag\data\evaluations\bank-rag\analysis 目录下保存优化建议文件md, 文件名格式为月日时分.md (例如11-03-18-41.md)
+- rag\evaluations\benchmarks\bank-rag-v2-50.jsonl 目前选中的50题评测文档
+- RAG评测报告保存至 docs/evaluations/；银行评测报告保存至 rag/evaluations/result/report/。简洁记录基线（现状、架构、模型及参数）、样本与指标（含延迟）、结论、异常和建议；注明来源、有效数、统计口径及限制。
+- rag\evaluations\result\analysis 目录下保存优化建议文件md, 文件名格式为月日时分.md (例如11-03-18-41.md)
