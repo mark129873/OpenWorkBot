@@ -8,25 +8,6 @@ RAG 作为独立 MCP 服务，供 Harness Agent 操作知识库，由 LangGraph 
 
 ![LangGraph RAG 检索流程](./readme_docs/rag_langgraph.png)
 
-
-
-### RAG 测评步骤
-```bash
-# 1.启动模型
-cd C:\Users\nnnnnn\Desktop\OpenWorkBot
-.\rag\.venv\Scripts\python.exe .\rag\run_models.py
-# 2.上传知识库
-.\rag\.venv\Scripts\python.exe .\rag\evaluations\utils\upload_bank_rag.py
-# 3.端到端生成
-.\rag\.venv\Scripts\python.exe .\rag\evaluations\utils\run_bank_rag.py --dataset .\rag\benchmarks\bank-rag-v2-50.jsonl --limit 50
-# 4.端到端评测
-.\rag\.venv\Scripts\python.exe .\rag\evaluations\utils\evaluate_bank_rag.py
-
-# 单检索评测
-.\rag\.venv\Scripts\python.exe .\rag\evaluations\evaluate_retrieval.py --dataset .\rag\benchmarks\bank-rag-v2-50.jsonl --limit 50
-# 单生成评测：将文件名替换为本次单检索生成的文件
-.\rag\.venv\Scripts\python.exe .\rag\evaluations\evaluate_generation.py --evidence .\rag\data\evaluations\bank-rag\retrieval\11-05-18-50.json --limit 50
-```
 ### 离线构建
 结构化解析: 带层级关系的 Structured Document JSON: 保留来源, 名称, 格式, 标题层级、段落、表格、图片、页码和顺序。
 →
@@ -49,6 +30,24 @@ LLM的APIConnectionError
 比如 查询转换全部失败或为空时使用原问题
 比如 使用规则进行降级
 
+
+### RAG 测评结果
+
+
+
+
+### RAG 测评步骤
+```bash
+# 1.启动模型
+cd C:\Users\nnnnnn\Desktop\OpenWorkBot
+.\rag\.venv\Scripts\python.exe .\rag\run_models.py
+# 2.上传知识库
+.\rag\.venv\Scripts\python.exe .\rag\evaluations\utils\upload_bank_rag.py
+# 3.检索评测
+.\rag\.venv\Scripts\python.exe .\rag\evaluations\evaluate_retrieval.py --dataset .\rag\evaluations\benchmarks\bank-rag-v2-50.jsonl --limit 50
+# 4.生成评测
+.\rag\.venv\Scripts\python.exe .\rag\evaluations\evaluate_generation.py --evidence .\rag\evaluations\result\retrieval_11-05-18-50.json --limit 50
+```
 
 
 
