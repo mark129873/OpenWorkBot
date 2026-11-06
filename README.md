@@ -1,12 +1,24 @@
 # OpenWorkBot
 
-打造类 OpenAI Dots 的自主智能员工，面向个人与企业提供主动执行、多智能体协同、长期记忆与工作流自动化，构建可自主规划、调用工具、根据反馈调整执行的 Agent 协作系统。
+<br />
+
+**项目介绍**
+
+OpenWorkBot 旨在打造类 OpenAI Dots 的自主智能员工,面向个人与企业提供主动执行、多智能体协同、长期记忆与工作流自动化能力,构建可自主规划、调用工具、根据反馈调整执行的 Agent 协作系统。
+
+**系统架构**
+
+项目采用主Agent与后台 SubAgent Worker协作的架构：
+- 主助手负责与用户交互、理解意图、协调以及简单任务。
+- SubAgent Worker 负责执行复杂或耗时的工作，并将进度和结果反馈给主助手。
+
+将对话从一问一答的半双工模式转变为全双工模式
+![全双工模式](./readme_docs/subagentWorker.png)
+
 
 ## 通过 MCP 接入 LangGraph RAG 知识库
 
 RAG 作为独立 MCP 服务，由后台 Worker 调用。LangGraph 按问题规划查询，通过 Milvus 稠密向量和 BM25 混合检索、本地重排及证据评估生成回答；证据不足时并通过 Grounding 反馈加入了 Reflection/自我纠错进行补检。
-
-![LangGraph RAG 检索流程](./readme_docs/rag_langgraph.png)
 
 ### 离线构建
 
@@ -17,12 +29,7 @@ RAG 作为独立 MCP 服务，由后台 Worker 调用。LangGraph 按问题规�
 
 ### 在线检索
 
-```
-问题 → 检索规划 → 按需并行生成查询
-     → 向量检索 + BM25 → RRF 融合 → 子块重排
-     → 回填父文档 → 判断证据 → 生成回答
-                           └─ 不足时最多补检一轮
-```
+![LangGraph RAG 检索流程](./readme_docs/rag_langgraph.png)
 
 1. 根据问题重写, 多查询, 查询扩展, 问题拆分等RAG增强策略, 每轮最多 6 个子查询；
 2. 稠稠密检索和 BM25 各取 20 条，经 RRF 融合后每个查询保留 10 条；
@@ -78,7 +85,7 @@ cd C:\Users\nnnnnn\Desktop\OpenWorkBot
 | 6. Subagents       | 独立历史、最多30步、串行、防递归；当前7个同步工具，权限同父级，结果回填父轮                                                                      | `subtask(prompt)` 用全新 `messages` 跑 30 轮独立循环，最终文本作 `tool_result` 返回父级；同一响应里的多个 `subtask` 严格串行 | [agent/subtask.py](./backend/app/agent/subtask.py)                                                                                                |
 | 7. Context Compact | turn开始执行microcompact → LLM摘要；阈值与恢复边界见§3                                                                      | <br />                                                                                       | [agent/compact.py](./backend/app/agent/compact.py)                                                                                                |
 | 8. Skill           | 启动扫描 `skills/*/SKILL.md`，system prompt 只放“名称 + 描述”目录，`load_skill` 按需取全文                                      | frontmatter 只取 `name / description` 两字段                                                      | [agent/skills.py](./backend/app/agent/skills.py)                                                                                                  |
-| 9. Goal Loop       | `/goal` 后模型每次想停，由无工具的独立判断器裁定；JSON `{ok, reason, impossible}`；未达成注入理由自动续轮，连续 8 次未放行收口交还用户                     | `max_tokens=512`；连续 8 次收口；error 不计数                                                          | <br />                                                                                                                                            |
+| <br />             | <br />                                                                                                       | <br />                                                                                       | <br />                                                                                                                                            |
 
 <br />
 
@@ -179,7 +186,7 @@ usage
 
 触发
 
-- 仅turn开始；历史token > 窗口 − 输出预留 − 安全buffer；默认预留32K + 13K
+- 历史token > 窗口 − 输出预留 − 安全buffer；默认预留32K + 13K
 
 microcompact
 
