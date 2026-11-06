@@ -10,6 +10,8 @@ React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最�
 
 后端使用 Python 3.12、FastAPI、Anthropic 兼容或 OpenAI 客户端、SQLAlchemy、SQLite；前端使用 React、Vite、SSE。Skills、Hooks、todo 和现有 build / edit / yolo 权限继续沿用。根目录 `uv run --no-project start.py` 启动前后端（8100 / 5173）；`/api/health` 不依赖模型配置。当前无登录或多租户，不能直接暴露公网。
 
+Skill 从 `backend/skills/<name>/SKILL.md` 发现：主助手和 Worker 的系统提示词只包含 YAML frontmatter 的 `name / description`；名称须符合规范且与目录一致，无效条目跳过。适用时用 `load_skill` 读取完整说明，引用的文本资源按需分页读取；资源路径不得越出该技能目录。脚本通过现有命令工具及权限执行，加载 Skill 不授予额外权限。
+
 ## 2. 产品交互
 
 - 进入直接显示唯一主聊天，无会话侧栏。沿用左右消息、Markdown、空聊天引导、助手名称、用量和权限模式；移除任务详情、工具过程、复制、重新生成及停止按钮。

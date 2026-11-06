@@ -72,6 +72,61 @@ def isolated(tmp_path, monkeypatch):
     db.dispose_engine()
 
 
+def test_skill_catalog_and_loading_in_main_and_worker(isolated, monkeypatch):
+    from app.agent import skills
+
+    monkeypatch.setattr(skills, "SKILLS_DIR", isolated / "skills")
+    directory = skills.SKILLS_DIR / "review-guide"
+    (directory / "references").mkdir(parents=True)
+    (directory / "SKILL.md").write_text(
+        "---\nname: review-guide\ndescription: 用于代码审查\n---\n说明正文标记", encoding="utf-8")
+    (directory / "references" / "guide.md").write_text("参考资料标记", encoding="utf-8")
+
+    class SkillModel(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.worker_calls = 0
+            self.main_calls = 0
+
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            assert "review-guide" in system and "用于代码审查" in system
+            assert "说明正文标记" not in system and "参考资料标记" not in system
+            if system.startswith("你是后台工作助手"):
+                self.worker_calls += 1
+                history = json.dumps(messages, ensure_ascii=False)
+                if self.worker_calls == 1:
+                    assert "说明正文标记" not in history
+                    yield {"type": "tool_use", "id": "skill", "name": "load_skill",
+                           "input": {"name": "review-guide"}}
+                elif self.worker_calls == 2:
+                    assert "说明正文标记" in history and "参考资料标记" not in history
+                    yield {"type": "tool_use", "id": "reference", "name": "load_skill",
+                           "input": {"name": "review-guide", "path": "references/guide.md"}}
+                else:
+                    assert "参考资料标记" in history
+                    yield {"type": "text_delta", "text": "已完成审查"}
+                yield {"type": "stop_reason", "reason": "end_turn"}
+                return
+            self.main_calls += 1
+            async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
+                yield event
+
+    async def run():
+        model = SkillModel()
+        runtime = Runtime(client=model)
+        await runtime.start()
+        try:
+            await accept(runtime, "skill-test", "任务：审查代码", "build")
+            def completed():
+                with db.new_session() as session:
+                    return any(task["status"] == "completed" for task in store.records(session, "task_state"))
+            await wait_for(completed)
+            assert model.worker_calls == 3 and model.main_calls >= 2
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
 def test_background_chat_and_idempotent_acceptance(isolated):
     async def run():
         model = FakeModel()
@@ -1922,6 +1977,29 @@ class FirstActionModel:
             self.reply_messages = messages
             yield {"type": "text_delta", "text": "已处理结果。"}
         yield {"type": "stop_reason", "reason": "end_turn"}
+
+
+def test_first_action_can_load_skill(isolated, monkeypatch):
+    from app.agent import skills
+
+    monkeypatch.setattr(skills, "SKILLS_DIR", isolated / "skills")
+    directory = skills.SKILLS_DIR / "review-guide"
+    directory.mkdir(parents=True)
+    (directory / "SKILL.md").write_text(
+        "---\nname: review-guide\ndescription: 用于代码审查\n---\n说明正文标记", encoding="utf-8")
+
+    async def run():
+        model = FirstActionModel("load_skill", {"name": "review-guide"})
+        runtime = Runtime(client=model)
+        await runtime.start()
+        try:
+            await accept(runtime, "skill-first", "加载审查技能", "build")
+            await wait_for(lambda: bool(model.reply_messages))
+            assert model.calls == ["first", "reply"]
+            assert "说明正文标记" in json.dumps(model.reply_messages, ensure_ascii=False)
+        finally:
+            await runtime.close()
+    asyncio.run(run())
 
 
 def test_first_action_runs_pwd_in_two_model_calls(isolated, monkeypatch):

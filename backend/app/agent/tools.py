@@ -301,8 +301,10 @@ TOOLS: list[dict] = [
         ["items"],
     ),
     _schema(
-        "load_skill", "加载指定技能的完整说明文档（按需加载，先看目录再取）。",
-        {"name": {"type": "string", "description": "技能目录名"}}, ["name"],
+        "load_skill", "按名称加载完整技能说明；指定相对路径可按需读取技能目录内的文本资源。",
+        {"name": {"type": "string", "description": "技能目录名"},
+         "path": {"type": "string", "description": "可选，技能目录内的相对资源路径"},
+         "offset": {"type": "integer", "minimum": 0, "description": "按资源读取结果提示继续"}}, ["name"],
     ),
     _schema(
         "subtask", "派出子助手独立完成一个目标（有自己的工具循环），返回其最终汇报。",

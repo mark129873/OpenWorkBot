@@ -9,7 +9,7 @@ import time
 from types import SimpleNamespace
 
 from app import db
-from app.agent import agent_bus, compact, hooks, tools
+from app.agent import agent_bus, compact, hooks, skills, tools
 from app.agent.model_call import record_model_step
 from app.agent.rag_client import RAG_NAMES
 from app.agent.runtime import read_output
@@ -97,8 +97,9 @@ class Worker:
             history = await compact.context_history(self.runtime, self.context_id)
             deps = SimpleNamespace(client=self.runtime.client,
                                    recorder=SimpleNamespace(session_id="main", turn_id=self.run_id))
-            with record_model_step(deps, _PROMPT, history, WORKER_TOOLS, subtask_id=self.task_id) as reply:
-                async for event in self.runtime.client.stream(system=_PROMPT, messages=history, tools=WORKER_TOOLS):
+            system_prompt = _PROMPT + skills.skill_prompt()
+            with record_model_step(deps, system_prompt, history, WORKER_TOOLS, subtask_id=self.task_id) as reply:
+                async for event in self.runtime.client.stream(system=system_prompt, messages=history, tools=WORKER_TOOLS):
                     reply.accept(event)
             if reply.stop_reason == "max_tokens":
                 await self.finish("failed", "模型输出达到上限，本轮未完成。")

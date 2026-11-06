@@ -11,7 +11,7 @@ from jsonschema import ValidationError, validate
 from sqlalchemy import func, or_, select
 
 from app import db
-from app.agent import agent_bus, compact, hooks
+from app.agent import agent_bus, compact, hooks, skills
 from app.agent.llm import build_client
 from app.agent.model_call import record_model_step
 from app.agent.task_tools import DIRECT_TOOLS, FIRST_ACTION_TOOLS, MAIN_TOOLS, ROUTE, SHARED_TOOLS
@@ -566,7 +566,7 @@ class Runtime:
             visible = store.visible(session)
             current_order = next((m["order"] for m in visible if m["id"] == event["message_id"]), 0)
             recent = [m for m in visible if m["order"] <= current_order][-12:]
-        route_prompt = (_PROMPT_PATH.read_text(encoding="utf-8") + "\n\n判断新消息与任务的关系；仅返回 route_input。"
+        route_prompt = (_PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt() + "\n\n判断新消息与任务的关系；仅返回 route_input。"
                         "知识库查询、入库、查看、移出一律使用 create 交给后台助手；用户未要求入库时不得入库。"
                         "单纯的知识库问答标记 knowledge_question=true，包含其他工作的任务不得标记。"
                         "简单问答以及只需少量操作、预计可快速完成的简单任务使用 chat，由主助手直接处理。"
@@ -956,7 +956,7 @@ class Runtime:
                 task_note += "直接执行已达到 40 步上限，请停止并说明；后续工作可分配后台助手。"
             messages.append({"role": "user", "content": f"{note}\n{task_note}\n当前任务：{store.dump(tasks)}"})
             deps = SimpleNamespace(client=self.client, recorder=SimpleNamespace(session_id="main", turn_id=new_id()))
-            system_prompt = _PROMPT_PATH.read_text(encoding="utf-8")
+            system_prompt = _PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt()
             dialog_tools = [tool for tool in MAIN_TOOLS if (required_review or tool["name"] != "task_review")
                             and (not recovered or tool["name"] != "task_create")] + SHARED_TOOLS
             if allow_direct and (not direct_task_id or (direct_task and direct_task["status"] not in _TERMINAL
