@@ -16,12 +16,14 @@ RAG 作为独立 MCP 服务，由后台 Worker 调用。LangGraph 按问题规�
 4. **建立索引**：标题与正文参与 Embedding，写入 Milvus 稠密向量和 BM25 索引。
 
 ### 在线检索
+
 ```
 问题 → 检索规划 → 按需并行生成查询
      → 向量检索 + BM25 → RRF 融合 → 子块重排
      → 回填父文档 → 判断证据 → 生成回答
                            └─ 不足时最多补检一轮
 ```
+
 1. 根据问题重写, 多查询, 查询扩展, 问题拆分等RAG增强策略, 每轮最多 6 个子查询；
 2. 稠稠密检索和 BM25 各取 20 条，经 RRF 融合后每个查询保留 10 条；
 3. 共 60 条合并去重后Top 20 条重排，聚合取 Top5 父Chunk供证据评估和回答。
@@ -36,17 +38,18 @@ RAG 作为独立 MCP 服务，由后台 Worker 调用。LangGraph 按问题规�
 
 ### RAG 测评结果
 
-| 指标                 |              基线结果 |  作用 |
-| ------------------ | ----------------: | --- |
-| 文档 Recall\@10      |             0.880 --→ 1.00 | 找全了没|
-| 文档 NDCG\@10        |             0.776 --→ 0.886 |排序好不好|
-| Faithfulness       |             0.710 --→ 0.970 |有没有编造|
-| Answer Correctness |             0.473 --→ 0.802 |回答对不对|
-| MCP 平均延迟 / P95     | 28.09 秒 / 35.47 秒 --→ 32.25 秒 / 43.27 秒 | 响应时间 |
+| 指标                 |                                    基线结果 | 作用    |
+| ------------------ | --------------------------------------: | ----- |
+| 文档 Recall\@10      |                          0.880 --→ 1.00 | 找全了没  |
+| 文档 NDCG\@10        |                         0.776 --→ 0.886 | 排序好不好 |
+| Faithfulness       |                         0.710 --→ 0.970 | 有没有编造 |
+| Answer Correctness |                         0.473 --→ 0.802 | 回答对不对 |
+| MCP 平均延迟 / P95     | 28.09 秒 / 35.47 秒 --→ 32.25 秒 / 43.27 秒 | 响应时间  |
 
 - 生成为 gpt-6-luna；测评为 gpt-6.1-terra
 
-### RAG 测评步骤
+### RAG 测评脚本
+
 ```bash
 # 1.启动模型
 cd C:\Users\nnnnnn\Desktop\OpenWorkBot
@@ -59,37 +62,25 @@ cd C:\Users\nnnnnn\Desktop\OpenWorkBot
 .\rag\.venv\Scripts\python.exe .\rag\evaluations\evaluate_generation.py --evidence .\rag\evaluations\result\retrieval_11-05-18-50.json --limit 50
 ```
 
-# 项目运行
-
-需要 Python 3.12+、uv 和 Node.js。首次运行需配置 `backend/.env`，然后启动：
-
-```bash
-uv run --no-project start.py
-# 或者分前后端启动
-cd backend # 新开终端启动后端服务
-uv sync
-uv run uvicorn app.main:app --host 127.0.0.1 --port 8100
-cd frontend # 新开终端启动前端服务
-npm run dev
-```
-
 # 项目实现
 
 ## 1. 九个机制
 
 主链路：用户输入 → 压缩 → LLM → 权限 → 工具 → tool\_result → 再调 LLM。
 
-| 机制                 | 本项目实现                                                                                                        | 代码文件                                                                                                                                              |
-| ------------------ | ------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1. Agent Loop      | run\_turn 进行While True循环；无工具则结束；工具错误回填，模型错误以failed收口                                                         | [agent/loop.py](./backend/app/agent/loop.py)、[agent/llm.py](./backend/app/agent/llm.py)、[agent/model\_call.py](./backend/app/agent/model_call.py) |
-| 2. Tool Use        | TOOLS 定义工具及参数 schema；普通工具由 TOOL\_HANDLERS 分发；todo\_write 和 subtask 由主循环单独处理。                                 | [agent/tools.py](./backend/app/agent/tools.py)、[agent/loop.py](./backend/app/agent/loop.py)                                                       |
-| 3. Permission      | 主循环check\_permission根据权限模式build/edit/yolo, 返回allow/deny/ask；命中危险命令清单或越界时deny，批准后把工具结果给模型；拒绝后把拒绝原因给模型，让它决定下一步 | [agent/permission\_service.py](./backend/app/agent/permission_service.py)、[sessions/approvals.py](./backend/app/sessions/approvals.py)            |
-| 4. Hooks           | Pre/Post记录工具日志；Stop可注入续轮；UserPromptSubmit仅预留，权限独立于hook                                                       | [agent/hooks.py](./backend/app/agent/hooks.py)、[agent/loop.py](./backend/app/agent/loop.py)                                                       |
-| 5. Task System     | todo\_write整板更新，≤20项、最多1项进行中；保存todo表；未实现“三轮未更新提醒”                                                            | [agent/todo.py](./backend/app/agent/todo.py)                                                                                                      |
-| 6. Subagents       | 独立历史、最多30步、串行、防递归；当前7个同步工具，权限同父级，结果回填父轮                                                                      | [agent/subtask.py](./backend/app/agent/subtask.py)                                                                                                |
-| 7. Context Compact | turn开始执行microcompact → LLM摘要；阈值与恢复边界见§3                                                                      | [agent/compact.py](./backend/app/agent/compact.py)                                                                                                |
-| 8. Skill           | load\_skill按目录读SKILL.md全文；有目录枚举函数，但尚未注入系统提示词                                                                 | [agent/skills.py](./backend/app/agent/skills.py)                                                                                                  |
-| 9. Goal Loop       | **Web后端未实现**；独立完成度判断器、/goal自动续轮仅在参考脚本中                                                                       | [scripts\_mini\_harness/mini\_harness.py](./scripts_mini_harness/mini_harness.py)                                                                 |
+| 机制                 | 本项目实现                                                                                                        | 补充说明                                                                                         | 代码文件                                                                                                                                              |
+| ------------------ | ------------------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 1. Agent Loop      | run\_turn 进行While True循环；无工具则结束；                                                                             | 错误也作为 `tool_result` 喂回，不抛异常打断循环                                                              | [agent/loop.py](./backend/app/agent/loop.py)、[agent/llm.py](./backend/app/agent/llm.py)、[agent/model\_call.py](./backend/app/agent/model_call.py) |
+| 2. Tool Use        | `TOOLS` 定义工具及参数 schema；`TOOL_HANDLERS` 为名字 → 函数的 dispatch map；todo\_write 和 subtask 由主循环单独处理。                | 文件操作全部先过 `safe_path` 沙箱, `execute_tool` 统一拦截 → 分发 → 兜异常                                      | [agent/tools.py](./backend/app/agent/tools.py)、[agent/loop.py](./backend/app/agent/loop.py)                                                       |
+| 3. Permission      | 主循环check\_permission根据权限模式build/edit/yolo, 返回allow/deny/ask；命中危险命令清单或越界时deny，批准后把工具结果给模型；拒绝后把拒绝原因给模型，让它决定下一步 | `permission_hook` 三道闸门：禁止清单硬拒 / 越界与 shell 删除硬拒 / 高危命令 `[y/N]` 确认；拒绝原因作为 `tool_result` 喂回模型   | [agent/permission\_service.py](./backend/app/agent/permission_service.py)、[sessions/approvals.py](./backend/app/sessions/approvals.py)            |
+| 4. Hooks           | `UserPromptSubmit / PreToolUse / PostToolUse / Stop` 四个事件点挂回调                                                | `Pre` = 权限 + 日志；`Post` = 大输出告警；`Stop` = 计数；`Submit` 暂无注册                                     | [agent/hooks.py](./backend/app/agent/hooks.py)、[agent/loop.py](./backend/app/agent/loop.py)                                                       |
+| 5. Task System     | `TodoManager`任务看板, todo\_write整板更新；持久化sqlite3；                                                               | 单 `in_progress`串行进行                                                                          | [agent/todo.py](./backend/app/agent/todo.py)                                                                                                      |
+| 6. Subagents       | 独立历史、最多30步、串行、防递归；当前7个同步工具，权限同父级，结果回填父轮                                                                      | `subtask(prompt)` 用全新 `messages` 跑 30 轮独立循环，最终文本作 `tool_result` 返回父级；同一响应里的多个 `subtask` 严格串行 | [agent/subtask.py](./backend/app/agent/subtask.py)                                                                                                |
+| 7. Context Compact | turn开始执行microcompact → LLM摘要；阈值与恢复边界见§3                                                                      | <br />                                                                                       | [agent/compact.py](./backend/app/agent/compact.py)                                                                                                |
+| 8. Skill           | 启动扫描 `skills/*/SKILL.md`，system prompt 只放“名称 + 描述”目录，`load_skill` 按需取全文                                      | frontmatter 只取 `name / description` 两字段                                                      | [agent/skills.py](./backend/app/agent/skills.py)                                                                                                  |
+| 9. Goal Loop       | `/goal` 后模型每次想停，由无工具的独立判断器裁定；JSON `{ok, reason, impossible}`；未达成注入理由自动续轮，连续 8 次未放行收口交还用户                     | `max_tokens=512`；连续 8 次收口；error 不计数                                                          | <br />                                                                                                                                            |
+
+<br />
 
 - 工具：bash/read\_file/write\_file/edit\_file/glob/delete\_file + todo\_write/load\_skill/subtask。
   - 子助手仅同步工具：6个基础工具 + load\_skill；不含todo/subtask。
@@ -198,7 +189,15 @@ compact
 
 - 仍超预算则LLM摘要此前历史；当前用户请求保留原文，不参与摘要
 
-# 初版最小harness实现(仅参考) `scripts_mini_harness/mini_harness.py`
+## 4. 项目启动
+
+需要 Python 3.12+、uv 和 Node.js, 配置 `backend/.env`，然后启动：
+
+```bash
+uv run --no-project start.py
+```
+
+### 初版最小harness实现(仅参考) `scripts_mini_harness/mini_harness.py`
 
 ```text
 用户输入 -> 压缩 -> LLM -> 有 tool_use ? -> 权限 hooks -> 工具 -> 回填
@@ -209,17 +208,6 @@ bash / read_file / write_file / edit_file / glob /
 delete_file(移入 rubbish/) / todo_write / load_skill / subtask(子助手)
 ```
 
-### 九个机制各自的实现(括号 = 代码所在分区)
-
-| 机制                     | 实现                                                                                                  | 补充说明                                                    |
-| ---------------------- | --------------------------------------------------------------------------------------------------- | ------------------------------------------------------- |
-| **1. Agent Loop**      | `agent_loop` 的 `while True`：调模型，无 `tool_use` 即停；有则执行工具并把 `tool_result` 回填继续                         | 错误也作为 `tool_result` 喂回，不抛异常打断循环                         |
-| **2. Tool Use**        | `TOOLS` 存给模型看的 schema，`TOOL_HANDLERS` 是名字 → 函数的 dispatch map；`execute_tool` 统一拦截 → 分发 → 兜异常         | 文件操作全部先过 `safe_path` 沙箱                                 |
-| **3. Permission**      | `permission_hook` 三道闸门：禁止清单硬拒 / 越界与 shell 删除硬拒 / 高危命令 `[y/N]` 确认；拒绝原因作为 `tool_result` 喂回模型          | 词表 = `sudo` 等；删除词；`chmod 777` 等 5 个确认词                  |
-| **4. Hooks**           | `UserPromptSubmit / PreToolUse / PostToolUse / Stop` 四个事件点挂回调，`trigger_hooks` 里第一个返回非 `None` 的回调生效） | `Pre` = 权限 + 日志；`Post` = 大输出告警；`Stop` = 计数；`Submit` 无注册 |
-| **5. Task System**     | `TodoManager` 内存任务板，`todo_write` 全量替换；3 轮未更新就在工具结果里注入提醒（§5）                                         | 渲染 `[ ] / [>] / [x]` 面板；单 `in_progress`；上限 20 条         |
-| **6. Subagents**       | `subtask(prompt)` 用全新 `messages` 跑 30 轮独立循环，最终文本作 `tool_result` 返回父级；同一响应里的多个 `subtask` 严格串行        | 子助手仅 6 个基础工具，无 `subtask`，防递归                            |
-| **7. Context Compact** | `ContextCompactor` 四级压缩：新结果落盘留预览 → 中间历史归档 → 旧结果缩短 → LLM 摘要重写；真实 token 计量，占窗口 80% 触发，压到 60%          | 归档 `.transcripts/` 与 `.task_outputs/`；重试 1 次            |
-| **8. Skill**           | 启动扫描 `skills/*/SKILL.md`，system prompt 只放“名称 + 描述”目录，`load_skill` 按需取全文                             | frontmatter 只取 `name / description` 两字段                 |
-| **9. Goal Loop**       | `/goal` 后模型每次想停，由无工具的独立判断器裁定；JSON `{ok, reason, impossible}`；未达成注入理由自动续轮，连续 8 次未放行收口交还用户            | `max_tokens=512`；连续 8 次收口；error 不计数                     |
+- Context Compact
+- 四级压缩：新结果落盘留预览 → 中间历史归档 → 旧结果缩短 → LLM 摘要重写；真实 token 计量，占窗口 80% 触发，压到 40%, 归档；重试 1 次
 
