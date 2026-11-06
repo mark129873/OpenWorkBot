@@ -41,6 +41,8 @@ OpenWorkBot, 目标打造类OpenAI Dots 的自主智能员工, 面向个人与�
 - .github_ZCode/ — ZCode 源码仓库克隆, agent harness工程实现参考: https://github.com/zai-org/ZCode
 - .github_learn-claude-code/ — learn-claude-code 教程仓库克隆, agent harness思想参考: https://github.com/shareAI-lab/learn-claude-code
 - .github_hermes-agent/ — Hermes Agent 源码仓库克隆, agent harness工程实现参考: https://github.com/NousResearch/hermes-agent
+- .github_deerflow/ deer-flow 源码仓库克隆, agent harness工程实现参考: https://github.com/bytedance/deer-flow
+
 
 ## 特别规定
 - README.md 暂不修改

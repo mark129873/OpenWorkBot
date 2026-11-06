@@ -2,6 +2,8 @@
 
 本文记录主聊天、多助手与已批准的 RAG 技术设计和运行边界；实现状态见进度记录。
 
+已确认以 DeerFlow Gateway 为主体改造；当前实现基线仍以本文为准，目标与待审批细节见 [deerflow_design.md](deerflow_design.md)。
+
 ## 1. 当前基线
 
 React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最多三个独立 Worker → 权限与工具 → SQLite / SSE。主助手每轮最多 40 步，Worker 每轮最多 30 步，任务和上下文独立持久化并支持恢复。
