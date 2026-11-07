@@ -84,7 +84,7 @@ class Conflict(ValueError):
 
 
 class Runtime:
-    def __init__(self, client=None, *, user_id: str | None = None, checkpointer=None, memory=None) -> None:
+    def __init__(self, client=None, *, user_id: str | None = None, checkpointer=None, memory=None, rag=None) -> None:
         self.user_id = user_id or require_user()
         from langgraph.checkpoint.memory import InMemorySaver
         from app.agent.graph import AgentGraph
@@ -92,6 +92,7 @@ class Runtime:
 
         self.graph = AgentGraph(checkpointer if checkpointer is not None else InMemorySaver())
         self.memory = memory if memory is not None else Memory()
+        self.rag = rag
         self.owns_memory = memory is None
         self.memory_reads: set[asyncio.Task] = set()
         self.data_dir = settings.data_dir
@@ -104,6 +105,7 @@ class Runtime:
         self.scheduler: asyncio.Task | None = None
         self.reset_task: asyncio.Task | None = None
         self.workers: dict[str, asyncio.Task] = {}
+        self.rag_writes: dict[asyncio.Task, asyncio.Event] = {}
         self.direct_calls: dict[str, asyncio.Task] = {}
         self.direct_slots = asyncio.Semaphore(3)
         self.active_tools: set[asyncio.Task] = set()
@@ -544,6 +546,8 @@ class Runtime:
                                             *self.direct_calls.values(), *self.active_tools] if task and not task.done()]
                 if not active:
                     break
+                if any(sent.is_set() and not task.done() for task, sent in self.rag_writes.items()):
+                    deadline = time.monotonic() + max(1, settings.bash_timeout + 5)
                 if time.monotonic() >= deadline:
                     def block(session):
                         meta = store.get(session, "meta")
@@ -734,7 +738,8 @@ class Runtime:
             current_order = next((m["order"] for m in visible if m["id"] == event["message_id"]), 0)
             recent = [m for m in visible if m["order"] <= current_order][-12:]
         route_prompt = (_PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt() + self.memory_prompt(self.main_memory) + "\n\n判断新消息与任务的关系；仅返回 route_input。"
-                        "知识库与宿主命令暂不可用。"
+                        "知识库查询、列表、入库和移出均使用 create 交给后台助手；上传文件不等于要求入库。"
+                        "纯知识库问答设置 knowledge_question=true，包含其他工作的任务不能设置。宿主命令不可用。"
                         "简单问答以及只需少量操作、预计可快速完成的简单任务使用 chat，由主助手直接处理。"
                         "复杂、耗时或适合并行的独立新任务使用 create，交给后台助手；instruction 要保留用户的限制。"
                         "简单任务需要工具或历史查询需要搜索时，同时在 first_action 中给出第一个工具及完整参数，"
@@ -988,14 +993,14 @@ class Runtime:
                 current = store.get(session, f"task:{report['task_id']}")
                 if not row or not current:
                     return True
-                pending = [item for item in store.records(session, "agent_message", context_id=current["context_id"],
-                                                          delivery="pending") if item.get("source") == "main"]
+                pending = [item for item in store.records(session, "agent_message", context_id=current["context_id"])
+                           if item.get("source") == "main" and item["delivery"] in {"pending", "applying", "unknown", "delivered"}]
                 if (current["status"] != "reviewing" or current.get("run_id") != report.get("run_id")
                         or current.get("stop_requested") or pending):
                     row["kind"] = "review"
                     store.put(session, f"bus:{report['id']}", row)
                     return False
-                current["status"] = "completed"
+                current.update(status="completed", result_sent=True)
                 store.put(session, f"task:{current['id']}", current)
                 self._release_dependents(session, current)
                 store.add_visible(session, "assistant", row["content"], message_id=f"rag-answer:{report['id']}")

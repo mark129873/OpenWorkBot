@@ -239,7 +239,7 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 - 保留 Vite 前端、`backend/app/main.py` Gateway 入口、`start.py` 启动方式以及聊天、上传、审批、重置和 SSE 接口。聊天默认兼容原完整历史返回，前端使用分页上翻；账号名和密码自行注册登录，Cookie 保存登录态，写请求校验 CSRF。首版仅监听和允许本机回环访问。
 - 主助手、Worker 和记忆提取共用 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`MODEL_ID` 指定的 OpenAI 兼容 Chat Completions；上下文压缩沿用 `CONTEXT_WINDOW` 等配置。`langgraph`、`langgraph-checkpoint-sqlite`、`jieba` 和 `tiktoken` 用于检查点及记忆；首次使用 token 词表可能需要联网。
 - 应用与检查点使用 `backend/data/app.db`，记忆文件放在 `backend/data/memory/`，FTS 索引使用 `backend/data/memory-index.sqlite`。不做旧数据库迁移，测试使用独立空库；重建前核对数据目录，不能删除用户工作区。Docker 和 PostgreSQL 待用户后续确认。
-- Agent 暂不开放 RAG MCP 工具；`rag/` 服务和数据保持独立，后续多用户接入须确认。
+- 共享 RAG MCP 接入见第 14 节；RAG 服务及现有知识库保持独立。
 
 ### 13.7 验证与边界
 
@@ -247,3 +247,10 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 - 尚未使用真实模型复测本次改造，也未执行真实服务崩溃或断电试验；SQLite、记忆文件及独立 FTS 不构成跨文件原子事务。参考实现不复制 DeerFlow 源码，应用当前定位为本机使用。
 
 参考源码：[AgentRuns](../.github_deerflow/backend/packages/extension-api/deerflow_extension_api/agent_runs.py)、[Agent Teams](../.github_deerflow/examples/deerflow-extension-agent-teams/deerflow_extension_agent_teams/service.py)、[LocalSandbox](../.github_deerflow/backend/packages/harness/deerflow/sandbox/local/local_sandbox.py)、[记忆队列](../.github_deerflow/backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/queue.py)、[记忆存储](../.github_deerflow/backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/storage.py)。
+
+## 14. 共享 RAG MCP 接入
+
+- Gateway 管理一个共享 stdio MCP 进程；后台 Worker 按现有权限与用户明确指令调用查询、列表、入库和移出，结果通过 Message Bus 送主助手及主聊天。保留 RAG 生成的答案、原有检索及 Responses 接口；最终结果按 16 KiB 截断并完成任务清理。
+- 共用现有 `rag/data/` 目录、文档 ID 和 Milvus 集合；不迁移、重建或清空旧知识库。入库仅从当前用户工作区取文件，复制到受控临时目录后调用原 MCP；正常结束后清理，结果未知时保留临时文件待核查。按完整文件名（含扩展名、忽略大小写）查找，命中时使用旧目录路径调用入库以复用 ID；新版本成功后切换，失败保留旧版本，工作区原文件不变。共享库变更串行处理，查询可并发。
+- 停止或重置时取消尚未发出的操作，已发出的入库或移出等待返回，再停止当前用户任务；结果未知不得自动重试。共享知识库、其他用户任务与现有 Langfuse 追踪保留；固定 MCP 服务由 Gateway 启动，宿主命令仍禁用。
+- 优先只改 Gateway、Worker、MCP 客户端和项目文档；修改 `rag/` 代码前必须取得用户批准。隔离测试覆盖旧库、同名更新、权限、并发、取消和恢复；未授权真实模型或云端写入。评测重建脚本不得指向共享库。

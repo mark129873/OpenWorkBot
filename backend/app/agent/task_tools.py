@@ -70,7 +70,7 @@ RAG_TOOLS = [
             {"document_id": {"type": "string"}}, ["document_id"]),
 ]
 
-WORKER_TOOLS = [tool for tool in TOOLS if tool["name"] not in {"subtask"}] + SHARED_TOOLS + [
+WORKER_TOOLS = [tool for tool in TOOLS if tool["name"] not in {"subtask"}] + SHARED_TOOLS + RAG_TOOLS + [
     _schema("agent_list", "查看可联系的后台助手。", {}, []),
     _schema("agent_send", "向后台助手发送信息。", {
         "context_id": {"type": "string"}, "content": {"type": "string"}}, ["context_id", "content"]),

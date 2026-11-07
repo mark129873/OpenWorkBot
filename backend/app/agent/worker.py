@@ -20,7 +20,9 @@ from app.sessions import approvals, chat_store as store, session_permissions
 from app.user_context import scoped
 
 _PROMPT = """你是后台工作助手，专注完成给定任务。独立保存工作上下文；先读后改，工具执行失败不能当作成功。
-知识库工具和宿主命令暂不可用。必须遵守用户限定的操作和顺序；不确定时询问主助手。
+知识库由所有用户共享。查询用 rag_search；仅在用户明确要求时调用 rag_ingest 或 rag_remove。
+已指定文件时直接入库；移出前用 rag_list 查文件 ID。普通知识问答完整返回工具答案。宿主命令不可用。
+必须遵守用户限定的操作和顺序；不确定时询问主助手。
 关键进展或需要用户确认的问题使用 task_report 告诉主助手。完成后简短汇报结果、验证及未解决的问题。
 收到用户修改、停止或同伴消息时按最新要求调整；不要冒充主助手或其他助手。"""
 
@@ -240,7 +242,7 @@ class Worker:
         if name in {"task_report", "agent_list", "agent_send", "agent_wait", "agent_help", "read_tool_output"}:
             return await self.communicate(name, args, execution["id"])
         if name in RAG_NAMES:
-            return "Error: 知识库工具暂不可用。"
+            return await self.rag_tool(execution)
         if name == "bash":
             return "Error: 当前沙箱禁止宿主命令。"
         if name not in tools.TOOL_HANDLERS and name != "todo_write":
@@ -262,6 +264,115 @@ class Worker:
             await self.runtime.change(lambda session: replace_todos(session, scoped("main"), items, commit=False))
             return render_panel(items)
         return await self.runtime.run_tool(tools.execute_tool, name, args)
+
+    async def rag_tool(self, execution: dict) -> str:
+        from app.agent.permission_service import evaluate
+
+        name, args = execution["name"], execution["input"]
+        fields = {"rag_search": {"query"}, "rag_list": set(), "rag_ingest": {"path"}, "rag_remove": {"document_id"}}
+        if set(args) != fields[name] or any(not isinstance(value, str) or not value.strip() for value in args.values()):
+            return "Error: 知识库工具参数无效。"
+        if self.runtime.rag is None:
+            return "Error: 知识库服务不可用。"
+        writing = name in {"rag_ingest", "rag_remove"}
+        if writing and not self.knowledge_authorized(name):
+            return "Error: 需要用户明确指定知识库入库或移出操作。"
+        with db.new_session() as session:
+            task = store.get(session, f"task:{self.task_id}")
+            pending = [item for item in store.records(session, "agent_message", context_id=self.context_id)
+                       if item.get("source") == "main" and item["delivery"] in {"pending", "applying", "unknown", "delivered"}]
+            previous = [item for item in store.records(session, "tool_execution") if item.get("id") != execution["id"]
+                        and item.get("name") == name and item.get("input") == args and item.get("result_unknown")]
+        if pending:
+            return "Error: 收到新的用户要求，请先处理后再调用知识库。"
+        if writing and previous and not self.knowledge_authorized(name, after=max(
+                item.get("user_seq", task["order"]) for item in previous)):
+            return "Error: 此前知识库操作结果未知，请先检查并等待用户明确要求重试。"
+        initial = evaluate(settings.data_dir, name, args)["decision"]
+        error = await self.authorize(execution)
+        if error:
+            return error
+        sequence = task.get("latest_user_seq", task["order"])
+
+        async def before_send():
+            if self.stop.is_set():
+                return "Error: 用户已停止任务，工具未执行。"
+            current = evaluate(settings.data_dir, name, args)["decision"]
+            if current == "deny" or (initial == "allow" and current == "ask"
+                                      and not session_permissions.allows(scoped("main"), name, args)):
+                return "Error: 知识库操作权限已变化，请重新确认。"
+            return await self.started(execution, sequence)
+
+        operation_id = hashlib.sha256(f"{self.runtime.user_id}:{execution['id']}".encode()).hexdigest()
+        sent = asyncio.Event()
+        call = asyncio.create_task(self.runtime.rag.perform(self.runtime, name, args, operation_id, before_send, sent))
+        if writing:
+            self.runtime.rag_writes[call] = sent
+        stopped = asyncio.create_task(self.stop.wait())
+        try:
+            await asyncio.wait([call, stopped], return_when=asyncio.FIRST_COMPLETED)
+            if self.stop.is_set() and not (writing and sent.is_set()):
+                if sent.is_set():
+                    await self.runtime.rag.cancel(operation_id)
+                call.cancel()
+                await asyncio.gather(call, return_exceptions=True)
+                return "Error: 操作已停止。"
+            try:
+                result = await asyncio.shield(call)
+            except Exception:
+                if writing and sent.is_set():
+                    result = "Error: 知识库操作结果未知，请先检查。"
+                else:
+                    result = "Error: 知识库操作失败，请检查后重试。"
+            if self.stop.is_set() and writing and sent.is_set():
+                def report(session):
+                    if not store.get(session, "meta").get("reset"):
+                        agent_bus.send(session, source=self.context_id, target="main", task_id=self.task_id,
+                                       content=_limit_result(f"停止前已提交的知识库操作结果：{result}"), kind="progress",
+                                       message_id=f"rag-stop:{execution['id']}", run_id=self.run_id)
+                await self.runtime.change(report)
+            if name == "rag_search" and not result.startswith("Error:"):
+                try:
+                    answer = json.loads(result)
+                    if (not isinstance(answer, dict) or answer.get("status") not in {"success", "insufficient"}
+                            or not isinstance(answer.get("answer"), str)):
+                        return "Error: 知识库返回格式无效。"
+                    answer["answer"] = _limit_result(answer["answer"])
+                    result = json.dumps(answer, ensure_ascii=False)
+                except (TypeError, ValueError):
+                    return "Error: 知识库返回格式无效。"
+            return result
+        except asyncio.CancelledError:
+            if writing and sent.is_set():
+                try:
+                    result = await asyncio.shield(call)
+                except Exception:
+                    result = "Error: 知识库操作结果未知，请先检查。"
+                def save(session):
+                    current = store.get(session, f"execution:{execution['id']}")
+                    if current and current["status"] != "completed":
+                        current.update(status="completed", output=result)
+                        if "结果未知" in result or "结果可能未知" in result:
+                            current["result_unknown"] = True
+                        store.put(session, f"execution:{execution['id']}", current)
+                await self.runtime.change(save)
+            else:
+                if sent.is_set():
+                    await asyncio.shield(self.runtime.rag.cancel(operation_id))
+                call.cancel()
+                await asyncio.gather(call, return_exceptions=True)
+                if writing:
+                    def save_unsent(session):
+                        current = store.get(session, f"execution:{execution['id']}")
+                        if current and current["status"] == "started":
+                            current.update(status="completed", output="Error: 操作已停止，工具未执行。")
+                            store.put(session, f"execution:{execution['id']}", current)
+                    await self.runtime.change(save_unsent)
+            raise
+        finally:
+            self.runtime.rag_writes.pop(call, None)
+            stopped.cancel()
+            await asyncio.gather(stopped, return_exceptions=True)
 
     def knowledge_authorized(self, name: str, after: int = -1) -> bool:
         # shortcut: 只识别常见明确指令，误拒频繁时扩展表达。
@@ -307,6 +418,10 @@ class Worker:
                     item.get("event_type") == "message" and item.get("status") == "pending"
                     and item["user_seq"] > expected_user_seq for item in store.records(session, "user_event")):
                 return "Error: 收到新的用户消息，请先判断后再执行。"
+            if expected_user_seq is not None and any(
+                    item.get("source") == "main" and item["delivery"] in {"pending", "applying", "unknown", "delivered"}
+                    for item in store.records(session, "agent_message", context_id=self.context_id)):
+                return "Error: 收到新的用户要求，请先判断后再执行。"
             if task.get("direct"):
                 decisions = [a.get("user_seq", 0) for a in store.records(session, "approval")
                              if a.get("task_id") == self.task_id and a.get("tool_call_id") == execution["call_id"]
@@ -637,15 +752,15 @@ class Worker:
             store.put(session, f"task:{self.task_id}", task)
             if result == "result" and task.get("knowledge_question"):
                 calls = [item for item in store.records(session, "tool_execution", context_id=self.context_id)
-                         if item.get("run_id") == self.run_id and item.get("name") != "task_report"]
-                if len(calls) == 1 and calls[0].get("name") == "rag_search" and calls[0].get("status") == "completed":
+                         if item.get("run_id") == self.run_id and item.get("name") == "rag_search"]
+                if len(calls) == 1 and calls[0].get("status") == "completed":
                     try:
                         answer = json.loads(calls[0].get("output", ""))
                     except (ValueError, TypeError):
                         answer = {}
                     if answer.get("status") in {"success", "insufficient"} and isinstance(answer.get("answer"), str):
                         agent_bus.send(session, source=self.context_id, target="main", task_id=self.task_id,
-                                       content=answer["answer"], kind="rag_answer",
+                                       content=_limit_result(answer["answer"]), kind="rag_answer",
                                        message_id=f"finish:{self.task_id}:{self.run_id}", run_id=self.run_id)
                         return
             agent_bus.send(session, source=self.context_id, target="main", task_id=self.task_id,

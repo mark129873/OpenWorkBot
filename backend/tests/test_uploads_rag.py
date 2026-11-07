@@ -174,25 +174,11 @@ def test_reset_during_upload_does_not_replace_file(isolated):
     asyncio.run(run())
 
 
-def test_rag_tools_are_not_available_to_agents(isolated):
+def test_rag_tools_are_only_available_to_workers():
     names = {item["name"] for item in RAG_TOOLS}
-    assert not names & {item["name"] for item in MAIN_TOOLS + DIRECT_TOOLS + WORKER_TOOLS}
+    assert names <= {item["name"] for item in WORKER_TOOLS}
+    assert not names & {item["name"] for item in MAIN_TOOLS + DIRECT_TOOLS}
 
-    async def run():
-        runtime = Runtime()
-        with db.new_session() as session:
-            store.initialize(session, isolated)
-            task = runtime.create_task(session, "查询知识库", 1)
-            task.update(status="running", run_id="run")
-            store.put(session, f"task:{task['id']}", task)
-            session.commit()
-        worker = Worker(runtime, task["id"])
-        worker.context_id, worker.run_id = task["context_id"], "run"
-        for name in names:
-            result = await worker.execute({"id": name, "name": name, "input": {}})
-            assert "暂不可用" in result
-        await runtime.close()
-    asyncio.run(run())
 
 def test_new_user_message_blocks_old_rag_operation(isolated):
     async def run():
