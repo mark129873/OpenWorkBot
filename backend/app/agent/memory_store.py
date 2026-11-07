@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import os
 import re
@@ -15,10 +16,15 @@ from app.config import settings
 from app.models import new_id
 
 
+logger = logging.getLogger(__name__)
 _SECTIONS = {
     "user": ("workContext", "personalContext", "topOfMind", "cognitiveStyle"),
     "history": ("recentMonths", "earlierContext", "longTermBackground"),
 }
+
+
+class MemoryRevisionConflict(ValueError):
+    pass
 
 
 def empty_memory() -> dict:
@@ -166,7 +172,7 @@ def _read_unlocked(directory: Path, user_id: str) -> tuple[dict, list[dict]]:
 
 
 def _validate_summary(summary: dict) -> None:
-    if not isinstance(summary, dict) or type(summary.get("revision")) is not int:
+    if not isinstance(summary, dict) or type(summary.get("revision")) is not int or summary["revision"] < 0:
         raise ValueError("记忆摘要格式无效")
     for section, names in _SECTIONS.items():
         if not isinstance(summary.get(section), dict):
@@ -177,6 +183,52 @@ def _validate_summary(summary: dict) -> None:
                 raise ValueError("记忆摘要格式无效")
 
 
+def _normalize_fact(fact: dict, existing: dict | None) -> dict:
+    result = dict(fact)
+    now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    result["content"] = result["content"].strip()
+    result["confidence"] = float(result["confidence"])
+    if result.get("status", "active") != "active":
+        raise ValueError("记忆事实状态无效")
+    source = result.get("source")
+    if isinstance(source, str):
+        source = ({"type": source, "threadId": None} if source in {"manual", "consolidation", "import", "unknown"}
+                  else {"type": "conversation", "threadId": source})
+    elif source is None:
+        source = {"type": "unknown", "threadId": None}
+    if (not isinstance(source, dict) or not isinstance(source.get("type"), str)
+            or source.get("threadId") is not None and not isinstance(source["threadId"], str)):
+        raise ValueError("记忆事实来源无效")
+    result.update(schemaVersion=2, status="active", source=source)
+    result["category"] = result.get("category") or "context"
+    if not isinstance(result["category"], str):
+        raise ValueError("记忆事实类别无效")
+    for name in ("topics", "consolidatedFrom"):
+        result.setdefault(name, [])
+        if not isinstance(result[name], list) or any(not isinstance(item, str) for item in result[name]):
+            raise ValueError("记忆事实元数据无效")
+    result["title"] = str(result.get("title") or result["content"].splitlines()[0]).strip().replace("\n", " ")[:160]
+    result["createdAt"] = (existing.get("createdAt") if existing else result.get("createdAt")) or now
+    if not isinstance(result["createdAt"], str):
+        raise ValueError("记忆事实时间无效")
+    if existing:
+        revision = existing.get("revision")
+        expected = result.get("revision", revision)
+        if type(revision) is not int or revision < 1 or type(expected) is not int or expected != revision:
+            raise MemoryRevisionConflict("记忆事实已更新，请重试")
+        old = {key: value for key, value in existing.items() if key not in {"revision", "updatedAt"}}
+        new = {key: value for key, value in result.items() if key not in {"revision", "updatedAt"}}
+        changed = old != new
+        result["revision"] = revision + int(changed)
+        if not isinstance(existing.get("updatedAt"), str):
+            raise ValueError("记忆事实时间无效")
+        result["updatedAt"] = now if changed else existing["updatedAt"]
+    else:
+        result["revision"] = 1
+        result["updatedAt"] = result["createdAt"]
+    return result
+
+
 def _recover(directory: Path) -> None:
     path = _path(directory, ".memory.journal.json")
     if not path.exists():
@@ -184,33 +236,41 @@ def _recover(directory: Path) -> None:
     journal = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(journal, dict):
         raise ValueError("记忆恢复日志无效")
-    operation = journal.get("operation")
+    operation = journal.get("operationId")
     if not isinstance(operation, str) or not re.fullmatch(r"[0-9a-f]+", operation):
         raise ValueError("记忆恢复日志无效")
     backup = _path(directory, ".recovery", operation)
     if journal.get("state") == "prepared":
         summary = _path(backup, "memory.json")
-        target = _path(directory, "memory.json")
-        old_ids = journal.get("old_ids")
-        fact_ids = journal.get("fact_ids")
-        if (type(journal.get("had_summary")) is not bool or not isinstance(old_ids, list) or not isinstance(fact_ids, list)
-                or any(not isinstance(identity, str) for identity in old_ids + fact_ids)
-                or len(set(fact_ids)) != len(fact_ids) or not set(old_ids).issubset(fact_ids)):
+        summary_target = _path(directory, "memory.json")
+        old = journal.get("oldEntries")
+        fact_ids = journal.get("factIds")
+        revision = journal.get("expectedRevision")
+        if (journal.get("agentName") != "__default__" or type(revision) is not int or revision < 0
+                or journal.get("nextRevision") != revision + 1 or not isinstance(old, dict)
+                or not isinstance(fact_ids, list) or any(not isinstance(identity, str) for identity in fact_ids)
+                or len(set(fact_ids)) != len(fact_ids) or not set(old).issubset(fact_ids)):
             raise ValueError("记忆恢复日志无效")
         for identity in fact_ids:
-            _fact_path(directory, identity)
-            if identity in old_ids:
+            target = _fact_path(directory, identity)
+            if identity in old:
+                if old[identity] != {"path": target.relative_to(directory).as_posix()}:
+                    raise ValueError("记忆恢复路径无效")
                 _parse_fact(_path(backup, f"{identity}.md"), directory.name)
-        if journal["had_summary"]:
+        if summary.exists():
             previous = summary.read_text(encoding="utf-8")
-            if not isinstance(json.loads(previous), dict):
+            previous_data = json.loads(previous)
+            _validate_summary(previous_data)
+            if previous_data["revision"] != revision:
                 raise ValueError("记忆恢复摘要无效")
-            _atomic_write(target, previous)
+            _atomic_write(summary_target, previous)
+        elif revision:
+            raise ValueError("记忆恢复摘要备份丢失")
         else:
-            target.unlink(missing_ok=True)
+            summary_target.unlink(missing_ok=True)
         for identity in fact_ids:
             target = _fact_path(directory, identity)
-            if identity in old_ids:
+            if identity in old:
                 source = _path(backup, f"{identity}.md")
                 _atomic_write(target, source.read_text(encoding="utf-8"))
             else:
@@ -244,23 +304,28 @@ def _store(user_id: str, summary: dict, facts: list[dict], expected_revision: in
         _recover(directory)
         current, old_facts = _read_unlocked(directory, user_id)
         if expected_revision is not None and current["revision"] != expected_revision:
-            raise ValueError("记忆已更新，请重试")
+            raise MemoryRevisionConflict("记忆已更新，请重试")
         old = {fact["id"]: fact for fact in old_facts}
-        desired = {fact["id"]: fact for fact in facts}
+        desired = {fact["id"]: _normalize_fact(fact, old.get(fact["id"])) for fact in facts}
         if len(desired) != len(facts):
             raise ValueError("记忆事实 ID 重复")
-        changed = [identity for identity in set(old) | set(desired)
-                   if identity not in old or identity not in desired or old[identity] != desired[identity]]
+        changed = sorted(identity for identity in set(old) | set(desired)
+                         if identity not in old or identity not in desired or old[identity] != desired[identity])
+        summary_path = _path(directory, "memory.json")
+        if not changed and all(summary[name] == current[name] for name in _SECTIONS):
+            return
         operation = new_id()
         backup = _path(directory, ".recovery", operation)
         journal_path = _path(directory, ".memory.journal.json")
-        summary_path = _path(directory, "memory.json")
-        journal = {"operation": operation, "state": "prepared", "had_summary": summary_path.exists(),
-                   "fact_ids": changed, "old_ids": [identity for identity in changed if identity in old]}
+        old_entries = {identity: {"path": _fact_path(directory, identity).relative_to(directory).as_posix()}
+                       for identity in changed if identity in old}
+        journal = {"operationId": operation, "state": "prepared", "agentName": "__default__",
+                   "expectedRevision": current["revision"], "nextRevision": current["revision"] + 1,
+                   "factIds": changed, "oldEntries": old_entries}
         try:
             if summary_path.exists():
                 _atomic_write(_path(backup, "memory.json"), summary_path.read_text(encoding="utf-8"))
-            for identity in journal["old_ids"]:
+            for identity in old_entries:
                 _atomic_write(_path(backup, f"{identity}.md"), _fact_path(directory, identity).read_text(encoding="utf-8"))
             _atomic_write(journal_path, json.dumps(journal, ensure_ascii=False))
             for identity in changed:
@@ -283,32 +348,39 @@ def _store(user_id: str, summary: dict, facts: list[dict], expected_revision: in
             raise
 
 
-def _state(user_id: str, activation_seq: int | None = None, watermark: str | None = None) -> dict:
+def _state(user_id: str) -> dict:
     directory = _directory(user_id)
     with _file_lock(directory):
         _recover(directory)
-        path = _path(directory, "agents", "__default__", ".metadata", "watermark.json")
+        path = _path(directory, "agents", "__default__", ".metadata", "watermarks.json")
         if not path.exists():
-            if activation_seq is None:
-                raise ValueError("记忆提取水位未初始化")
-            if _path(directory, "memory.json").exists():
-                raise ValueError("记忆提取水位丢失")
-            value = {"activation_seq": activation_seq, "watermark": watermark}
-            _atomic_write(path, json.dumps(value, ensure_ascii=False))
-            return value
-        value = json.loads(path.read_text(encoding="utf-8"))
-        if (not isinstance(value, dict) or type(value.get("activation_seq")) is not int
-                or value.get("watermark") is not None and not isinstance(value["watermark"], str)):
-            raise ValueError("记忆提取水位无效")
-        return value
+            return {}
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            logger.warning("记忆提取水位无效 user=%s", user_id)
+            return {}
+        if not isinstance(value, dict):
+            logger.warning("记忆提取水位无效 user=%s", user_id)
+        return value if isinstance(value, dict) else {}
 
 
 def _advance(user_id: str, watermark: str) -> None:
     directory = _directory(user_id)
     with _file_lock(directory):
-        path = _path(directory, "agents", "__default__", ".metadata", "watermark.json")
-        value = json.loads(path.read_text(encoding="utf-8"))
-        value["watermark"] = watermark
+        path = _path(directory, "agents", "__default__", ".metadata", "watermarks.json")
+        if path.exists():
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                value = {}
+        else:
+            value = {}
+        if not isinstance(value, dict):
+            value = {}
+        value = {key: item for key, item in value.items() if isinstance(item, list) and item
+                 and all(isinstance(part, str) for part in item)}
+        value["main"] = ["id", watermark]
         _atomic_write(path, json.dumps(value, ensure_ascii=False))
 
 

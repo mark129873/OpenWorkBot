@@ -194,14 +194,6 @@ class Runtime:
                     store.put(session, "meta", meta)
                 store.bump(session)
                 session.commit()
-                history = store.records(session, "agent_context", context_id="main")
-                memory_start = (meta["user_seq"], history[-1]["id"] if history else None)
-        try:
-            await self.memory.initialize(*memory_start)
-        except Exception:
-            logger.warning("初始化长期记忆失败 user=%s", self.user_id, exc_info=True)
-            await self.change(lambda session: store.add_visible(
-                session, "assistant", "长期记忆暂时不可用，本次将继续处理。", status="failed"))
         self.main_loop = asyncio.create_task(self._consume(), name="main-chat")
         self.scheduler = asyncio.create_task(self._schedule(), name="task-scheduler")
         if self.network_approvals:
@@ -713,9 +705,6 @@ class Runtime:
             if self.network_approvals:
                 await self.network_approvals.forget_grants()
             await self.memory.clear()
-            with db.new_session() as session:
-                memory_start = store.get(session, "meta")["user_seq"]
-            await self.memory.initialize(memory_start, None)
             for thread_id in current.get("thread_ids", []):
                 await self.graph.delete_thread(thread_id)
             from app.agent.memory import _io

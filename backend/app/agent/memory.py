@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 from app import db
 from app.agent.memory_recall import _snapshot
-from app.agent.memory_store import _advance, _delete, _read_files, _state, _store
+from app.agent.memory_store import MemoryRevisionConflict, _advance, _delete, _read_files, _state, _store
 from app.models import User, new_id
 from app.user_context import bind_user, require_user
 
@@ -17,7 +17,26 @@ logger = logging.getLogger(__name__)
 _DEBOUNCE = 30
 _MAX_WAIT = 300
 _MAX_FACTS = 100
+_MAX_PENDING = 1000
+_SHUTDOWN_WAIT = 30
+_BATCH_DELAY = 0.5
 _TRIVIAL = re.compile(r"(?:嗯+|ok(?:ay)?|好的[呢]?|好[的呀]?|谢谢|感谢|多谢|对|是的|收到|明白|了解|知道了|got it|thanks|thank you|cheers)", re.I)
+_SIGNALS = {name: re.compile(pattern, re.I) for name, pattern in {
+    "correction": r"\bthat(?:'s| is) (?:wrong|incorrect)\b|\byou misunderstood\b|\btry again\b|\bredo\b|不对|你理解错了|你理解有误|重试|重新来|换一种|改用",
+    "reinforcement": r"\byes[,.]?\s+(?:exactly|perfect|that(?:'s| is) (?:right|correct|it))\b|\bperfect(?:[.!?]|$)|\bexactly\s+(?:right|correct)\b|\bthat(?:'s| is)\s+(?:exactly\s+)?(?:right|correct|what i (?:wanted|needed|meant))\b|\bkeep\s+(?:doing\s+)?that\b|\bjust\s+(?:like\s+)?(?:that|this)\b|\bthis is (?:great|helpful)\b(?:[.!?]|$)|\bthis is what i wanted\b(?:[.!?]|$)|对[，,]?\s*就是这样(?:[。！？!?.]|$)|完全正确(?:[。！？!?.]|$)|(?:对[，,]?\s*)?就是这个意思(?:[。！？!?.]|$)|正是我想要的(?:[。！？!?.]|$)|继续保持(?:[。！？!?.]|$)|(?:以后|今后)(?:都|一直)?保持这样(?:[。！？!?.]|$)",
+    "preference": r"\bI (?:really )?(?:prefer|like|love|enjoy|favor|hate|dislike|don.t like|cannot stand)\b|\bmy favorite\b|\bI.d rather\b|我喜欢|我偏好|我更喜欢|我偏爱|我讨厌|我不喜欢|我钟爱|我最喜欢",
+    "identity": r"\bI am (?:a |an )?[a-z][a-z -]{2,}\b|\bI work as\b|\bI.m (?:a |an )?[a-z][a-z -]{2,}\b|\bmy job is\b|我是|我的职业是|我的工作是|我担任|我是一名",
+    "goal": r"\bI (?:plan to|want to|am going to|aim to|intend to)\b|\bmy goal is\b|\bI.m going to\b|\bnext I.ll\b|我的目标是|我打算|我准备|接下来我要|接下来我打算|我想做",
+    "decision": r"\blet.s (?:go with|use|pick|choose)\b|\bI.ll (?:go with|use|pick|choose)\b|\bwe (?:should|will) (?:go with|use|pick|choose)\b|\bI (?:decide|chose|selected) to\b|就用|决定用|决定采用|我们选|我选|就采用",
+}.items()}
+_HINTS = {
+    "correction": "检测到纠错；仅长期用户偏好可记录为 correction，明确纠错的置信度可至少为 0.95。",
+    "reinforcement": "检测到正面反馈；仅用户长期认可的方式可记录。",
+    "preference": "检测到偏好；仅跨任务持续有效的用户偏好可记录。",
+    "identity": "检测到身份；仅跨任务持续有效的用户身份可记录。",
+    "goal": "检测到目标；仅跨任务持续有效的用户目标可记录。",
+    "decision": "检测到决定；仅跨任务持续有效的用户决定可记录。",
+}
 _PROMPT = """从对话提取跨任务长期有用的用户信息，不猜测。项目专属信息、临时要求和本次授权不可写入用户记忆。
 只返回 JSON 对象，包含 user、history、newFacts、factsToRemove。
 user 可更新 workContext、personalContext、topOfMind、cognitiveStyle；history 可更新 recentMonths、earlierContext、longTermBackground。
@@ -25,6 +44,7 @@ user 可更新 workContext、personalContext、topOfMind、cognitiveStyle；hist
 newFacts 每项包含 content、category、confidence（0 到 1）、scope、durability、authority；
 只保存 scope=user、durability=durable、authority=descriptive 的事实。category 可为 preference、knowledge、context、behavior、cognitive、goal、correction。
 factsToRemove 仅包含用户明确更正或撤回的已有事实，每项包含 id、scope=user、reason；若删除依赖新事实，replacementFactIndex 指向 newFacts 的下标。
+仅在 correction 的错误明确时记录 sourceError；不得把当前任务的纠错写成长期用户偏好。
 明确陈述的事实置信度可为 0.9 至 1，强烈暗示可为 0.7 至 0.8。不要把本次任务、文件、上传或操作授权记为长期信息。"""
 
 
@@ -39,8 +59,9 @@ async def _io(function, *args):
 
 def _conversation(records: list[dict], events: dict[str, dict], state: dict) -> list[dict]:
     start = 0
-    watermark = state.get("watermark")
-    if watermark:
+    watermark = state.get("main")
+    if isinstance(watermark, list) and len(watermark) == 2 and watermark[0] == "id" and isinstance(watermark[1], str):
+        watermark = watermark[1]
         start = next((index + 1 for index, row in enumerate(records) if row.get("id") == watermark), 0)
     result = []
     eligible = False
@@ -49,7 +70,7 @@ def _conversation(records: list[dict], events: dict[str, dict], state: dict) -> 
         identity, role, content = row.get("id", ""), row.get("role"), row.get("content")
         if role == "user" and identity.startswith("input:"):
             event = events.get(identity[6:])
-            eligible = bool(event and event.get("user_seq", 0) > state["activation_seq"])
+            eligible = bool(event)
             text = event.get("user_text", "") if eligible else ""
             text = text.strip() if isinstance(text, str) else ""
             skip_reply = not text or bool(_TRIVIAL.fullmatch(text.rstrip(" \t\n\r.。,，!！?？;；")))
@@ -79,10 +100,46 @@ def _label(value) -> str:
     return value.strip().lower() if isinstance(value, str) else ""
 
 
+def _signals(messages: list[dict]) -> set[str]:
+    return {name for name, pattern in _SIGNALS.items() for message in messages[-6:]
+            if message.get("role") == "user" and pattern.search(message.get("content", ""))}
+
+
+def _parse(text: str) -> dict:
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"\{", text):
+        try:
+            result, _ = decoder.raw_decode(text[match.start():])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(result, dict) and {"user", "history", "newFacts"}.issubset(result):
+            return result
+    raise ValueError("记忆提取结果无效")
+
+
+def _fact_confidence(fact) -> float | None:
+    if not isinstance(fact, dict) or not isinstance(fact.get("content"), str) or not fact["content"].strip():
+        return None
+    confidence = fact.get("confidence", 0.5)
+    if isinstance(confidence, bool):
+        return None
+    try:
+        confidence = float(confidence)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return confidence if math.isfinite(confidence) and 0 <= confidence <= 1 else None
+
+
 def _apply(summary: dict, facts: list[dict], result: dict) -> tuple[dict, list[dict]]:
     if (not isinstance(result.get("user"), dict) or not isinstance(result.get("history"), dict)
             or not isinstance(result.get("newFacts"), list)):
         raise ValueError("记忆提取结果不完整")
+    proposals = result["newFacts"]
+    removals = result.get("factsToRemove", [])
+    if not isinstance(removals, list):
+        raise ValueError("记忆删除结果无效")
+    if removals and any(_fact_confidence(fact) is None for fact in proposals):
+        raise ValueError("删除请求包含格式无效的新事实")
     now = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     for section in ("user", "history"):
         updates = result.get(section)
@@ -91,26 +148,18 @@ def _apply(summary: dict, facts: list[dict], result: dict) -> tuple[dict, list[d
         for name, item in updates.items():
             if (name in summary[section] and isinstance(item, dict) and item.get("shouldUpdate") is True
                     and _label(item.get("scope")) == "user" and _label(item.get("authority")) == "descriptive"
-                    and isinstance(item.get("summary"), str)):
-                summary[section][name] = {"summary": item["summary"], "updatedAt": now}
+                    and isinstance(item.get("summary"), str) and item["summary"].strip()
+                    and item["summary"].strip() != summary[section][name]["summary"]):
+                summary[section][name] = {"summary": item["summary"].strip(), "updatedAt": now}
 
     by_id = {fact["id"]: fact for fact in facts}
-    proposals = result.get("newFacts", [])
-    if not isinstance(proposals, list):
-        raise ValueError("记忆提取事实格式无效")
     accepted = {}
     for index, fact in enumerate(proposals):
         if (not isinstance(fact, dict) or _label(fact.get("scope")) != "user" or _label(fact.get("durability")) != "durable"
                 or _label(fact.get("authority")) != "descriptive" or not isinstance(fact.get("content"), str)):
             continue
-        confidence = fact.get("confidence")
-        if isinstance(confidence, bool):
-            continue
-        try:
-            confidence = float(confidence)
-        except (TypeError, ValueError, OverflowError):
-            continue
-        if not math.isfinite(confidence) or not 0.7 <= confidence <= 1:
+        confidence = _fact_confidence(fact)
+        if confidence is None or confidence < 0.7:
             continue
         content = fact["content"].strip()
         if not content:
@@ -123,16 +172,13 @@ def _apply(summary: dict, facts: list[dict], result: dict) -> tuple[dict, list[d
             item = {"id": identity, "content": content,
                     "category": category.strip() if isinstance(category, str) and category.strip() else "context",
                     "confidence": float(confidence), "createdAt": now, "source": "main"}
-            if isinstance(fact.get("sourceError"), str) and fact["sourceError"].strip():
+            if item["category"] == "correction" and isinstance(fact.get("sourceError"), str) and fact["sourceError"].strip():
                 item["sourceError"] = fact["sourceError"].strip()
             by_id[identity] = item
         accepted[index] = identity
 
     kept = sorted(by_id.values(), key=lambda item: item["confidence"], reverse=True)[:_MAX_FACTS]
     kept_ids = {fact["id"] for fact in kept}
-    removals = result.get("factsToRemove", [])
-    if not isinstance(removals, list):
-        raise ValueError("记忆删除结果无效")
     removal_ids = {item.get("id") for item in removals if isinstance(item, dict) and isinstance(item.get("id"), str)
                    and _label(item.get("scope")) == "user" and isinstance(item.get("reason"), str) and item["reason"].strip()}
     for item in removals:
@@ -151,14 +197,10 @@ def _apply(summary: dict, facts: list[dict], result: dict) -> tuple[dict, list[d
 class Memory:
     def __init__(self) -> None:
         self.pending: dict[str, dict] = {}
-        self.events: dict[str, asyncio.Event] = {}
-        self.workers: dict[str, asyncio.Task] = {}
+        self.event = asyncio.Event()
+        self.worker: asyncio.Task | None = None
+        self.draining = False
         self.locks: dict[str, asyncio.Lock] = {}
-
-    async def initialize(self, activation_seq: int, watermark: str | None) -> None:
-        user_id = require_user()
-        async with self.locks.setdefault(user_id, asyncio.Lock()):
-            await _io(_state, user_id, activation_seq, watermark)
 
     async def snapshot(self, query: str) -> str:
         user_id = require_user()
@@ -169,17 +211,28 @@ class Memory:
         if role != "main":
             raise PermissionError("仅主 Agent 可以写入记忆")
         user_id = require_user()
+        if self.draining:
+            return
         now = time.monotonic()
-        first = self.pending.get(user_id, {}).get("first", now)
-        self.pending[user_id] = {"generation": generation, "records": records, "events": events,
-                                 "first": first, "last": now}
-        self.events.setdefault(user_id, asyncio.Event()).set()
-        if user_id not in self.workers or self.workers[user_id].done():
-            self.workers[user_id] = asyncio.create_task(self._worker(user_id, client))
+        old = self.pending.get(user_id)
+        signals = _signals(_conversation(records, events, {}))
+        if old is None and len(self.pending) >= _MAX_PENDING and not signals:
+            logger.warning("长期记忆队列已满，等待下次处理 user=%s", user_id)
+            return
+        first = old["first"] if old else now
+        due = min(now + _DEBOUNCE, first + _MAX_WAIT)
+        if old and old["due"] <= now:
+            due = old["due"]
+        self.pending.pop(user_id, None)
+        self.pending[user_id] = {"client": client, "generation": generation, "records": records, "events": events,
+                                 "first": first, "due": due, "signals": signals | (old["signals"] if old else set())}
+        self.event.set()
+        if self.worker is None or self.worker.done():
+            self.worker = asyncio.create_task(self._worker())
 
     def discard_pending(self, user_id: str) -> None:
         self.pending.pop(user_id, None)
-        self.events.setdefault(user_id, asyncio.Event()).set()
+        self.event.set()
 
     async def clear(self) -> None:
         user_id = require_user()
@@ -188,37 +241,52 @@ class Memory:
             await _io(_delete, user_id)
 
     async def close(self) -> None:
-        for task in self.workers.values():
-            task.cancel()
-        await asyncio.gather(*self.workers.values(), return_exceptions=True)
+        self.draining = True
+        self.event.set()
+        if self.pending and (self.worker is None or self.worker.done()):
+            self.worker = asyncio.create_task(self._worker())
+        if self.worker is not None:
+            try:
+                await asyncio.wait_for(asyncio.shield(self.worker), timeout=_SHUTDOWN_WAIT)
+            except asyncio.TimeoutError:
+                self.worker.cancel()
+                await asyncio.gather(self.worker, return_exceptions=True)
 
-    async def _worker(self, user_id: str, client) -> None:
-        with bind_user(user_id):
-            event = self.events[user_id]
-            while user_id in self.pending:
-                event.clear()
-                batch = self.pending[user_id]
-                wait = max(0, min(batch["last"] + _DEBOUNCE, batch["first"] + _MAX_WAIT) - time.monotonic())
+    async def _worker(self) -> None:
+        while self.pending:
+            self.event.clear()
+            now = time.monotonic()
+            due = [user_id for user_id, item in self.pending.items() if self.draining or item["due"] <= now]
+            if not due:
+                wait = max(0, min(item["due"] for item in self.pending.values()) - now)
                 try:
-                    await asyncio.wait_for(event.wait(), timeout=wait)
-                    continue
+                    await asyncio.wait_for(self.event.wait(), timeout=wait)
                 except asyncio.TimeoutError:
                     pass
-                batch = self.pending.pop(user_id, None)
-                if batch is None:
-                    continue
+                continue
+            batches = [(user_id, self.pending.pop(user_id)) for user_id in due]
+            for user_id, batch in batches:
                 try:
-                    await self._extract(user_id, client, batch["records"], batch["events"], batch["generation"])
+                    with bind_user(user_id):
+                        await self._extract(user_id, batch["client"], batch["records"], batch["events"],
+                                            batch["generation"], batch["signals"])
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     logger.exception("长期记忆提取失败 user=%s", user_id)
+                if len(due) > 1 and not self.draining:
+                    await asyncio.sleep(_BATCH_DELAY)
 
-    async def _extract(self, user_id: str, client, records: list[dict], events: dict[str, dict], generation: int) -> None:
+    async def _extract(self, user_id: str, client, records: list[dict], events: dict[str, dict], generation: int,
+                       signals: set[str] | frozenset[str] = frozenset()) -> None:
+        with db.new_session() as session:
+            user = session.get(User, user_id)
+            if not user or user.generation != generation:
+                return
         async with self.locks.setdefault(user_id, asyncio.Lock()):
             state = await _io(_state, user_id)
             summary, facts = await _io(_read_files, user_id)
-        conversation = _conversation(records, events, {**state, "watermark": None})
+        conversation = _conversation(records, events, {})
         if not {"user", "assistant"}.issubset({item["role"] for item in conversation}):
             return
         messages = _conversation(records, events, state)
@@ -227,23 +295,29 @@ class Memory:
         content = json.dumps({"memory": {**summary, "facts": facts},
                               "messages": [{"role": item["role"], "content": item["content"]} for item in messages]},
                              ensure_ascii=False)
+        signals = signals | _signals(messages)
+        hints = "\n".join(_HINTS[name] for name in _HINTS if name in signals)
         output = []
-        async for event in client.stream(system=_PROMPT, messages=[{"role": "user", "content": content}], tools=[]):
+        async for event in client.stream(system=_PROMPT + ("\n" + hints if hints else ""),
+                                         messages=[{"role": "user", "content": content}], tools=[]):
             if event.get("type") == "text_delta":
                 output.append(event.get("text", ""))
             if event.get("type") == "stop_reason" and event.get("reason") == "max_tokens":
                 raise ValueError("记忆提取结果不完整")
-        text = "".join(output).strip()
-        if text.startswith("```") and text.endswith("```"):
-            text = text.split("\n", 1)[1].rsplit("```", 1)[0].strip()
-        result = json.loads(text)
-        if not isinstance(result, dict):
-            raise ValueError("记忆提取结果无效")
+        result = _parse("".join(output))
         async with self.locks.setdefault(user_id, asyncio.Lock()):
             with db.new_session() as session:
                 user = session.get(User, user_id)
                 if not user or user.generation != generation:
                     return
-            updated, kept = _apply(summary, facts, result)
-            await _io(_store, user_id, updated, kept, summary["revision"])
+            for attempt in range(3):
+                revision = summary["revision"]
+                updated, kept = _apply(summary, facts, result)
+                try:
+                    await _io(_store, user_id, updated, kept, revision)
+                    break
+                except MemoryRevisionConflict:
+                    if attempt == 2:
+                        raise
+                    summary, facts = await _io(_read_files, user_id)
             await _io(_advance, user_id, messages[-1]["id"])

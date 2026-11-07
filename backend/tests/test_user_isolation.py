@@ -229,7 +229,6 @@ def test_memory_keeps_the_highest_confidence_facts(tmp_path, monkeypatch):
 
     async def run():
         memory = Memory()
-        await memory.initialize(0, None)
         records = [{"id": "input:one", "role": "user", "content": "内容"},
                    {"id": "answer", "role": "assistant", "content": "完成"}]
         events = {"one": {"user_seq": 1, "user_text": "内容"}}
@@ -280,10 +279,7 @@ def test_memory_reset_fences_late_extraction_and_preserves_other_user(tmp_path, 
                    {"id": "answer", "role": "assistant", "content": "完成"}]
         events = {"one": {"user_seq": 1, "user_text": "内容"}}
         with bind_user("b" * 32):
-            await memory.initialize(0, None)
             await memory._extract("b" * 32, Model(), records, events, 0)
-        with bind_user("a" * 32):
-            await memory.initialize(0, None)
         started, release = asyncio.Event(), asyncio.Event()
 
         async def old_extract():
