@@ -43,8 +43,9 @@ user 可更新 workContext、personalContext、topOfMind、cognitiveStyle；hist
 每个需要更新的摘要包含 summary、shouldUpdate=true、scope=user、authority=descriptive；无变化可省略。
 摘要长度建议：workContext 2-3 句；personalContext 1-2 句；topOfMind 3-5 句；cognitiveStyle 2-4 句；
 recentMonths 4-6 句或 1-2 段；earlierContext 3-5 句或 1 段；longTermBackground 2-4 句。
-更新后的七类摘要正文（包括未更新的已有摘要）合计不得超过 1000 token；必要时精简并更新相关摘要，保留跨任务长期有效的重要信息。
+摘要须非常简洁且不失信息；更新后的七类摘要正文（包括未更新的已有摘要）合计不得超过 1000 token；必要时精简并更新相关摘要，保留跨任务长期有效的重要信息。
 newFacts 每项包含 content、category、confidence（0 到 1）、scope、durability、authority；
+每条事实 content 须非常简洁且不失信息，不得超过 1000 token。
 只保存 scope=user、durability=durable、authority=descriptive 的事实。category 可为 preference、knowledge、context、behavior、cognitive、goal、correction。
 factsToRemove 仅包含用户明确更正或撤回的已有事实，每项包含 id、scope=user、reason；若删除依赖新事实，replacementFactIndex 指向 newFacts 的下标。
 仅在 correction 的错误明确时记录 sourceError；不得把当前任务的纠错写成长期用户偏好。

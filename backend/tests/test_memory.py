@@ -322,6 +322,8 @@ def test_extraction_reapplies_corrections_after_revision_conflict(memory_dir, mo
             self.calls += 1
             assert "检测到纠错" in kwargs["system"] and "sourceError" in kwargs["system"]
             assert "七类摘要正文" in kwargs["system"] and "1000 token" in kwargs["system"]
+            assert "摘要须非常简洁且不失信息" in kwargs["system"]
+            assert "每条事实 content 须非常简洁且不失信息，不得超过 1000 token" in kwargs["system"]
             assert kwargs["tools"] == []
             fact = _fact("偏好中文", category="correction", sourceError="此前使用英文")
             yield {"type": "text_delta", "text": "结果：" + json.dumps(_result(newFacts=[fact]))}
