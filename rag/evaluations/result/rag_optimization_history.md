@@ -24,7 +24,7 @@ OpenWorkBot 面向个人和企业，目标是构建能够自主规划、调用�
 | Answer Correctness | 0.473 |
 | MCP 平均延迟 / P95 | 28.09 秒 / 35.47 秒 |
 
-结果见 [first_evaluate.json](first_evaluate.json)。Answer Correctness 是自动评分，不是答对题目比例。
+Answer Correctness 是自动评分，不是答对题目比例。
 
 主要发现是：**命中目标文件不代表命中所需条款。** BF-001 找到目标文件，但材料清单和额度条款不全；BF-029 的关键块在合并候选中排第 47，当时重排候选上限为 32，关键块提前被截掉。讨论过将上限增至 64，但未证明该数值最优。
 
