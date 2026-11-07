@@ -25,6 +25,20 @@ MAIN_TOOLS = [
 SHARED_TOOLS = [_schema("read_tool_output", "分段读取已保存的命令输出。", {
     "output_id": {"type": "string"}, "offset": {"type": "integer", "minimum": 0},
     "limit": {"type": "integer", "minimum": 1, "maximum": 30000}}, ["output_id"])]
+SHARED_TOOLS += [
+    _schema("state_write", "创建或更新共享状态；新建时版本填 0，更新时填读取到的版本。", {
+        "state_id": {"type": "string"}, "task_id": {"type": "string"}, "kind": {"type": "string"},
+        "content": {"type": "string"}, "expected_version": {"type": "integer", "minimum": 0}},
+        ["kind", "content", "expected_version"]),
+    _schema("state_read", "读取一条共享状态。", {"state_id": {"type": "string"}}, ["state_id"]),
+    _schema("state_list", "按任务或类型分页读取共享状态。", {
+        "task_id": {"type": "string"}, "kind": {"type": "string"},
+        "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}, []),
+    _schema("agent_subscribe", "订阅协作消息主题。", {"topic": {"type": "string"}}, ["topic"]),
+    _schema("agent_unsubscribe", "取消主题订阅。", {"topic": {"type": "string"}}, ["topic"]),
+    _schema("agent_publish", "向当前订阅者发布消息。", {
+        "topic": {"type": "string"}, "content": {"type": "string"}}, ["topic", "content"]),
+]
 
 DIRECT_TOOLS = [tool for tool in TOOLS if tool["name"] != "subtask"]
 FIRST_ACTION_TOOLS = DIRECT_TOOLS + [tool for tool in MAIN_TOOLS if tool["name"] in {"task_search", "task_inspect"}] + SHARED_TOOLS
@@ -56,7 +70,7 @@ RAG_TOOLS = [
             {"document_id": {"type": "string"}}, ["document_id"]),
 ]
 
-WORKER_TOOLS = [tool for tool in TOOLS if tool["name"] not in {"subtask"}] + SHARED_TOOLS + RAG_TOOLS + [
+WORKER_TOOLS = [tool for tool in TOOLS if tool["name"] not in {"subtask"}] + SHARED_TOOLS + [
     _schema("agent_list", "查看可联系的后台助手。", {}, []),
     _schema("agent_send", "向后台助手发送信息。", {
         "context_id": {"type": "string"}, "content": {"type": "string"}}, ["context_id", "content"]),

@@ -16,6 +16,24 @@ class Base(DeclarativeBase):
     pass
 
 
+class User(Base):
+    __tablename__ = 'user_account'
+    id: Mapped[str] = mapped_column(Text, primary_key=True, default=new_id)
+    username: Mapped[str] = mapped_column(Text, unique=True)
+    password: Mapped[str] = mapped_column(Text)
+    generation: Mapped[int] = mapped_column(Integer, default=0)
+    disabled: Mapped[int] = mapped_column(Integer, default=0)
+    time_created: Mapped[int] = mapped_column(Integer, default=now_ms)
+
+
+class LoginSession(Base):
+    __tablename__ = 'login_session'
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    user_id: Mapped[str] = mapped_column(Text, ForeignKey('user_account.id', ondelete='CASCADE'), index=True)
+    csrf: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[int] = mapped_column(Integer)
+
+
 class Session(Base):
     __tablename__ = 'session'
     __table_args__ = (Index('session_project_idx', 'project_id'),)

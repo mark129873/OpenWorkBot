@@ -8,10 +8,16 @@ export class ApiError extends Error {
   }
 }
 
+let csrfToken = ''
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const headers = new Headers(init?.headers)
+  if (!(init?.body instanceof FormData) && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json')
+  if (init?.method && !['GET', 'HEAD'].includes(init.method.toUpperCase())) headers.set('X-CSRF-Token', csrfToken)
   const resp = await fetch(path, {
-    headers: { 'Content-Type': 'application/json' },
     ...init,
+    headers,
+    credentials: 'same-origin',
   })
   if (!resp.ok) {
     let detail = `请求失败（${resp.status}）`
@@ -24,6 +30,27 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
     throw new ApiError(resp.status, detail)
   }
   return resp.json() as Promise<T>
+}
+
+export interface AuthSession { username: string | null; csrf: string }
+
+export async function getAuthSession(): Promise<AuthSession> {
+  const result = await request<AuthSession>('/api/auth/session')
+  csrfToken = result.csrf
+  return result
+}
+
+export async function authenticate(username: string, password: string, register: boolean): Promise<AuthSession> {
+  const result = await request<AuthSession>(`/api/auth/${register ? 'register' : 'login'}`, {
+    method: 'POST', body: JSON.stringify({ username, password }),
+  })
+  csrfToken = result.csrf
+  return result
+}
+
+export async function logout(): Promise<void> {
+  await request('/api/auth/logout', { method: 'POST' })
+  csrfToken = ''
 }
 
 export interface ChatMessage {
@@ -50,15 +77,20 @@ export interface ChatApproval {
 export interface ChatSnapshot {
   revision: number
   assistant_id: string
-  reset: { id: string; assistant_id: string; status: 'stopping' | 'blocked'; reason?: 'unknown' | 'timeout' | 'error' | null } | null
+  reset: { id: string; assistant_id: string; status: 'stopping' | 'deleting' | 'blocked'; deletion_started?: boolean; reason?: 'unknown' | 'timeout' | 'error' | null } | null
   messages: ChatMessage[]
+  next_before: number | null
   approvals: ChatApproval[]
   permission_mode: string
   context_usage: { used: number; window: number }
 }
 
 export function getChat(): Promise<ChatSnapshot> {
-  return request('/api/chat')
+  return request('/api/chat?limit=50')
+}
+
+export function getChatPage(before: number): Promise<ChatSnapshot> {
+  return request(`/api/chat?limit=50&before=${before}`)
 }
 
 export function sendChatMessage(assistantId: string, clientMessageId: string, text: string, mode?: string, attachments: string[] = []): Promise<unknown> {

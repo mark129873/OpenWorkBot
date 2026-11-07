@@ -23,7 +23,7 @@ def _env_int(name: str, default: int) -> int:
 
 @dataclass
 class Settings:
-    llm_provider: str = "anthropic"
+    llm_provider: str = "openai"
     anthropic_api_key: str = field(default="")
     anthropic_base_url: str = field(default="")
     openai_api_key: str = field(default="")
@@ -40,6 +40,7 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8100
     data_dir: Path = field(default=BACKEND_ROOT / "data")
+    workspaces_dir: Path = field(default=BACKEND_ROOT / "workspaces")
 
     log_level: str = "INFO"
 
@@ -58,7 +59,7 @@ def load_settings() -> Settings:
         modelio_dir = BACKEND_ROOT / modelio_dir
 
     return Settings(
-        llm_provider=_env_str("LLM_PROVIDER", "anthropic").lower(),
+        llm_provider="openai",
         anthropic_api_key=_env_str("ANTHROPIC_API_KEY"),
         anthropic_base_url=_env_str("ANTHROPIC_BASE_URL"),
         openai_api_key=_env_str("OPENAI_API_KEY"),

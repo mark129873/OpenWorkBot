@@ -16,9 +16,10 @@ from app.agent.llm import build_client
 from app.agent.model_call import record_model_step
 from app.agent.task_tools import DIRECT_TOOLS, FIRST_ACTION_TOOLS, MAIN_TOOLS, ROUTE, SHARED_TOOLS
 from app.config import settings, validate_llm_config
-from app.models import LocalSetting, Part, new_id
+from app.models import LocalSetting, Part, User, new_id
 from app.sessions import chat_store as store
 from app.sessions import execution_state, session_permissions
+from app.user_context import require_user, scoped, unscoped
 
 logger = logging.getLogger(__name__)
 _TERMINAL = {"completed", "failed", "stopped"}
@@ -49,7 +50,7 @@ def _task_summary(task: dict) -> dict:
 def _task_context(session, priority: str | None = None) -> tuple[list[dict], bool]:
     kind = func.json_extract(Part.data, "$.type")
     status = func.json_extract(Part.data, "$.status")
-    base = select(Part).where(Part.message_id == "main:control", kind == "task_state")
+    base = select(Part).where(Part.message_id == scoped("main:control"), kind == "task_state")
     active = list(session.scalars(base.where(status.not_in(_TERMINAL))
                 .order_by(func.json_extract(Part.data, "$.order"), Part.id).limit(_TASK_ACTIVE_LIMIT + 1)))
     recent = list(session.scalars(base.where(status.in_(_TERMINAL))
@@ -57,7 +58,7 @@ def _task_context(session, priority: str | None = None) -> tuple[list[dict], boo
     omitted = len(active) > _TASK_ACTIVE_LIMIT or len(recent) > _TASK_RECENT_LIMIT
     active, recent = active[:_TASK_ACTIVE_LIMIT], recent[:_TASK_RECENT_LIMIT]
     if priority:
-        row = session.get(Part, f"task:{priority}")
+        row = session.get(Part, scoped(f"task:{priority}"))
         if row:
             if store.read(row)["status"] in _TERMINAL:
                 omitted |= len(recent) == _TASK_RECENT_LIMIT and all(item.id != row.id for item in recent)
@@ -83,12 +84,21 @@ class Conflict(ValueError):
 
 
 class Runtime:
-    def __init__(self, client=None) -> None:
+    def __init__(self, client=None, *, user_id: str | None = None, checkpointer=None, memory=None) -> None:
+        self.user_id = user_id or require_user()
+        from langgraph.checkpoint.memory import InMemorySaver
+        from app.agent.graph import AgentGraph
+        from app.agent.memory import Memory
+
+        self.graph = AgentGraph(checkpointer if checkpointer is not None else InMemorySaver())
+        self.memory = memory if memory is not None else Memory()
+        self.owns_memory = memory is None
+        self.memory_reads: set[asyncio.Task] = set()
         self.data_dir = settings.data_dir
         self.client = client if client is not None else (build_client(settings) if not validate_llm_config(settings) else None)
         self.lock = asyncio.Lock()
         self.wake = asyncio.Event()
-        self.subscribers: set[asyncio.Queue] = set()
+        self.subscribers: dict[asyncio.Queue, int | None] = {}
         self.main_call: asyncio.Task | None = None
         self.main_loop: asyncio.Task | None = None
         self.scheduler: asyncio.Task | None = None
@@ -101,63 +111,75 @@ class Runtime:
         self.stops: dict[str, asyncio.Event] = {}
         self.file_locks: dict[str, asyncio.Lock] = {}
         self.upload_locks: dict[str, asyncio.Lock] = {}
-        from app.agent.rag_client import RagClient
-        self.rag = RagClient()
         self.generation = 0
+        self.main_memory = ""
         self.closing = False
 
+    def _check_user(self) -> None:
+        if require_user() != self.user_id:
+            raise PermissionError("运行时不属于当前用户")
+
     async def start(self) -> None:
-        session_permissions.forget_session("main")
-        with db.new_session() as session:
-            store.initialize(session, settings.data_dir)
-            meta = store.get(session, "meta")
-            unknown = False
-            for approval in store.records(session, "approval"):
-                if approval["status"] == "requested":
-                    approval["status"] = "expired"
-                    store.put(session, f"approval:{approval['request_id']}", approval)
-            for execution in store.records(session, "tool_execution"):
-                if execution["status"] == "started":
-                    unknown = True
-                    execution.update(status="completed", result_unknown=True,
-                                     output="Error: 工具结果未知，可能已产生副作用；请先检查，不要自动重跑。")
-                    store.put(session, f"execution:{execution['id']}", execution)
-            if meta.get("reset") and unknown:
-                meta["reset"].update(status="blocked", reason="unknown")
-                store.put(session, "meta", meta)
-            for task in store.records(session, "task_state"):
-                if task["status"] in {"running", "waiting_user"}:
-                    task["status"] = "stopped" if task.get("stop_requested") else "running" if task.get("direct") else "queued"
-                    store.put(session, f"task:{task['id']}", task)
-            for helper in store.records(session, "agent_run"):
-                if helper["status"] in {"running", "waiting_user"}:
-                    task = store.get(session, f"task:{helper['task_id']}")
-                    helper["status"] = "stopped" if not task or task.get("stop_requested") else "queued"
-                    store.put(session, f"helper:{helper['context_id']}", helper)
-            for waiting in store.records(session, "file_wait"):
-                if waiting.get("status") == "waiting":
-                    row_key = waiting.get("key")
-                    if row_key:
-                        waiting["status"] = "completed"
-                        store.put(session, row_key, waiting)
-            for message in store.visible(session):
-                if message["status"] == "streaming":
-                    store.update_visible(session, message["id"], status="interrupted")
-            meta = store.get(session, "meta")
-            unfinished = (any(t["status"] not in _TERMINAL for t in store.records(session, "task_state"))
-                          or any(r["status"] == "pending" for r in store.records(session, "main_reply")))
-            if self.client is None and unfinished and not meta.get("config_warned"):
-                store.add_visible(session, "assistant", "模型配置不完整，未完成的任务和回复会保留；请检查模型配置。", status="failed")
-                meta["config_warned"] = True
-                store.put(session, "meta", meta)
-            elif self.client is not None and meta.get("config_warned"):
-                meta["config_warned"] = False
-                store.put(session, "meta", meta)
-            store.bump(session)
-            session.commit()
+        self._check_user()
+        from app.agent.tools import workspace_root
+
+        workspace_root().mkdir(parents=True, exist_ok=True)
+        session_permissions.forget_session(scoped("main"))
+        async with self.graph.write_lock:
+            with db.new_session() as session:
+                store.initialize(session, settings.data_dir)
+                meta = store.get(session, "meta")
+                unknown = False
+                for approval in store.records(session, "approval"):
+                    if approval["status"] == "requested":
+                        approval["status"] = "expired"
+                        store.put(session, f"approval:{approval['request_id']}", approval)
+                for execution in store.records(session, "tool_execution"):
+                    if execution["status"] == "started":
+                        unknown = True
+                        execution.update(status="completed", result_unknown=True,
+                                         output="Error: 工具结果未知，可能已产生副作用；请先检查，不要自动重跑。")
+                        store.put(session, f"execution:{execution['id']}", execution)
+                if meta.get("reset") and unknown:
+                    meta["reset"].update(status="blocked", reason="unknown")
+                    store.put(session, "meta", meta)
+                elif (meta.get("reset") or {}).get("deletion_started"):
+                    meta["reset"].update(status="deleting", reason=None)
+                    store.put(session, "meta", meta)
+                for task in store.records(session, "task_state"):
+                    if task["status"] in {"running", "waiting_user"} and not task.get("delivery_unknown"):
+                        task["status"] = "stopped" if task.get("stop_requested") else "running" if task.get("direct") else "queued"
+                        store.put(session, f"task:{task['id']}", task)
+                for helper in store.records(session, "agent_run"):
+                    if helper["status"] in {"running", "waiting_user"}:
+                        task = store.get(session, f"task:{helper['task_id']}")
+                        helper["status"] = ("stopped" if not task or task.get("stop_requested") else
+                                            "waiting_user" if task.get("delivery_unknown") else "queued")
+                        store.put(session, f"helper:{helper['context_id']}", helper)
+                for waiting in store.records(session, "file_wait"):
+                    if waiting.get("status") == "waiting":
+                        row_key = waiting.get("key")
+                        if row_key:
+                            waiting["status"] = "completed"
+                            store.put(session, row_key, waiting)
+                for message in store.visible(session):
+                    if message["status"] == "streaming":
+                        store.update_visible(session, message["id"], status="interrupted")
+                meta = store.get(session, "meta")
+                unfinished = (any(t["status"] not in _TERMINAL for t in store.records(session, "task_state"))
+                              or any(r["status"] == "pending" for r in store.records(session, "main_reply")))
+                if self.client is None and unfinished and not meta.get("config_warned"):
+                    store.add_visible(session, "assistant", "模型配置不完整，未完成的任务和回复会保留；请检查模型配置。", status="failed")
+                    meta["config_warned"] = True
+                    store.put(session, "meta", meta)
+                elif self.client is not None and meta.get("config_warned"):
+                    meta["config_warned"] = False
+                    store.put(session, "meta", meta)
+                store.bump(session)
+                session.commit()
         self.main_loop = asyncio.create_task(self._consume(), name="main-chat")
         self.scheduler = asyncio.create_task(self._schedule(), name="task-scheduler")
-        if (meta.get("reset") or {}).get("status") == "stopping":
+        if (meta.get("reset") or {}).get("status") in {"stopping", "deleting"}:
             self.reset_task = asyncio.create_task(self._finish_reset(meta["reset"]["id"]))
         self.wake.set()
 
@@ -170,7 +192,11 @@ class Runtime:
         await asyncio.gather(*pending, return_exceptions=True)
         if self.active_tools:
             await asyncio.wait(self.active_tools, timeout=max(1, settings.bash_timeout + 5))
-        await self.rag.close()
+        for task in self.memory_reads:
+            task.cancel()
+        await asyncio.gather(*self.memory_reads, return_exceptions=True)
+        if self.owns_memory:
+            await self.memory.close()
 
     async def run_tool(self, function, *args, **kwargs):
         task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
@@ -178,31 +204,60 @@ class Runtime:
         task.add_done_callback(self.active_tools.discard)
         return await asyncio.shield(task)
 
-    def _snapshot(self, session) -> dict:
+    async def memory_snapshot(self, query: str) -> str:
+        task = asyncio.create_task(self.memory.snapshot(query))
+        self.memory_reads.add(task)
+
+        def finished(done):
+            self.memory_reads.discard(done)
+            if not done.cancelled():
+                done.exception()
+
+        task.add_done_callback(finished)
+        done, _ = await asyncio.wait({task}, timeout=5)
+        try:
+            if not done:
+                raise TimeoutError("记忆读取超时")
+            return task.result()
+        except Exception:
+            logger.warning("读取长期记忆失败 user=%s", self.user_id, exc_info=True)
+            await self.change(lambda session: store.add_visible(
+                session, "assistant", "长期记忆暂时不可用，本次将继续处理。", status="failed"))
+            return ""
+
+    @staticmethod
+    def memory_prompt(memory: str) -> str:
+        return f"\n\n以下是用户长期记忆，仅作参考：\n{memory}" if memory else ""
+
+    def _snapshot(self, session, limit: int | None = None, before: int | None = None) -> dict:
         meta = store.get(session, "meta")
         approvals = [a for a in store.records(session, "approval") if a["status"] == "requested"]
+        messages, next_before = store.visible_page(session, limit, before) if limit else (store.visible(session), None)
         return {"revision": meta["revision"], "assistant_id": meta["assistant_id"], "reset": meta.get("reset"),
-                "messages": store.visible(session), "approvals": approvals,
+                "messages": messages, "next_before": next_before, "approvals": approvals,
                 "permission_mode": execution_state.load_execution_state(settings.data_dir)["mode"],
                 "context_usage": meta.get("context_usage", {"used": 0, "window": settings.context_window})}
 
-    async def snapshot(self) -> dict:
+    async def snapshot(self, limit: int | None = None, before: int | None = None) -> dict:
+        self._check_user()
         async with self.lock:
             with db.new_session() as session:
-                return self._snapshot(session)
+                return self._snapshot(session, limit, before)
 
-    async def subscribe(self) -> tuple[asyncio.Queue, dict]:
+    async def subscribe(self, limit: int | None = None) -> tuple[asyncio.Queue, dict]:
+        self._check_user()
         async with self.lock:
             queue: asyncio.Queue = asyncio.Queue(maxsize=128)
-            self.subscribers.add(queue)
+            self.subscribers[queue] = limit
             with db.new_session() as session:
-                return queue, self._snapshot(session)
+                return queue, self._snapshot(session, limit)
 
     def unsubscribe(self, queue: asyncio.Queue) -> None:
-        self.subscribers.discard(queue)
+        self.subscribers.pop(queue, None)
 
     async def change(self, action, kind: str = "message"):
-        async with self.lock:
+        self._check_user()
+        async with self.lock, self.graph.write_lock:
             with db.new_session() as session:
                 result = action(session)
                 meta = store.bump(session)
@@ -210,18 +265,86 @@ class Runtime:
                 for task in store.records(session, "task_state"):
                     if task.get("stop_requested"):
                         self.stops.setdefault(task["id"], asyncio.Event()).set()
-                snapshot = self._snapshot(session)
-            event = {"revision": meta["revision"], "type": kind, "data": snapshot}
-            for queue in list(self.subscribers):
+                snapshots = {limit: self._snapshot(session, limit) for limit in set(self.subscribers.values())}
+            for queue, limit in list(self.subscribers.items()):
                 try:
-                    queue.put_nowait(event)
+                    queue.put_nowait({"revision": meta["revision"], "type": kind, "data": snapshots[limit]})
                 except asyncio.QueueFull:
-                    self.subscribers.discard(queue)
+                    self.subscribers.pop(queue, None)
                     while not queue.empty():
                         queue.get_nowait()
                     queue.put_nowait(None)
             self.wake.set()
             return result
+
+    async def deliver_message(self, message: dict) -> bool:
+        identity = message["id"]
+
+        def begin(session):
+            row = store.get(session, f"bus:{identity}")
+            if not row or row["delivery"] in {"delivered", "processed"}:
+                return row, False
+            if row["delivery"] == "unknown":
+                return row, False
+            fresh = row["delivery"] == "pending"
+            if fresh:
+                row["delivery"] = "applying"
+                store.put(session, f"bus:{identity}", row)
+            return row, fresh
+
+        row, fresh = await self.change(begin)
+        if not row:
+            return False
+        if row["delivery"] in {"delivered", "processed"}:
+            return True
+        if row["delivery"] == "unknown":
+            return False
+        envelope = {key: row.get(key) for key in ("id", "source", "context_id", "task_id", "run_id", "content")}
+        try:
+            if fresh:
+                await self.graph.invoke(row["context_id"], incoming=envelope)
+                applied = True
+            else:
+                applied = await self.graph.has_delivery(row["context_id"], envelope)
+        except Exception:
+            logger.exception("内部消息检查点写入失败 id=%s", identity)
+            try:
+                applied = await self.graph.has_delivery(row["context_id"], envelope)
+            except Exception:
+                logger.exception("无法确认内部消息检查点 id=%s", identity)
+                applied = False
+        if not applied:
+            def uncertain(session):
+                current = store.get(session, f"bus:{identity}")
+                if current and current["delivery"] == "applying":
+                    current["delivery"] = "unknown"
+                    store.put(session, f"bus:{identity}", current)
+                    task = store.get(session, f"task:{current['task_id']}")
+                    if task and task["status"] not in _TERMINAL:
+                        task.update(status="waiting_user", delivery_unknown=True)
+                        store.put(session, f"task:{task['id']}", task)
+                    helper = store.get(session, f"helper:{current['context_id']}")
+                    if helper and helper["status"] not in _TERMINAL:
+                        helper["status"] = "waiting_user"
+                        store.put(session, f"helper:{current['context_id']}", helper)
+                    store.add_visible(session, "assistant", "一条内部消息的送达状态无法确定，相关任务已暂停，请检查后处理。", status="failed")
+            await self.change(uncertain)
+            return False
+
+        def acknowledge(session):
+            current = store.get(session, f"bus:{identity}")
+            if current and current["delivery"] == "applying":
+                agent_bus.deliver(session, current)
+        await self.change(acknowledge)
+        return True
+
+    async def reconcile_incoming(self, context_id: str) -> bool:
+        with db.new_session() as session:
+            messages = store.records(session, "agent_message", context_id=context_id)
+        for message in messages:
+            if message["delivery"] in {"applying", "unknown"} and not await self.deliver_message(message):
+                return False
+        return True
 
     @staticmethod
     def _check_assistant(session, assistant_id: str) -> None:
@@ -342,10 +465,14 @@ class Runtime:
                 if current.get("reason") == "unknown":
                     current["confirmed_unknown_ids"] = [item["id"] for item in store.records(session, "tool_execution")
                                                         if _unknown_execution(item)]
-                current.update(status="stopping", reason=None)
+                current.update(status="deleting" if current.get("deletion_started") else "stopping", reason=None)
             else:
                 unknown = any(_unknown_execution(execution) for execution in store.records(session, "tool_execution"))
-                current = {"id": reset_id, "assistant_id": assistant_id, "status": "blocked" if unknown else "stopping"}
+                current = {"id": reset_id, "assistant_id": assistant_id, "status": "blocked" if unknown else "stopping",
+                           "deletion_started": False}
+                user = session.get(User, self.user_id)
+                if user:
+                    user.generation += 1
                 if unknown:
                     current["reason"] = "unknown"
                 for event in store.records(session, "user_event"):
@@ -371,11 +498,12 @@ class Runtime:
             return current
 
         result = await self.change(begin, "reset")
-        if result["status"] in {"stopping", "blocked"}:
+        if result["status"] in {"stopping", "deleting", "blocked"}:
+            self.memory.discard_pending(self.user_id)
             self.generation += 1
             if self.main_call and not self.main_call.done() and not self.main_call.cancelling():
                 self.main_call.cancel()
-            if result["status"] == "stopping" and (not self.reset_task or self.reset_task.done()):
+            if result["status"] in {"stopping", "deleting"} and (not self.reset_task or self.reset_task.done()):
                 self.reset_task = asyncio.create_task(self._finish_reset(reset_id))
         return result
 
@@ -390,6 +518,8 @@ class Runtime:
             current = meta.get("reset")
             if assistant_id != meta["assistant_id"] or not current or current["id"] != reset_id:
                 raise Conflict("删除请求已失效，请刷新后重试")
+            if current.get("deletion_started"):
+                raise Conflict("已开始删除，不能取消")
             result = {"id": reset_id, "assistant_id": assistant_id, "status": "cancelled"}
             meta.update(reset=None, last_reset=result)
             store.put(session, "meta", meta)
@@ -406,8 +536,10 @@ class Runtime:
             while True:
                 with db.new_session() as session:
                     current = store.get(session, "meta").get("reset")
-                if not current or current["id"] != reset_id or current["status"] != "stopping":
+                if not current or current["id"] != reset_id or current["status"] not in {"stopping", "deleting"}:
                     return
+                if current.get("deletion_started"):
+                    break
                 active = [task for task in [self.main_call, *self.workers.values(),
                                             *self.direct_calls.values(), *self.active_tools] if task and not task.done()]
                 if not active:
@@ -422,11 +554,13 @@ class Runtime:
                     return
                 await asyncio.sleep(0.1)
 
-            def finish(session):
+            def prepare(session):
                 meta = store.get(session, "meta")
                 current = meta.get("reset")
-                if not current or current["id"] != reset_id or current["status"] != "stopping":
-                    return
+                if not current or current["id"] != reset_id or current["status"] not in {"stopping", "deleting"}:
+                    return None
+                if current.get("deletion_started"):
+                    return current
                 executions = store.records(session, "tool_execution")
                 for execution in executions:
                     if execution["status"] == "started":
@@ -437,7 +571,7 @@ class Runtime:
                 if any(_unknown_execution(item) and item["id"] not in confirmed for item in executions):
                     current.update(status="blocked", reason="unknown")
                     store.put(session, "meta", meta)
-                    return
+                    return None
                 for task in store.records(session, "task_state"):
                     if task["status"] not in _TERMINAL:
                         task.update(status="stopped", stop_requested=True)
@@ -446,17 +580,37 @@ class Runtime:
                     if helper["status"] not in _TERMINAL:
                         helper["status"] = "stopped"
                         store.put(session, f"helper:{helper['context_id']}", helper)
-                archive_id = store.archive(session)
+                current.update(status="deleting", deletion_started=True,
+                               thread_ids=[item["thread_id"] for item in store.records(session, "graph_thread")])
+                store.put(session, "meta", meta)
+                return current
+
+            current = await self.change(prepare, "reset")
+            if not current:
+                return
+            await self.memory.clear()
+            for thread_id in current.get("thread_ids", []):
+                await self.graph.delete_thread(thread_id)
+            from app.agent.memory import _io
+            from app.modelio import clear_user_logs
+            await _io(clear_user_logs)
+
+            def finish(session):
+                meta = store.get(session, "meta")
+                current = meta.get("reset")
+                if not current or current["id"] != reset_id or not current.get("deletion_started"):
+                    return
+                store.clear(session)
                 new_assistant_id = new_id()
                 store.put(session, "meta", {"type": "meta", "revision": meta["revision"],
                           "user_seq": meta["user_seq"], "assistant_id": new_assistant_id, "reset": None,
-                          "last_reset": {**current, "status": "completed", "new_assistant_id": new_assistant_id,
-                                         "archive_id": archive_id}})
+                          "last_reset": {"id": reset_id, "assistant_id": current["assistant_id"],
+                                         "status": "completed", "new_assistant_id": new_assistant_id}})
                 key = ("project", execution_state.project_id(settings.data_dir), "permission", "mode")
                 row = session.get(LocalSetting, key)
                 if row:
                     row.value = json.dumps({"mode": "build"})
-                session_permissions.forget_session("main")
+                session_permissions.forget_session(scoped("main"))
                 self.stops.clear()
                 self.file_locks.clear()
                 self.approval_events.clear()
@@ -484,7 +638,7 @@ class Runtime:
             if replies:
                 return "reply", min(replies, key=lambda item: item["source_seq"])
             reports = [row for row in store.records(session, "agent_message", context_id="main")
-                       if row["delivery"] in {"pending", "delivered"} and row.get("retry_at", 0) <= time.time()]
+                       if row["delivery"] in {"pending", "applying", "delivered"} and row.get("retry_at", 0) <= time.time()]
             return ("report", reports[0]) if reports else (None, None)
 
     async def _consume(self) -> None:
@@ -498,11 +652,18 @@ class Runtime:
                     except asyncio.TimeoutError:
                         pass
                     continue
+                with db.new_session() as session:
+                    user = session.get(User, self.user_id)
+                    memory_generation = user.generation if user else None
+                query = item.get("text") or item.get("content") or ""
+                self.main_memory = await self.memory_snapshot(query)
                 operation = (self._input(item) if kind == "user" else self._resume_reply(item) if kind == "reply"
                              else self._report(item))
                 self.main_call = asyncio.create_task(operation)
+                completed = False
                 try:
                     await self.main_call
+                    completed = True
                 except asyncio.CancelledError:
                     if self.closing:
                         raise
@@ -513,6 +674,12 @@ class Runtime:
                     await self._error_item(kind, item, error)
                 finally:
                     self.main_call = None
+                if completed and self.client and memory_generation is not None:
+                    with db.new_session() as session:
+                        meta = store.get(session, "meta")
+                        history = store.history(session, "main")[-12:]
+                    if not meta.get("reset") and history:
+                        self.memory.enqueue(self.client, history, memory_generation, role="main")
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -566,9 +733,8 @@ class Runtime:
             visible = store.visible(session)
             current_order = next((m["order"] for m in visible if m["id"] == event["message_id"]), 0)
             recent = [m for m in visible if m["order"] <= current_order][-12:]
-        route_prompt = (_PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt() + "\n\n判断新消息与任务的关系；仅返回 route_input。"
-                        "知识库查询、入库、查看、移出一律使用 create 交给后台助手；用户未要求入库时不得入库。"
-                        "单纯的知识库问答标记 knowledge_question=true，包含其他工作的任务不得标记。"
+        route_prompt = (_PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt() + self.memory_prompt(self.main_memory) + "\n\n判断新消息与任务的关系；仅返回 route_input。"
+                        "知识库与宿主命令暂不可用。"
                         "简单问答以及只需少量操作、预计可快速完成的简单任务使用 chat，由主助手直接处理。"
                         "复杂、耗时或适合并行的独立新任务使用 create，交给后台助手；instruction 要保留用户的限制。"
                         "简单任务需要工具或历史查询需要搜索时，同时在 first_action 中给出第一个工具及完整参数，"
@@ -588,11 +754,13 @@ class Runtime:
         messages.append({"role": "user", "content": json.dumps(request, ensure_ascii=False)})
         deps = SimpleNamespace(client=self.client, recorder=SimpleNamespace(session_id="main", turn_id=event["id"]))
         with record_model_step(deps, route_prompt, messages, [ROUTE]) as reply:
-            async for part in self.client.stream(system=route_prompt, messages=messages, tools=[ROUTE],
-                                                  tool_choice={"type": "tool", "name": "route_input"}):
-                if generation != self.generation:
-                    raise asyncio.CancelledError
-                reply.accept(part)
+            async def route_step():
+                async for part in self.client.stream(system=route_prompt, messages=messages, tools=[ROUTE],
+                                                      tool_choice={"type": "tool", "name": "route_input"}):
+                    if generation != self.generation:
+                        raise asyncio.CancelledError
+                    reply.accept(part)
+            await self.graph.invoke("main", history=messages, memory=self.main_memory, action=route_step)
         if generation != self.generation:
             raise asyncio.CancelledError
         if reply.stop_reason == "max_tokens" or len(reply.tool_uses) != 1 or reply.tool_uses[0].get("name") != "route_input":
@@ -677,7 +845,7 @@ class Runtime:
                 task = self.create_task(session, intent["instruction"], event["user_seq"],
                                         key=f"route:{event['id']}:{index}",
                                         knowledge_question=intent.get("knowledge_question", False))
-                notes.append(f"已创建任务 {task['title']}（{task['id']}）")
+                notes.append("该任务请求已处理" if task.get("processed") else f"已创建任务 {task['title']}（{task['id']}）")
             elif kind in {"update", "stop"}:
                 task = store.get(session, f"task:{task_id}")
                 if not task:
@@ -787,6 +955,8 @@ class Runtime:
         identity = key or new_id()
         old = store.get(session, f"task-key:{identity}")
         if old:
+            if old.get("processed"):
+                return {"processed": True}
             if (old["goal"] != goal or old.get("title") != title
                     or old.get("knowledge_question", False) != knowledge_question):
                 raise ValueError("相同任务调用 ID 的参数不一致")
@@ -804,11 +974,8 @@ class Runtime:
         return task
 
     async def _report(self, report: dict) -> None:
-        def deliver(session):
-            row = store.get(session, f"bus:{report['id']}")
-            if row and row["delivery"] == "pending":
-                agent_bus.deliver(session, row)
-        await self.change(deliver)
+        if not await self.deliver_message(report):
+            return
         with db.new_session() as session:
             report = store.get(session, f"bus:{report['id']}")
             task = store.get(session, f"task:{report['task_id']}")
@@ -841,7 +1008,7 @@ class Runtime:
         if report.get("kind") == "direct":
             await self._dialog("请根据直接执行的工具结果继续处理并回复用户。", allow_direct=True,
                                direct_task_id=report["task_id"], direct_report_id=report["id"])
-            await self.change(lambda session: agent_bus.processed(session, store.get(session, f"bus:{report['id']}")))
+            await self.change(lambda session: self._finish_report(session, report))
             return
         current_review = (report.get("kind") == "review" and task and task["status"] == "reviewing"
                           and task.get("run_id") == report.get("run_id") and not report.get("reviewed"))
@@ -855,7 +1022,17 @@ class Runtime:
                 task = store.get(session, f"task:{required}")
             if task and task["status"] == "reviewing":
                 raise ValueError("任务判断未完成")
-        await self.change(lambda session: agent_bus.processed(session, store.get(session, f"bus:{report['id']}")))
+        await self.change(lambda session: self._finish_report(session, report))
+
+    @staticmethod
+    def _finish_report(session, report: dict) -> None:
+        row = store.get(session, f"bus:{report['id']}")
+        if row:
+            agent_bus.processed(session, row)
+        task = store.get(session, f"task:{report['task_id']}")
+        if task and task["status"] in _TERMINAL and report.get("kind") in {"review", "result", "direct"}:
+            task["result_sent"] = True
+            store.put(session, f"task:{task['id']}", task)
 
     async def _reconcile(self, report: dict) -> None:
         generation = self.generation
@@ -879,17 +1056,19 @@ class Runtime:
             return
         prompt = ("重新判断一条较早的任务修改或停止要求。后续用户消息和审批以先后顺序为准；"
                   "如果较早要求与较新决定冲突，返回 chat 表示不再执行；无冲突则保留原意图；"
-                  "无法判断时返回 unclear 并要求澄清。只能针对给定任务，不能创建新任务或返回 first_action。仅调用 route_input。")
+                  "无法判断时返回 unclear 并要求澄清。只能针对给定任务，不能创建新任务或返回 first_action。仅调用 route_input。") + self.memory_prompt(self.main_memory)
         request = {"message_id": event["message_id"], "user_seq": event["user_seq"], "original_intent": pending["intent"],
                    "task": task, "later_user_events": later, "approvals": approvals}
         messages = [{"role": "user", "content": json.dumps(request, ensure_ascii=False)}]
         deps = SimpleNamespace(client=self.client, recorder=SimpleNamespace(session_id="main", turn_id=report["id"]))
         with record_model_step(deps, prompt, messages, [ROUTE]) as reply:
-            async for item in self.client.stream(system=prompt, messages=messages, tools=[ROUTE],
-                                                 tool_choice={"type": "tool", "name": "route_input"}):
-                if generation != self.generation:
-                    raise asyncio.CancelledError
-                reply.accept(item)
+            async def reconcile_step():
+                async for item in self.client.stream(system=prompt, messages=messages, tools=[ROUTE],
+                                                     tool_choice={"type": "tool", "name": "route_input"}):
+                    if generation != self.generation:
+                        raise asyncio.CancelledError
+                    reply.accept(item)
+            await self.graph.invoke("main", history=messages, memory=self.main_memory, action=reconcile_step)
         if generation != self.generation:
             raise asyncio.CancelledError
         if reply.stop_reason == "max_tokens" or len(reply.tool_uses) != 1 or reply.tool_uses[0].get("name") != "route_input":
@@ -956,7 +1135,7 @@ class Runtime:
                 task_note += "直接执行已达到 40 步上限，请停止并说明；后续工作可分配后台助手。"
             messages.append({"role": "user", "content": f"{note}\n{task_note}\n当前任务：{store.dump(tasks)}"})
             deps = SimpleNamespace(client=self.client, recorder=SimpleNamespace(session_id="main", turn_id=new_id()))
-            system_prompt = _PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt()
+            system_prompt = _PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt() + self.memory_prompt(self.main_memory)
             dialog_tools = [tool for tool in MAIN_TOOLS if (required_review or tool["name"] != "task_review")
                             and (not recovered or tool["name"] != "task_create")] + SHARED_TOOLS
             if allow_direct and (not direct_task_id or (direct_task and direct_task["status"] not in _TERMINAL
@@ -969,19 +1148,22 @@ class Runtime:
             try:
                 with record_model_step(deps, system_prompt, messages, dialog_tools) as reply:
                     choice = {"tool_choice": {"type": "tool", "name": "task_review"}} if required_review and step == 0 else {}
-                    async for event in self.client.stream(system=system_prompt, messages=messages,
-                                                          tools=dialog_tools, **choice):
-                        if generation != self.generation:
-                            raise asyncio.CancelledError
-                        reply.accept(event)
-                        if event.get("type") == "text_delta" and event.get("text"):
-                            text += event["text"]
-                            if message_id is None:
-                                message_id = await self.change(lambda session: store.add_visible(session, "assistant", text, status="streaming"))
-                                saved_length, last_update = len(text), time.monotonic()
-                            elif len(text) - saved_length >= 64 or time.monotonic() - last_update >= 0.12:
-                                await self.change(lambda session: store.update_visible(session, message_id, text=text))
-                                saved_length, last_update = len(text), time.monotonic()
+                    async def dialog_step():
+                        nonlocal text, message_id, saved_length, last_update
+                        async for event in self.client.stream(system=system_prompt, messages=messages,
+                                                              tools=dialog_tools, **choice):
+                            if generation != self.generation:
+                                raise asyncio.CancelledError
+                            reply.accept(event)
+                            if event.get("type") == "text_delta" and event.get("text"):
+                                text += event["text"]
+                                if message_id is None:
+                                    message_id = await self.change(lambda session: store.add_visible(session, "assistant", text, status="streaming"))
+                                    saved_length, last_update = len(text), time.monotonic()
+                                elif len(text) - saved_length >= 64 or time.monotonic() - last_update >= 0.12:
+                                    await self.change(lambda session: store.update_visible(session, message_id, text=text))
+                                    saved_length, last_update = len(text), time.monotonic()
+                    await self.graph.invoke("main", history=messages, memory=self.main_memory, action=dialog_step)
                 if generation != self.generation:
                     raise asyncio.CancelledError
                 if reply.stop_reason == "max_tokens":
@@ -1017,7 +1199,7 @@ class Runtime:
                             if direct_task_id:
                                 task = store.get(session, f"task:{direct_task_id}")
                                 if task and task["status"] not in _TERMINAL:
-                                    task.update(status="failed", direct_phase="finished")
+                                    task.update(status="failed", direct_phase="finished", result_sent=True)
                                     store.put(session, f"task:{direct_task_id}", task)
                                     self._release_dependents(session, task)
                                 if direct_report_id:
@@ -1054,6 +1236,7 @@ class Runtime:
                                 task["status"] = ("stopped" if task.get("stop_requested") else
                                                   "failed" if task.get("direct_failed") else "completed")
                                 task["direct_phase"] = "finished"
+                                task["result_sent"] = True
                                 store.put(session, f"task:{direct_task_id}", task)
                                 self._release_dependents(session, task)
                             if direct_report_id:
@@ -1176,6 +1359,8 @@ class Runtime:
                 task = store.get(session, f"task:{task_id}")
             worker = Worker(self, task_id)
             worker.context_id, worker.run_id = task["context_id"], task["run_id"]
+            if not await self.reconcile_incoming(worker.context_id):
+                return
             try:
                 await worker.process_group(group_id)
             except Exception:
@@ -1197,6 +1382,12 @@ class Runtime:
                     group["status"] = "completed"
                     store.put(session, f"group:{group_id}", group)
                 await self.change(fail_group)
+            with db.new_session() as session:
+                messages = store.records(session, "agent_message", context_id=worker.context_id)
+            for message in messages:
+                if message["delivery"] in {"pending", "applying", "unknown"}:
+                    if not await self.deliver_message(message):
+                        return
             def report(session):
                 current = store.get(session, f"task:{task_id}")
                 group = store.get(session, f"group:{group_id}")
@@ -1204,9 +1395,8 @@ class Runtime:
                            for identity in group["calls"]
                            if (execution := store.get(session, f"execution:{identity}"))]
                 updates = [item for item in store.records(session, "agent_message", context_id=current["context_id"],
-                                                          delivery="pending") if item["source"] == "main"]
+                                                          delivery="delivered") if item["source"] == "main"]
                 for item in updates:
-                    agent_bus.deliver(session, item)
                     agent_bus.processed(session, item)
                 current["direct_phase"] = "reporting"
                 current["direct_failed"] = any(item["output"].startswith("Error:") for item in outputs)
@@ -1228,6 +1418,8 @@ class Runtime:
         identity = f"main:{call.get('id', '')}"
         old = store.get(session, f"action:{identity}")
         if old:
+            if old.get("processed"):
+                return "已处理"
             if old["name"] != name or old["input"] != args:
                 return "Error: 相同工具调用 ID 的参数不一致"
             return old["output"]
@@ -1240,20 +1432,24 @@ class Runtime:
 
     def _main_action(self, session, name: str, args: dict, source_seq: int | None, identity: str,
                      review_report_id: str | None = None) -> str:
+        from app.agent import coordination
+
+        if name in coordination.NAMES:
+            return coordination.call(session, name, args, actor="main", task_id=None, request_id=identity)
         if name == "task_create":
             order = source_seq or store.get(session, "meta")["user_seq"]
             if type(args.get("knowledge_question", False)) is not bool:
                 return "Error: 知识库问答标记无效"
             task = self.create_task(session, args["goal"], order, key=identity, title=args.get("title"),
                                     knowledge_question=args.get("knowledge_question", False))
-            return f"已受理任务 {task['title']}，ID：{task['id']}"
+            return "已处理" if task.get("processed") else f"已受理任务 {task['title']}，ID：{task['id']}"
         if name == "read_tool_output":
             return read_output(session, args)
         if name == "task_search":
             keyword, offset = args.get("keyword"), args.get("offset", 0)
             if not isinstance(keyword, str) or len(keyword) > 100 or not _valid_offset(offset):
                 return "Error: 查询关键词或偏移量无效"
-            query = select(Part).where(Part.message_id == "main:control",
+            query = select(Part).where(Part.message_id == scoped("main:control"),
                                        func.json_extract(Part.data, "$.type") == "task_state")
             if keyword.strip():
                 term = keyword.strip().casefold()
@@ -1277,7 +1473,7 @@ class Runtime:
             if not _valid_offset(offset) or not _valid_offset(report_offset):
                 return "Error: 查询偏移量无效"
             reports = list(session.scalars(select(Part).where(
-                Part.message_id == "main:control", func.json_extract(Part.data, "$.type") == "agent_message",
+                Part.message_id == scoped("main:control"), func.json_extract(Part.data, "$.type") == "agent_message",
                 func.json_extract(Part.data, "$.task_id") == task_id,
                 func.json_extract(Part.data, "$.kind").in_(["review", "result"])
             ).order_by(Part.sequence.desc(), Part.id.desc()).offset(report_offset).limit(4)))
@@ -1329,7 +1525,8 @@ class Runtime:
                            and h["status"] not in {"completed", "failed", "stopped"}]
                 if helpers and decision == "complete":
                     return "Error: 协助助手仍在执行，须先收口协助工作"
-                pending = store.records(session, "agent_message", context_id=task["context_id"], delivery="pending")
+                pending = [message for message in store.records(session, "agent_message", context_id=task["context_id"])
+                           if message["delivery"] in {"pending", "applying", "unknown", "delivered"}]
                 if pending and decision == "complete":
                     return "Error: 任务还有未处理消息，请继续处理后再判断完成"
                 task["status"] = {"complete": "completed", "fail": "failed", "stop": "stopped"}[decision]
@@ -1371,12 +1568,19 @@ class Runtime:
                 root_wait |= wait["context_id"] == task["context_id"]
                 wait["status"] = "completed"
                 store.put(session, wait["key"], wait)
-        if task["status"] in {"queued", "waiting_dependency", "reviewing"}:
-            if root_wait:
+        if task["status"] in {"queued", "waiting_dependency", "reviewing"} or task.get("delivery_unknown"):
+            if root_wait and not task.get("delivery_unknown"):
                 task["status"] = "queued"
             else:
                 task["status"] = "stopped"
                 self._release_dependents(session, task)
+                agent_bus.send(session, source="runtime", target="main", task_id=task["id"],
+                               content=f"任务【{task['title']}】已停止。", kind="result",
+                               message_id=f"stopped:{task['id']}")
+                for helper in store.records(session, "agent_run"):
+                    if helper["task_id"] == task["id"] and helper["status"] == "waiting_user":
+                        helper["status"] = "stopped"
+                        store.put(session, f"helper:{helper['context_id']}", helper)
         store.put(session, f"task:{task['id']}", task)
 
     def _release_dependents(self, session, completed: dict) -> None:
@@ -1408,7 +1612,7 @@ class Runtime:
             try:
                 with db.new_session() as session:
                     direct = [] if store.get(session, "meta").get("reset") else [task for task in store.records(session, "task_state")
-                              if task.get("direct_phase") == "executing"]
+                              if task.get("direct_phase") == "executing" and not task.get("delivery_unknown")]
                 for task in direct:
                     group = task["direct_group"]
                     if group not in self.direct_calls:
@@ -1417,12 +1621,106 @@ class Runtime:
                         call.add_done_callback(lambda done, key=group: self._direct_done(key, done))
                 if self.client is not None:
                     await self._schedule_once()
+                await self._cleanup_finished()
                 await asyncio.sleep(0.2)
             except asyncio.CancelledError:
                 raise
             except Exception:
                 logger.exception("后台任务调度失败")
                 await asyncio.sleep(1)
+
+    async def _cleanup_finished(self) -> None:
+        with db.new_session() as session:
+            if store.get(session, "meta").get("reset"):
+                return
+            tasks = store.records(session, "task_state")
+            helpers = store.records(session, "agent_run")
+            messages = store.records(session, "agent_message")
+        active_contexts = {"main", *(item["context_id"] for item in [*tasks, *helpers]
+                                    if item["status"] not in _TERMINAL)}
+        dead = [item for item in messages if item["context_id"] not in active_contexts
+                and item["delivery"] in {"pending", "delivered"}]
+        if dead:
+            def notify(session):
+                for item in dead:
+                    current = store.get(session, f"bus:{item['id']}")
+                    if not current or current["delivery"] not in {"pending", "delivered"}:
+                        continue
+                    current["delivery"] = "failed"
+                    store.put(session, f"bus:{current['id']}", current)
+                    agent_bus.send(session, source="runtime", target="main", task_id=current["task_id"], kind="undelivered",
+                                   content=f"目标助手已结束，以下内部消息未能继续处理，请判断：{current['content']}",
+                                   message_id=f"undelivered:{current['id']}")
+            await self.change(notify)
+            return
+        for task in tasks:
+            if task["status"] not in _TERMINAL or not task.get("result_sent"):
+                continue
+            owned_helpers = [item for item in helpers if item["task_id"] == task["id"]]
+            if any(item["status"] not in _TERMINAL for item in owned_helpers):
+                continue
+            keys = [task["id"], *(f"helper:{item['context_id']}" for item in owned_helpers)]
+            if any(key in self.workers and not self.workers[key].done() for key in keys):
+                continue
+            contexts = {task["context_id"], *(item["context_id"] for item in owned_helpers)}
+            relevant = [item for item in messages if item.get("task_id") == task["id"]]
+            if any(item["delivery"] not in {"processed", "failed"} for item in relevant):
+                continue
+            await self._cleanup_task(task["id"], contexts)
+
+    async def _cleanup_task(self, task_id: str, contexts: set[str]) -> None:
+        def prepare(session):
+            task = store.get(session, f"task:{task_id}")
+            if not task or task["status"] not in _TERMINAL or not task.get("result_sent"):
+                return None
+            if any(item["task_id"] == task_id and item["status"] not in _TERMINAL
+                   for item in store.records(session, "agent_run")):
+                return None
+            if any(item.get("task_id") == task_id and item["delivery"] not in {"processed", "failed"}
+                   for item in store.records(session, "agent_message")):
+                return None
+            if not task.get("cleanup"):
+                threads = [item["thread_id"] for item in store.records(session, "graph_thread")
+                           if item["context_id"] in contexts]
+                task["cleanup"] = {"contexts": sorted(contexts), "threads": threads}
+                store.put(session, f"task:{task_id}", task)
+            return task["cleanup"]
+
+        cleanup = await self.change(prepare)
+        if not cleanup:
+            return
+        for thread_id in cleanup["threads"]:
+            await self.graph.delete_thread(thread_id)
+
+        def remove(session):
+            task = store.get(session, f"task:{task_id}")
+            if not task or not task.get("cleanup"):
+                return
+            active_contexts = {item["context_id"] for item in store.records(session, "task_state")
+                               if item["id"] != task_id and item["status"] not in _TERMINAL}
+            active_contexts.update(item["context_id"] for item in store.records(session, "agent_run")
+                                   if item["task_id"] != task_id and item["status"] not in _TERMINAL)
+            rows = list(session.scalars(select(Part).where(Part.message_id == scoped("main:control"))))
+            for row in rows:
+                value = store.read(row)
+                key = unscoped(row.id)
+                if value.get("type") == "task_key" and value.get("task_id") == task_id:
+                    identity = key.removeprefix("task-key:")
+                    row.data = store.dump({"type": "task_key", "processed": True})
+                    action = session.get(Part, scoped(f"action:{identity}"))
+                    if action:
+                        action.data = store.dump({"type": "agent_action", "processed": True})
+                elif value.get("type") in {"publication", "coord_action"} and value.get("task_id") == task_id:
+                    row.data = store.dump({"type": value["type"], "processed": True})
+                elif value.get("type") == "shared_state":
+                    owner = value.get("task_id")
+                    if owner and (owner == task_id or not store.get(session, f"task:{owner}")) and not active_contexts.intersection(value.get("readers", [])):
+                        session.delete(row)
+                elif (value.get("task_id") == task_id or value.get("context_id") in cleanup["contexts"]):
+                    if value.get("type") == "agent_message" and value.get("delivery") not in {"processed", "failed"}:
+                        continue
+                    session.delete(row)
+        await self.change(remove)
 
     def _direct_done(self, group: str, call: asyncio.Task) -> None:
         self.direct_calls.pop(group, None)
@@ -1433,7 +1731,8 @@ class Runtime:
         waits = [wait for wait in store.records(session, "agent_wait") if wait.get("status") == "waiting"]
         if not waits:
             return False, {}
-        messages = store.records(session, "agent_message", delivery="pending")
+        messages = [message for message in store.records(session, "agent_message")
+                    if message["delivery"] in {"pending", "applying", "delivered"}]
         changed = False
         orders = {}
         for wait in waits:
@@ -1463,7 +1762,7 @@ class Runtime:
 
     async def _schedule_once(self) -> None:
         from app.agent.worker import run_worker
-        async with self.lock:
+        async with self.lock, self.graph.write_lock:
             with db.new_session() as session:
                 if store.get(session, "meta").get("reset"):
                     return
@@ -1474,12 +1773,13 @@ class Runtime:
                     store.bump(session)
                     session.commit()
                 active = [worker for worker in self.workers.values() if not worker.done()]
-                if len(active) >= 3:
+                if len(active) >= 6:
                     return
                 reviewing = [t["order"] for t in tasks if t["status"] == "reviewing"]
-                candidates = [t for t in tasks if t["status"] == "queued" and t["id"] not in self.workers
+                candidates = [t for t in tasks if t["status"] == "queued" and not t.get("delivery_unknown") and t["id"] not in self.workers
                               and (t.get("stop_requested") or not reviewing or t["order"] <= min(reviewing))]
-                helpers = [h for h in helpers if h["status"] == "queued"
+                paused = {task["id"] for task in tasks if task.get("delivery_unknown")}
+                helpers = [h for h in helpers if h["status"] == "queued" and h["task_id"] not in paused
                            and f"helper:{h['context_id']}" not in self.workers]
                 urgent = [h for h in helpers if h["context_id"] in orders
                           and (not reviewing or orders[h["context_id"]] <= min(reviewing))]

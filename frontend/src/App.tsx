@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { ChatTeardropText, GearSix, ShieldCheck, Trash } from '@phosphor-icons/react'
 
-import { ApiError, cancelAssistantReset, decideChatApproval, getChat, resetAssistant, sendChatMessage, uploadChatFile, type ChatApproval, type ChatSnapshot, type ExecutionDraft } from './api/client'
+import { ApiError, authenticate, cancelAssistantReset, decideChatApproval, getAuthSession, getChat, getChatPage, logout, resetAssistant, sendChatMessage, uploadChatFile, type ChatApproval, type ChatSnapshot, type ExecutionDraft } from './api/client'
 import { Composer } from './components/Composer'
 import { MarkdownWithCopy, UserBubble } from './components/MessageItem'
 import { TokenBadge } from './components/TokenBadge'
@@ -10,6 +10,60 @@ import type { ApprovalOptionId } from './types'
 import './workspace.css'
 
 export default function App() {
+  const [username, setUsername] = useState<string | null | undefined>(undefined)
+  const [error, setError] = useState<string | null>(null)
+  useEffect(() => {
+    void getAuthSession().then((session) => setUsername(session.username))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : '登录状态加载失败'))
+  }, [])
+  if (username === undefined) return <div className="app-shell grid place-items-center text-sm text-zinc-600">{error ?? '正在连接…'}</div>
+  if (username === null) return <Login onAuthenticated={setUsername} />
+  return <Workspace key={username} username={username} onLogout={() => {
+    setError(null)
+    void logout().then(getAuthSession).then(() => setUsername(null))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : '退出失败'))
+  }} logoutError={error} />
+}
+
+function Login({ onAuthenticated }: { onAuthenticated: (username: string) => void }) {
+  const [username, setUsername] = useState('')
+  const [password, setPassword] = useState('')
+  const [register, setRegister] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const submit = (event: React.FormEvent) => {
+    event.preventDefault()
+    if (busy) return
+    setBusy(true)
+    setError(null)
+    void authenticate(username, password, register).then((session) => {
+      if (session.username) onAuthenticated(session.username)
+    }).catch((e: unknown) => setError(e instanceof Error ? e.message : '操作失败'))
+      .finally(() => setBusy(false))
+  }
+  return <div className="app-shell grid place-items-center bg-zinc-50 p-6">
+    <form onSubmit={submit} className="w-full max-w-sm rounded-2xl border border-zinc-200 bg-white p-7 shadow-sm">
+      <h1 className="text-xl font-semibold text-zinc-900">{register ? '注册账号' : '登录 OpenWorkBot'}</h1>
+      <label className="mt-6 block text-sm text-zinc-700">账号名
+        <input value={username} onChange={(e) => setUsername(e.target.value)} required maxLength={128}
+          autoComplete="username" className="mt-2 block w-full rounded-lg border border-zinc-300 px-3 py-2" />
+      </label>
+      <label className="mt-4 block text-sm text-zinc-700">密码
+        <input value={password} onChange={(e) => setPassword(e.target.value)} required maxLength={256} type="password"
+          autoComplete={register ? 'new-password' : 'current-password'} className="mt-2 block w-full rounded-lg border border-zinc-300 px-3 py-2" />
+      </label>
+      {error && <p role="alert" className="mt-4 text-sm text-red-700">{error}</p>}
+      <button type="submit" disabled={busy} className="mt-6 w-full rounded-lg bg-zinc-900 px-4 py-2.5 text-sm font-semibold text-white disabled:opacity-50">
+        {busy ? '处理中…' : register ? '注册' : '登录'}
+      </button>
+      <button type="button" onClick={() => { setRegister(!register); setError(null) }} className="mt-4 w-full text-sm text-zinc-600 underline">
+        {register ? '已有账号？登录' : '没有账号？注册'}
+      </button>
+    </form>
+  </div>
+}
+
+function Workspace({ username, onLogout, logoutError }: { username: string; onLogout: () => void; logoutError: string | null }) {
   const [chat, setChat] = useState<ChatSnapshot | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [menuOpen, setMenuOpen] = useState(false)
@@ -20,20 +74,38 @@ export default function App() {
   const retryIds = useRef(new Map<string, string>())
   const sending = useRef(new Set<string>())
   const bottom = useRef<HTMLDivElement>(null)
+  const scrollArea = useRef<HTMLDivElement>(null)
+  const scrollRestore = useRef<{ height: number; top: number } | null>(null)
+  const historyAssistant = useRef<string | null>(null)
+  const latestRevision = useRef(-1)
+  const before = useRef<number | null>(null)
+  const loadingOlder = useRef(false)
+  const [hasOlder, setHasOlder] = useState(false)
   const menu = useRef<HTMLDivElement>(null)
   const settingsButton = useRef<HTMLButtonElement>(null)
   const resetId = useRef<string | null>(null)
   const previousAssistant = useRef<string | null>(null)
 
   const update = useCallback((next: ChatSnapshot) => {
-    setChat((current) => !current || next.revision > current.revision ? next : current)
+    if (next.revision <= latestRevision.current) return
+    latestRevision.current = next.revision
+    if (historyAssistant.current !== next.assistant_id) {
+      historyAssistant.current = next.assistant_id
+      before.current = next.next_before
+      setHasOlder(next.next_before !== null)
+    }
+    setChat((current) => {
+      if (!current || current.assistant_id !== next.assistant_id) return next
+      const ids = new Set(next.messages.map((message) => message.id))
+      return { ...next, messages: [...current.messages.filter((message) => !ids.has(message.id)), ...next.messages] }
+    })
   }, [])
 
   useEffect(() => {
     let active = true
     void getChat().then((snapshot) => { if (active) update(snapshot) })
       .catch((e: unknown) => { if (active) setError(e instanceof Error ? e.message : '聊天加载失败') })
-    const source = new EventSource('/api/chat/events')
+    const source = new EventSource('/api/chat/events?limit=50')
     source.onmessage = (event) => {
       try {
         const envelope = JSON.parse(event.data) as { data: ChatSnapshot }
@@ -64,10 +136,34 @@ export default function App() {
     return () => document.removeEventListener('mousedown', onDown)
   }, [menuOpen])
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    if (scrollRestore.current && scrollArea.current) {
+      scrollArea.current.scrollTop = scrollRestore.current.top + scrollArea.current.scrollHeight - scrollRestore.current.height
+      scrollRestore.current = null
+      return
+    }
     const reduced = window.matchMedia('(prefers-reduced-motion: reduce)').matches
     bottom.current?.scrollIntoView({ behavior: reduced ? 'instant' : 'smooth', block: 'end' })
   }, [chat?.messages, chat?.approvals])
+
+  const loadOlder = () => {
+    const cursor = before.current, assistantId = historyAssistant.current
+    if (cursor === null || loadingOlder.current || !assistantId) return
+    loadingOlder.current = true
+    const area = scrollArea.current
+    void getChatPage(cursor).then((page) => {
+      if (historyAssistant.current !== assistantId || page.assistant_id !== assistantId) return
+      before.current = page.next_before
+      setHasOlder(page.next_before !== null)
+      if (area) scrollRestore.current = { height: area.scrollHeight, top: area.scrollTop }
+      setChat((current) => {
+        if (!current || current.assistant_id !== assistantId) return current
+        const ids = new Set(current.messages.map((message) => message.id))
+        return { ...current, messages: [...page.messages.filter((message) => !ids.has(message.id)), ...current.messages] }
+      })
+    }).catch((e: unknown) => setError(e instanceof Error ? e.message : '加载历史失败'))
+      .finally(() => { loadingOlder.current = false })
+  }
 
   const send = (text: string, execution: ExecutionDraft, onAccepted?: (remaining?: File[]) => void, files: File[] = []) => {
     if (!chat || chat.reset || resetBusy) return
@@ -136,6 +232,7 @@ export default function App() {
   }
 
   const closeDialog = () => {
+    if (chat?.reset?.deletion_started) return
     if (chat?.reset || resetId.current) void changeReset(true)
     else if (!resetBusy) { setDialogOpen(false); setResetError(null); resetId.current = null; settingsButton.current?.focus() }
   }
@@ -149,7 +246,7 @@ export default function App() {
     <div className="app-shell flex">
       <main className="flex min-w-0 flex-1 flex-col bg-white">
         <header className="workspace-header">
-          <h1 className="min-w-0 flex-1 truncate text-[14px] font-semibold text-zinc-800">助手</h1>
+          <h1 className="min-w-0 flex-1 truncate text-[14px] font-semibold text-zinc-800">助手 · {username}</h1>
           <TokenBadge used={chat?.context_usage.used} window={chat?.context_usage.window} />
           <div ref={menu} className="relative" onKeyDown={(event) => {
             if (event.key === 'Escape') { setMenuOpen(false); settingsButton.current?.focus() }
@@ -159,12 +256,14 @@ export default function App() {
             {menuOpen && <div id="assistant-settings" role="group" aria-label="助手设置" className="floating-menu absolute right-0 top-full z-20 mt-2 w-40 rounded-xl bg-white p-2">
               <button type="button" disabled={!chat || !!chat.reset} onClick={() => { setMenuOpen(false); setDialogOpen(true) }}
                 className="flex w-full items-center gap-2 rounded-lg px-3 py-2 text-left text-[13px] text-red-700 hover:bg-red-50 disabled:opacity-50"><Trash size={16} />删除</button>
+              <button type="button" onClick={onLogout} className="flex w-full rounded-lg px-3 py-2 text-left text-[13px] text-zinc-700 hover:bg-zinc-50">退出登录</button>
             </div>}
           </div>
         </header>
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 py-8 sm:px-8">
+        <div ref={scrollArea} onScroll={(event) => { if (event.currentTarget.scrollTop < 80) loadOlder() }} className="min-h-0 flex-1 overflow-y-auto px-5 py-8 sm:px-8">
           {chat && (chat.messages.length > 0 || chat.approvals.length > 0) ? (
             <div className="mx-auto max-w-[800px] space-y-10">
+              {hasOlder && <button type="button" onClick={loadOlder} className="block text-sm text-zinc-500 underline">加载更早消息</button>}
               {timeline.map((item) => item.kind === 'approval'
                 ? <ApprovalCard key={item.approval.request_id} approval={item.approval}
                     disabled={!!chat?.reset || resetBusy}
@@ -187,7 +286,7 @@ export default function App() {
           )}
           <div ref={bottom} />
         </div>
-        {error && <div role="alert" className="mx-5 mb-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[13px] text-amber-800">{error}</div>}
+        {(error || logoutError) && <div role="alert" className="mx-5 mb-2 rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-[13px] text-amber-800">{error || logoutError}</div>}
         <Composer disabled={!chat || !!chat.reset || resetBusy} streaming={false} assistantId={chat?.assistant_id} permission={{ mode: chat?.permission_mode ?? 'build' }}
           onSend={send} onStop={() => {}} />
       </main>
@@ -229,22 +328,23 @@ function ResetDialog({ reset, busy, error, onCancel, onConfirm }: {
   return <div className="fixed inset-0 z-50 flex items-center justify-center bg-zinc-900/30 p-4 backdrop-blur-[3px]">
     <div ref={dialog} role="dialog" aria-modal="true" aria-labelledby="reset-title" aria-describedby="reset-description"
       tabIndex={-1} className="approval-dialog max-h-[90dvh] w-full max-w-[520px] overflow-y-auto rounded-[20px] border border-zinc-200 bg-white p-6 shadow-[0_24px_80px_#30261826]">
-      <h2 id="reset-title" className="text-[18px] font-semibold text-zinc-900">删除助手</h2>
+      <h2 id="reset-title" className="text-[18px] font-semibold text-zinc-900">重置助手</h2>
       <div id="reset-description" className="mt-4 space-y-3 text-[13px] leading-6 text-zinc-600">
-        <p>将停止正在运行的任务，归档当前对话、任务和结果，并自动创建全新的助手。此版本暂不提供归档查看入口。</p>
-        <p>已开始的操作可能产生的影响无法撤销。工作区文件、项目权限规则、模型连接配置和模型调用日志会保留；日志可能包含旧对话。</p>
-        <p>权限模式会恢复为“变更前确认”，本会话授权会清除。新助手不会自动继承旧对话和任务，仍可按权限访问共享工作区。</p>
+        <p>将停止当前账号的任务，删除聊天、任务、检查点、长期记忆和该账号的模型日志，再创建全新的助手。</p>
+        <p>工作区文件和其他账号的数据会保留。无法确认账号归属的旧模型日志会保留。</p>
+        <p>权限模式会恢复为“变更前确认”，本会话授权会清除。已开始删除后不能取消。</p>
       </div>
       {reset && <p role="status" className="mt-4 rounded-lg bg-amber-50 px-3 py-2 text-[13px] leading-6 text-amber-800">
         {reset.status === 'stopping' ? '正在等待任务和已开始的操作停止…'
+          : reset.status === 'deleting' ? '正在删除旧数据，请等待完成…'
           : unknown ? '重启前有操作的结果未知。请检查并确认该操作已停止，再继续删除。'
-          : reset.reason === 'timeout' ? '仍有操作未停止，删除尚未完成。可稍后重试或取消。'
-          : '删除未完成，请重试或取消。'}
-        <span className="mt-1 block">取消删除后，已停止的任务不会自动恢复。</span>
+          : reset.reason === 'timeout' ? '仍有操作未停止，请稍后重试。'
+          : '删除未完成，请重试。'}
+        {!reset.deletion_started && <span className="mt-1 block">取消删除后，已停止的任务不会自动恢复。</span>}
       </p>}
       {error && <p role="alert" className="mt-3 text-[13px] text-red-700">{error}</p>}
       <div className="mt-6 flex flex-wrap justify-end gap-3">
-        <button type="button" disabled={busy} onClick={onCancel} className="rounded-xl border border-zinc-300 px-4 py-2.5 text-[13px] text-zinc-700 hover:bg-zinc-50 disabled:opacity-50">取消</button>
+        <button type="button" disabled={busy || !!reset?.deletion_started} onClick={onCancel} className="rounded-xl border border-zinc-300 px-4 py-2.5 text-[13px] text-zinc-700 hover:bg-zinc-50 disabled:opacity-50">取消</button>
         {(!reset || reset.status === 'blocked') && <button type="button" disabled={busy} onClick={() => onConfirm(unknown)}
           className="rounded-xl bg-red-700 px-4 py-2.5 text-[13px] font-semibold text-white hover:bg-red-800 disabled:opacity-50">
           {busy ? '处理中…' : unknown ? '确认操作已停止并继续' : reset ? '重试删除' : '删除并新建'}

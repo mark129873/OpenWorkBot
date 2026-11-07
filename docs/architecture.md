@@ -2,9 +2,9 @@
 
 本文记录主聊天、多助手与已批准的 RAG 技术设计和运行边界；实现状态见进度记录。
 
-已确认以 DeerFlow Gateway 为主体改造；当前实现基线仍以本文为准，目标与待审批细节见 [deerflow_design.md](deerflow_design.md)。
+第 1–12 节记录改造前的历史基线；当前实现和差异以第 13 节为准。原 `deerflow_design.md` 和 `deerflow_runtime_design.md` 为历史草案。
 
-## 1. 当前基线
+## 1. 改造前基线
 
 React / TypeScript → FastAPI 主聊天接口 → 主助手与 Runtime → 最多三个独立 Worker → 权限与工具 → SQLite / SSE。主助手每轮最多 40 步，Worker 每轮最多 30 步，任务和上下文独立持久化并支持恢复。
 
@@ -23,7 +23,7 @@ Skill 从 `backend/skills/<name>/SKILL.md` 发现：主助手和 Worker 的系�
 - 主对话与各任务上下文独立保存和压缩，不将所有 Worker 工作细节塞进主对话。
 - Bot 使用单个 FastAPI 进程、`asyncio`、现有模型、SQLite 与 SSE。最多三个 Worker 执行槽位；Bot 不引入 Redis、Celery、LangGraph、任务表、Kanban 或长期记忆模块。独立 RAG 服务可使用 LangGraph。
 
-## 3. 目标架构与代码结构
+## 3. 改造前架构与代码结构
 
     主聊天 ── HTTP / SSE ── FastAPI
                               │ lifespan / app.state
@@ -186,3 +186,64 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 - 评测裁判在 `rag/.env` 用 `EVAL_REASONING_EFFORT` 和 `EVAL_TEMPERATURE` 配置，默认 `medium` 和 `none`；温度 `none` 或留空时不传。RAGAS 参数映射不得覆盖设置，评测结果记录配置。
 - 保留现有历史格式和 SQLite 表；请求时转换消息、工具调用及结果，流式聚合完整参数，支持指定工具与用量。参数无效、流中断或输出截断时不得执行不完整工具调用。
 - 延续现有授权、上下文压缩和恢复语义，密钥不进入日志；用假服务及独立空库测试。用户填写真实配置并通知后再做真实调用。
+
+## 13. DeerFlow 参考改造
+
+参考本地 DeerFlow `2a16b26960cb953cd3283702d018bd7dce6b80b7`，在本项目自行实现；未批准或不清楚的设计和实现先与用户同步。
+
+### 13.1 已确认目标
+
+    用户 ↔ 现有前端 / Gateway ↔ 主 Agent（独立上下文）
+                                     ↕ 提交任务 / 运行反馈
+                            协调器 / Runtime
+                                     ↕ 调度 / 生命周期 / 并发
+                        后台 Worker × 多个（各自独立上下文）
+
+    主 Agent + 各 Worker ↔ Shared State（任务 / 进度 / 结果）
+    主 Agent + 各 Worker ↔ Message Bus（请求 / 事件 / 通知）
+    应用状态和重要消息 + 各 Agent 检查点 → 同一 SQLite 文件
+
+保留 README 的主 Agent、独立后台 Worker 和 2.1 Shared State + Message Bus；沿用 Vite 前端及现有调度规则。
+
+### 13.2 DeerFlow 已核实机制
+
+| 能力 | 源码现状与差异 |
+| --- | --- |
+| Agent 运行 | `AgentRuns` 提供独立线程、启动 / 取消、`steer` 和输入查询；`RunInputControl` 可在运行中处理输入，原生子 Agent 生命周期仍与父 Run 关联。`task` 不能直接代替独立 Worker；默认关闭的 `batch_task` 可能在租约过期后重试，适合只读或幂等任务。 |
+| Agent Teams | 示例提供用户隔离、独立 Agent Run、定向请求、结果回传和共享状态，但无固定主 Agent、完整发布订阅或自动重连；成员请求按会话排队，示例最多八个活动任务。附件捕获 / 导入要求 POSIX，Windows 兼容性未验证。 |
+| 存储 | Gateway 的应用数据、LangGraph Store 和检查点默认共用 SQLite；Teams 示例另用 SQLite，`run_events.backend` 默认是 `memory`。DeerMem 以用户 JSON 摘要和 Agent Markdown 事实为主存储，FTS 使用独立 SQLite 索引。 |
+| 记忆 | 默认 middleware 模式，首次运行注入会话快照，轮次后异步提取；防抖 30 秒、最多 100 条事实、置信度阈值 0.7、注入预算 2,000 token。待提取队列在内存中，异常退出可能丢失待处理内容；`clear_memory(user_id, agent_name=None)` 清除该用户摘要和全部 Agent 事实。 |
+| 沙箱 / 认证 | LocalSandbox 默认关闭宿主命令，不提供系统级用户隔离；`allow_host_bash` 不约束 MCP / 自定义工具。本地邮箱密码允许自助注册，OIDC 和可选细粒度授权默认关闭。 |
+
+### 13.3 协调、消息与任务
+
+- Gateway 按认证用户绑定独立 Runtime、主助手、Worker、任务、消息、审批及工作区，拒绝跨用户访问和伪造发送者。主助手和 Worker 分别保存上下文；Shared State 支持按任务或类型分页、版本冲突校验，Message Bus 支持定向发送及发布订阅，后加入者不回放旧消息。
+- 业务数据和 LangGraph 异步检查点使用同一 SQLite 文件的不同表，关键检查点同步写入；应用事务与检查点事务协调写入以避免相互阻塞。任务、待发送消息在业务事务中持久化，进程内事件只作唤醒。消息在模型步骤或工具执行后的安全边界处理，消息和投递 ID 先写入目标检查点，再确认总线送达；无法确认时暂停并提示核查。目标已结束而消息未能处理时通知主助手，不自动重发。
+- 每用户最多六个后台 Worker，保留任务顺序、依赖让位、审批占槽、主助手 40 步和 Worker 30 步的单轮限制；退出登录、切换账号、断线和主回复被打断不会取消后台工作。Worker 最终结果超过 16 KiB 时按 UTF-8 字符边界截断并提示。
+- 成功、失败及停止的任务，在结果送达且依赖和通知处理后清理；先记录清理状态、删除 Worker 检查点，再在业务事务中删除任务数据并保留仅含请求 ID 的去重标记。中断后继续清理；未确认消息保留。主聊天结果、用户文件、长期记忆和模型日志保留。
+- 不设置团队累计 100 个请求、共享状态 20 条 / 16,000 字节总量、最近消息 100 条、任务查询偏移 200、每 Run 16 条 / 64 KiB 或单根任务 12 个关联请求的示例限制；按需分页和现有上下文压缩仍限制单次模型输入。
+
+### 13.4 恢复与授权
+
+- 用户显式切换 build / edit / yolo 后，运行中和重启恢复的任务使用最新有效模式；文件审批继续沿用现有规则，重启后临时会话授权失效。已完成的工具结果复用，已开始但结果未知的工具不得自动重跑。
+- 启动时按用户恢复安全的未完成工作，停止或等待中的任务遵循现有调度规则；检查点与业务状态不是同一事务，未知投递或外部操作必须等待核查。只允许启用的账号登录和创建运行时。
+
+### 13.5 长期记忆、重置与工作区
+
+- 每用户一份共享记忆：摘要为 JSON、事实为 Markdown，使用独立 SQLite FTS5 和 jieba 搜索分词；主 Agent 写入，Worker 只读。静默 30 秒后按用户顺序后台提取，置信度至少 0.7，按置信度最多保留 100 条，每次注入最多 2,000 token。每次新 Run 刷新快照；读取失败或超时提示用户并继续。待提取队列在内存中，异常退出可能丢失未提取内容。
+- 重置停止该用户所有 Agent、使旧记忆提取代号失效，删除其聊天、任务、检查点、记忆、FTS 索引及可确定归属的模型日志和轮转文件；新助手使用空白会话。旧版无法确认归属的日志保留并提示；其他用户和工作区不受影响。删除开始前可取消，开始后仅可等待或失败重试；重启继续未完成的删除。
+- 用户工作区为 `backend/workspaces/<用户 ID>/`，与 `backend/data/` 分开且不入 Git；本机旧工作区已移至 `C:/Users/nnnnnn/Desktop/OpenWorkBot_旧工作区`，不导入新账号。LocalSandbox 参考实现限定文件路径，宿主命令始终关闭；不提供系统级进程隔离。
+
+### 13.6 接口与配置
+
+- 保留 Vite 前端、`backend/app/main.py` Gateway 入口、`start.py` 启动方式以及聊天、上传、审批、重置和 SSE 接口。聊天默认兼容原完整历史返回，前端使用分页上翻；账号名和密码自行注册登录，Cookie 保存登录态，写请求校验 CSRF。首版仅监听和允许本机回环访问。
+- 主助手、Worker 和记忆提取共用 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`MODEL_ID` 指定的 OpenAI 兼容 Chat Completions；上下文压缩沿用 `CONTEXT_WINDOW` 等配置。`langgraph`、`langgraph-checkpoint-sqlite`、`jieba` 和 `tiktoken` 用于检查点及记忆；首次使用 token 词表可能需要联网。
+- 应用与检查点使用 `backend/data/app.db`，记忆文件放在 `backend/data/memory/`，FTS 索引使用 `backend/data/memory-index.sqlite`。不做旧数据库迁移，测试使用独立空库；重建前核对数据目录，不能删除用户工作区。Docker 和 PostgreSQL 待用户后续确认。
+- Agent 暂不开放 RAG MCP 工具；`rag/` 服务和数据保持独立，后续多用户接入须确认。
+
+### 13.7 验证与边界
+
+- 隔离空库及模拟模型测试覆盖用户隔离、检查点同步、消息状态不确定、任务清理、重置重试与重启、记忆代号屏障、中文检索、分页、认证和每用户六个 Worker。前端执行构建、lint、现有测试及本机登录页面检查；完整结果见 [progress.md](progress.md)。
+- 尚未使用真实模型复测本次改造，也未执行真实服务崩溃或断电试验；SQLite、记忆文件及独立 FTS 不构成跨文件原子事务。参考实现不复制 DeerFlow 源码，应用当前定位为本机使用。
+
+参考源码：[AgentRuns](../.github_deerflow/backend/packages/extension-api/deerflow_extension_api/agent_runs.py)、[Agent Teams](../.github_deerflow/examples/deerflow-extension-agent-teams/deerflow_extension_agent_teams/service.py)、[LocalSandbox](../.github_deerflow/backend/packages/harness/deerflow/sandbox/local/local_sandbox.py)、[记忆队列](../.github_deerflow/backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/queue.py)、[记忆存储](../.github_deerflow/backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/storage.py)。

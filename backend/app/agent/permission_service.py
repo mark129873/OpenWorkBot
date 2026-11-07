@@ -83,11 +83,7 @@ def _capability(tool_name: str, tool_input: dict) -> dict:
 
 def hard_deny_reason(tool_name: str, tool_input: dict) -> str | None:
     if tool_name == "bash":
-        command = str(tool_input.get("command", "")).lower()
-        for pattern in _DENY_PATTERNS:
-            if pattern in command:
-                return f"命令命中绝对禁止清单：{pattern.strip()}"
-        return None
+        return "当前沙箱禁止宿主命令"
     if tool_name in ("write_file", "edit_file", "delete_file", "read_file", "rag_ingest"):
         try:
             safe_path(str(tool_input.get("path", "")))

@@ -21,7 +21,7 @@ from app.sessions import chat_store as store
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "modelio_dir", tmp_path / "modelio")
-    (tmp_path / "workspace").mkdir()
+    (tmp_path / ("a" * 32)).mkdir()
     db.dispose_engine()
     db.init_db(tmp_path)
     yield tmp_path
@@ -35,7 +35,8 @@ def test_upload_overwrite_replay_and_file_only_message(isolated):
         await runtime.start()
         app = FastAPI()
         app.include_router(router)
-        app.state.runtime = runtime
+        from conftest import install_runtime
+        install_runtime(app, runtime)
         try:
             assistant = (await runtime.snapshot())["assistant_id"]
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
@@ -47,7 +48,7 @@ def test_upload_overwrite_replay_and_file_only_message(isolated):
                 assert first.json()["path"] == "uploads/a.txt"
                 assert (await put("two", b"second")).status_code == 200
                 assert (await put("one", b"first")).status_code == 200
-                assert (isolated / "workspace/uploads/a.txt").read_bytes() == b"second"
+                assert (isolated / ("a" * 32) / "uploads/a.txt").read_bytes() == b"second"
                 assert (await put("one", b"different")).status_code == 409
                 stale = await client.post("/api/chat/messages", json={
                     "assistant_id": assistant, "client_message_id": "stale", "attachments": ["one"]})
@@ -81,7 +82,8 @@ def test_upload_limit_and_invalid_filename(isolated, monkeypatch):
         await runtime.start()
         app = FastAPI()
         app.include_router(router)
-        app.state.runtime = runtime
+        from conftest import install_runtime
+        install_runtime(app, runtime)
         try:
             assistant = (await runtime.snapshot())["assistant_id"]
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
@@ -89,7 +91,7 @@ def test_upload_limit_and_invalid_filename(isolated, monkeypatch):
                 assert (await client.post("/api/chat/uploads", data=data, files={"file": ("a.txt", b"1234")})).status_code == 200
                 data["upload_id"] = "two"
                 assert (await client.post("/api/chat/uploads", data=data, files={"file": ("a.txt", b"12345")})).status_code == 400
-                assert (isolated / "workspace/uploads/a.txt").read_bytes() == b"1234"
+                assert (isolated / ("a" * 32) / "uploads/a.txt").read_bytes() == b"1234"
                 data["upload_id"] = "three"
                 assert (await client.post("/api/chat/uploads", data=data, files={"file": ("../escape.txt", b"x")})).status_code == 400
         finally:
@@ -123,7 +125,7 @@ def test_actual_100_mib_upload_boundary(isolated):
             assert accepted["size"] == MAX_UPLOAD
             with pytest.raises(ValueError, match="100 MiB"):
                 await upload(runtime, assistant, "too-large", StreamFile(MAX_UPLOAD + 1))
-            target = isolated / "workspace/uploads/large.bin"
+            target = isolated / ("a" * 32) / "uploads/large.bin"
             assert target.stat().st_size == MAX_UPLOAD
         finally:
             await runtime.close()
@@ -154,7 +156,7 @@ def test_reset_during_upload_does_not_replace_file(isolated):
         runtime = Runtime()
         runtime.client = None
         await runtime.start()
-        target = isolated / "workspace/uploads/a.txt"
+        target = isolated / ("a" * 32) / "uploads/a.txt"
         target.parent.mkdir()
         target.write_bytes(b"old")
         file = SlowFile()
@@ -172,31 +174,25 @@ def test_reset_during_upload_does_not_replace_file(isolated):
     asyncio.run(run())
 
 
-def test_rag_tools_are_worker_only_and_respect_rules(isolated):
+def test_rag_tools_are_not_available_to_agents(isolated):
     names = {item["name"] for item in RAG_TOOLS}
-    assert names <= {item["name"] for item in WORKER_TOOLS}
-    assert not names & {item["name"] for item in MAIN_TOOLS + DIRECT_TOOLS}
-    assert check_permission("build", {"deny": [{"toolName": "rag_remove"}]}, "rag_remove", {"document_id": "a"})["decision"] == "deny"
-    assert check_permission("build", {"ask": [{"toolName": "rag_ingest"}]}, "rag_ingest", {"path": "a.txt"})["decision"] == "ask"
-    assert check_permission("build", {}, "rag_ingest", {"path": "../outside.txt"})["decision"] == "deny"
-    assert check_permission("build", {}, "rag_ingest", {"path": "a.txt"})["decision"] == "allow"
+    assert not names & {item["name"] for item in MAIN_TOOLS + DIRECT_TOOLS + WORKER_TOOLS}
 
-    with db.new_session() as session:
-        store.initialize(session, isolated)
+    async def run():
         runtime = Runtime()
-        task = runtime.create_task(session, "将 a.txt 加入知识库", 1)
-        store.put(session, "input:one", {"type": "user_event", "event_type": "message", "user_seq": 1,
-                                         "user_text": "将 a.txt 加入知识库"})
-        session.commit()
-    worker = Worker(runtime, task["id"])
-    assert worker.knowledge_authorized("rag_ingest")
-    assert not worker.knowledge_authorized("rag_remove")
-    with db.new_session() as session:
-        store.put(session, "input:one", {"type": "user_event", "event_type": "message", "user_seq": 1,
-                                         "user_text": "查询知识库，不要将 a.txt 入库"})
-        session.commit()
-    assert not worker.knowledge_authorized("rag_ingest")
-
+        with db.new_session() as session:
+            store.initialize(session, isolated)
+            task = runtime.create_task(session, "查询知识库", 1)
+            task.update(status="running", run_id="run")
+            store.put(session, f"task:{task['id']}", task)
+            session.commit()
+        worker = Worker(runtime, task["id"])
+        worker.context_id, worker.run_id = task["context_id"], "run"
+        for name in names:
+            result = await worker.execute({"id": name, "name": name, "input": {}})
+            assert "暂不可用" in result
+        await runtime.close()
+    asyncio.run(run())
 
 def test_new_user_message_blocks_old_rag_operation(isolated):
     async def run():
@@ -250,126 +246,4 @@ def test_worker_reports_mcp_start_timeout(monkeypatch):
         assert "启动超时" in await client.call("rag_list", {})
         await asyncio.gather(client.task, return_exceptions=True)
         await client.close()
-    asyncio.run(run())
-
-
-def test_simple_rag_answer_is_delivered_without_main_model(isolated):
-    async def run():
-        runtime = Runtime()
-        runtime.client = None
-        with db.new_session() as session:
-            store.initialize(session, isolated)
-            task = runtime.create_task(session, "查询知识库问题", 1, knowledge_question=True)
-            task.update(status="running", run_id="run-one")
-            store.put(session, f"task:{task['id']}", task)
-            store.put(session, "execution:rag", {"type": "tool_execution", "id": "rag", "task_id": task["id"],
-                      "context_id": task["context_id"], "run_id": "run-one", "name": "rag_search",
-                      "status": "completed", "output": json.dumps({"status": "success",
-                      "answer": "事实。"}, ensure_ascii=False)})
-            session.commit()
-        worker = Worker(runtime, task["id"])
-        worker.context_id, worker.run_id = task["context_id"], "run-one"
-        await worker.finish("result", "完成")
-        with db.new_session() as session:
-            report = store.records(session, "agent_message", context_id="main")[0]
-            assert report["kind"] == "rag_answer"
-        await runtime._report(report)
-        snapshot = await runtime.snapshot()
-        assert snapshot["messages"][-1]["text"] == "事实。"
-        with db.new_session() as session:
-            assert store.get(session, f"task:{task['id']}")["status"] == "completed"
-        await runtime.close()
-    asyncio.run(run())
-
-
-def test_unknown_rag_write_is_not_replayed_without_new_user_request(isolated):
-    class FakeRag:
-        async def call(self, name, args):
-            return '{"status":"success"}'
-
-        async def close(self):
-            pass
-
-    async def run():
-        runtime = Runtime()
-        runtime.rag = FakeRag()
-        with db.new_session() as session:
-            store.initialize(session, isolated)
-            task = runtime.create_task(session, "将 a.txt 加入知识库", 1)
-            task.update(status="running", run_id="run-one")
-            store.put(session, f"task:{task['id']}", task)
-            store.put(session, "input:one", {"type": "user_event", "event_type": "message", "user_seq": 1,
-                                             "user_text": "将 a.txt 加入知识库"})
-            prior = {"type": "tool_execution", "id": "prior", "task_id": "previous-task",
-                     "context_id": task["context_id"], "run_id": "run-one", "name": "rag_ingest",
-                     "input": {"path": "a.txt"}, "status": "completed", "result_unknown": True, "user_seq": 1}
-            current = {**prior, "id": "current", "task_id": task["id"], "status": "pending",
-                       "result_unknown": False, "call_id": "call"}
-            store.put(session, "execution:prior", prior)
-            store.put(session, "execution:current", current)
-            session.commit()
-        worker = Worker(runtime, task["id"])
-        worker.context_id, worker.run_id = task["context_id"], "run-one"
-        assert "等待用户明确要求重试" in await worker.execute(current)
-        with db.new_session() as session:
-            task = store.get(session, f"task:{task['id']}")
-            store.put(session, "input:two", {"type": "user_event", "event_type": "message", "user_seq": 2,
-                                             "user_text": "继续任务"})
-            runtime._send_update(session, task, "继续任务", "update-two", 2)
-            for message in store.records(session, "agent_message", context_id=task["context_id"]):
-                message["delivery"] = "processed"
-                store.put(session, f"bus:{message['id']}", message)
-            session.commit()
-        assert "等待用户明确要求重试" in await worker.execute(current)
-        with db.new_session() as session:
-            task = store.get(session, f"task:{task['id']}")
-            store.put(session, "input:three", {"type": "user_event", "event_type": "message", "user_seq": 3,
-                                               "user_text": "再次将 a.txt 加入知识库"})
-            runtime._send_update(session, task, "再次将 a.txt 加入知识库", "update-three", 3)
-            for message in store.records(session, "agent_message", context_id=task["context_id"]):
-                message["delivery"] = "processed"
-                store.put(session, f"bus:{message['id']}", message)
-            session.commit()
-        assert '"success"' in await worker.execute(current)
-        await runtime.close()
-    asyncio.run(run())
-
-
-def test_stopping_worker_cancels_inflight_rag_operation(isolated):
-    class FakeRag:
-        def __init__(self):
-            self.started = asyncio.Event()
-            self.cancelled = None
-
-        async def call(self, name, args):
-            self.started.set()
-            await asyncio.Event().wait()
-
-        async def cancel(self, operation_id):
-            self.cancelled = operation_id
-
-        async def close(self):
-            pass
-
-    async def run():
-        runtime = Runtime()
-        runtime.rag = FakeRag()
-        with db.new_session() as session:
-            store.initialize(session, isolated)
-            task = runtime.create_task(session, "查询知识库", 1)
-            task.update(status="running", run_id="run-one")
-            store.put(session, f"task:{task['id']}", task)
-            execution = {"type": "tool_execution", "id": "current", "task_id": task["id"],
-                         "context_id": task["context_id"], "run_id": "run-one", "name": "rag_search",
-                         "input": {"query": "问题"}, "status": "pending", "call_id": "call"}
-            store.put(session, "execution:current", execution)
-            session.commit()
-        worker = Worker(runtime, task["id"])
-        worker.context_id, worker.run_id = task["context_id"], "run-one"
-        pending = asyncio.create_task(worker.execute(execution))
-        await runtime.rag.started.wait()
-        worker.stop.set()
-        assert "结果可能未知" in await asyncio.wait_for(pending, 2)
-        assert runtime.rag.cancelled == "current"
-        await runtime.close()
     asyncio.run(run())

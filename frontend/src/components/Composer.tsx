@@ -13,8 +13,8 @@ export interface ComposerProps {
 }
 const MODE_META: Record<string, { label: string; icon: typeof Hand; hint: string }> = {
   build: { label: '变更前确认', icon: Hand, hint: '有副作用的操作会先征求同意' },
-  edit: { label: '自动编辑', icon: ShieldCheck, hint: '文件编辑自动执行，命令仍需确认' },
-  yolo: { label: '完全访问', icon: ShieldWarning, hint: '允许的操作直接执行，禁止规则仍生效' },
+  edit: { label: '自动编辑', icon: ShieldCheck, hint: '文件编辑自动执行，删除仍需确认' },
+  yolo: { label: '工作区完全访问', icon: ShieldWarning, hint: '允许的工作区操作直接执行，宿主命令已关闭' },
 }
 
 export function Composer({ disabled, permission, assistantId, onSend }: ComposerProps) {

@@ -30,7 +30,7 @@ async def upload(runtime, assistant_id: str, upload_id: str, file: UploadFile) -
     filename = _filename(file.filename or "")
     lock = runtime.upload_locks.setdefault(upload_id, asyncio.Lock())
     async with lock:
-        async with runtime.lock:
+        async with runtime.lock, runtime.graph.write_lock:
             with db.new_session() as session:
                 runtime._check_assistant(session, assistant_id)
                 old = store.get(session, f"upload:{upload_id}")
@@ -69,7 +69,7 @@ async def upload(runtime, assistant_id: str, upload_id: str, file: UploadFile) -
                 raise ValueError("上传目标无效")
             canonical = os.path.normcase(str(target.resolve()))
             async with runtime.file_locks.setdefault(canonical, asyncio.Lock()):
-                async with runtime.lock:
+                async with runtime.lock, runtime.graph.write_lock:
                     with db.new_session() as session:
                         runtime._check_assistant(session, assistant_id)
                         owners = [task for task in store.records(session, "task_state")
@@ -93,7 +93,7 @@ async def upload(runtime, assistant_id: str, upload_id: str, file: UploadFile) -
             return {key: result[key] for key in ("upload_id", "name", "path", "size")}
         except BaseException:
             if not replaced and not (old and old["status"] == "completed"):
-                async with runtime.lock:
+                async with runtime.lock, runtime.graph.write_lock:
                     with db.new_session() as session:
                         current = store.get(session, f"upload:{upload_id}")
                         if current and current.get("assistant_id") == assistant_id:

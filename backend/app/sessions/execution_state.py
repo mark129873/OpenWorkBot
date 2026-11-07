@@ -1,4 +1,3 @@
-import re
 import json
 import os
 import threading
@@ -8,18 +7,20 @@ from sqlalchemy.dialects.sqlite import insert
 
 from app import db
 from app.models import LocalSetting, now_ms
+from app.user_context import require_user
 
 _MODES = ("build", "edit", "yolo")
 _RULE_LOCK = threading.Lock()
 
 
 def project_directory(data_dir) -> str:
-    return os.path.normcase(str((Path(data_dir) / "workspace").resolve()))
+    from app.agent.tools import workspace_root
+
+    return os.path.normcase(str(workspace_root().resolve()))
 
 
 def project_id(data_dir) -> str:
-    """项目键使用小写路径 slug，最多 80 字符。"""
-    return re.sub(r"[^a-z0-9._-]+", "-", project_directory(data_dir).lower()).strip("-")[:80] or "default"
+    return f"user-{require_user()}"
 
 
 def _read(data_dir, key: str, scope_id: str | None = None) -> dict:

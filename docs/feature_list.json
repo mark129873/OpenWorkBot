@@ -13,11 +13,18 @@
   },
   "features": [
     {
+      "id": "Backend-08",
+      "name": "多用户 Gateway 与长期记忆改造",
+      "description": "保留主 Agent、后台 Worker 和通信架构，增加用户隔离、SQLite 检查点、本地沙箱和长期记忆。",
+      "status": "passing",
+      "evidence": "隔离空库、模拟模型后端全量 151 项及补充记忆上限 1 项通过；前端 2 项、构建、lint 和本机登录页检查通过。真实模型尚未复测。"
+    },
+    {
       "id": "Backend-01",
       "name": "后台多助手协作",
       "description": "主助手首轮意图和动作、直接执行、后台调度、授权与恢复。",
       "status": "passing",
-      "evidence": "后端全量 90 项及首轮动作专项 16 项通过；DeepSeek 实测快速任务两次模型调用、混合意图与命令限制。"
+      "evidence": "本轮隔离后端全量 151 项通过，覆盖任务顺序、审批、通信和每用户六个 Worker；真实模型尚未复测。"
     },
     {
       "id": "Frontend-01",
@@ -29,23 +36,23 @@
     {
       "id": "Backend-02",
       "name": "删除助手并新建",
-      "description": "停止任务、归档历史和结果、隔离新助手及恢复删除流程。",
+      "description": "停止当前用户任务，删除旧聊天、任务、检查点和记忆，新建空白助手。",
       "status": "passing",
-      "evidence": "空库全量 102 项通过；最终调整后删除专项 13 项及原幂等测试通过。"
+      "evidence": "隔离空库覆盖双用户重置、删除失败重试、重启恢复及取消边界；其他用户和工作区保留。"
     },
     {
       "id": "Frontend-02",
       "name": "助手设置",
       "description": "删除确认、停止进度及异常处理。",
       "status": "passing",
-      "evidence": "前端 2 项测试、构建及 lint 通过；隔离浏览器验证菜单、确认、阻塞、取消与草稿。"
+      "evidence": "前端 2 项测试、构建与 lint 通过；重置状态及取消边界由后端测试覆盖，重置页面尚未浏览器联调。"
     },
     {
       "id": "Backend-03",
       "name": "后台 RAG 知识库",
-      "description": "Worker 经 MCP 管理知识库，子块检索并回填完整父文档。",
+      "description": "RAG 服务和数据保持独立；Agent 的 RAG 工具暂时关闭，多用户接入待确认。",
       "status": "in_progress",
-      "evidence": "断连重试通过隔离 RAG 全量 151 项；提示词回退专项 29 项通过。v2 真实 50 题目标文档 Recall@5=1，固定证据正确性 0.7555、忠实度 0.9360；存在材料及优先条件遗漏，Anthropic 参数兼容待修复。"
+      "evidence": "此前隔离 RAG 全量 151 项及 v2 真实 50 题评测见历史记录；本轮未改动 RAG，后端验证 Agent 工具已关闭。"
     },
     {
       "id": "Frontend-03",
@@ -78,9 +85,9 @@
     {
       "id": "Backend-06",
       "name": "OpenAI 模型接入",
-      "description": "主助手、后台助手及 RAG 使用 OpenAI Chat Completions，温度固定为 0。",
+      "description": "主助手、后台助手及记忆提取使用 OpenAI 兼容 Chat Completions。",
       "status": "passing",
-      "evidence": "真实 gpt-6-luna 曾通过聊天、工具、双后台助手、重启回放及 MCP RAG（检索与 Embedding 为替身）；温度 0 通过隔离后端 26 项及 RAG/评测专项 80 项。"
+      "evidence": "本轮模拟 OpenAI 接口和后端全量测试通过；此前真实模型验证属于旧版，本轮尚未复测。"
     },
     {
       "id": "Backend-07",

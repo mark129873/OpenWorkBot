@@ -42,7 +42,7 @@ def make_client(handler):
 
 
 def test_provider_selection_and_configuration(monkeypatch):
-    assert validate_llm_config(Settings(model_id="x")) == ["ANTHROPIC_API_KEY"]
+    assert validate_llm_config(Settings(model_id="x")) == ["OPENAI_API_KEY"]
     assert validate_llm_config(Settings(llm_provider="openai", model_id="x")) == ["OPENAI_API_KEY"]
     assert validate_llm_config(Settings(llm_provider="other", model_id="x")) == ["LLM_PROVIDER"]
     config = Settings(llm_provider="openai", openai_api_key="test-key", model_id="gpt-6-luna")
@@ -256,8 +256,8 @@ def test_rag_process_receives_selected_provider(tmp_path, monkeypatch, provider,
 def test_main_direct_action_with_mock_openai(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "modelio_dir", tmp_path / "modelio")
-    (tmp_path / "workspace").mkdir()
-    (tmp_path / "workspace" / "note.txt").write_text("隔离测试内容", encoding="utf-8")
+    (tmp_path / ("a" * 32)).mkdir()
+    (tmp_path / ("a" * 32) / "note.txt").write_text("隔离测试内容", encoding="utf-8")
     db.dispose_engine()
     db.init_db(tmp_path)
     requests = []
@@ -300,8 +300,8 @@ def test_main_direct_action_with_mock_openai(tmp_path, monkeypatch):
 def test_worker_tool_round_trip_with_mock_openai(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "modelio_dir", tmp_path / "modelio")
-    (tmp_path / "workspace").mkdir()
-    (tmp_path / "workspace" / "note.txt").write_text("后台测试内容", encoding="utf-8")
+    (tmp_path / ("a" * 32)).mkdir()
+    (tmp_path / ("a" * 32) / "note.txt").write_text("后台测试内容", encoding="utf-8")
     db.dispose_engine()
     db.init_db(tmp_path)
     requests = []

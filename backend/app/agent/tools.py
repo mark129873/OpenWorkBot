@@ -7,10 +7,17 @@ from typing import Callable
 
 from app.agent.skills import tool_load_skill
 from app.config import settings
+from app.user_context import require_user
 
 
 def workspace_root() -> Path:
-    return settings.data_dir / "workspace"
+    parent = settings.workspaces_dir.resolve()
+    target = parent / require_user()
+    if target.is_symlink() or (hasattr(target, "is_junction") and target.is_junction()):
+        raise ValueError("用户工作区不能是链接")
+    if target.resolve().parent != parent:
+        raise ValueError("用户工作区路径无效")
+    return target
 
 
 def safe_path(relative: str) -> Path:
@@ -232,7 +239,6 @@ def tool_delete_file(path: str) -> str:
 
 
 TOOL_HANDLERS: dict[str, Callable[..., str]] = {
-    "bash": tool_bash,
     "read_file": tool_read_file,
     "write_file": tool_write_file,
     "edit_file": tool_edit_file,
@@ -251,10 +257,6 @@ def _schema(name: str, description: str, properties: dict, required: list[str]) 
 
 
 TOOLS: list[dict] = [
-    _schema(
-        "bash", "在工作区内用 PowerShell 执行命令，返回合并输出。工作目录即工作区根。",
-        {"command": {"type": "string", "description": "PowerShell 命令"}}, ["command"],
-    ),
     _schema(
         "read_file", "按行读取工作区内文本文件，超长时提示下一行。",
         {"path": {"type": "string", "description": "工作区内相对路径"},

@@ -17,12 +17,21 @@ from app.agent.task_tools import WORKER_TOOLS
 from app.config import settings
 from app.models import new_id
 from app.sessions import approvals, chat_store as store, session_permissions
+from app.user_context import scoped
 
 _PROMPT = """你是后台工作助手，专注完成给定任务。独立保存工作上下文；先读后改，工具执行失败不能当作成功。
-知识库查询使用 rag_search；仅在用户明确要求时使用 rag_ingest 或 rag_remove，不得自行入库或移出。已指定文件路径时直接调用 rag_ingest，不要先执行命令、读取文件或列出知识库；移出前用 rag_list 查文件 ID，再调用 rag_remove。普通知识库问答完整返回工具答案。
-必须遵守用户明确限定的操作和顺序；禁止的操作即使只读、用于定位或检查也不能执行。用户指定具体命令且禁止其他命令时，不得追加或替换命令；不确定时询问主助手。
+知识库工具和宿主命令暂不可用。必须遵守用户限定的操作和顺序；不确定时询问主助手。
 关键进展或需要用户确认的问题使用 task_report 告诉主助手。完成后简短汇报结果、验证及未解决的问题。
 收到用户修改、停止或同伴消息时按最新要求调整；不要冒充主助手或其他助手。"""
+
+
+def _limit_result(text: str) -> str:
+    data = text.encode("utf-8")
+    if len(data) <= 16 * 1024:
+        return text
+    marker = "\n[结果过长，已截断]"
+    budget = 16 * 1024 - len(marker.encode("utf-8"))
+    return data[:budget].decode("utf-8", errors="ignore") + marker
 
 
 class AgentWaiting(Exception):
@@ -49,6 +58,7 @@ class Worker:
         self.stop = runtime.stops.setdefault(task_id, asyncio.Event())
         self.context_id = ""
         self.run_id = ""
+        self.memory = ""
 
     def task(self) -> dict:
         with db.new_session() as session:
@@ -65,6 +75,9 @@ class Worker:
             self.context_id, self.run_id = state["context_id"], state["run_id"]
         else:
             self.context_id, self.run_id = task["context_id"], task["run_id"]
+        self.memory = await self.runtime.memory_snapshot(task.get("goal", ""))
+        if not await self.runtime.reconcile_incoming(self.context_id):
+            return
         await self.resume_groups()
         while True:
             task = self.task()
@@ -86,7 +99,8 @@ class Worker:
             if state["steps"] >= 30:
                 await self.finish("limit", "本轮达到 30 步上限，请判断是否继续或停止。")
                 return
-            await self.deliver_messages()
+            if not await self.deliver_messages():
+                return
             def step(session):
                 key = f"helper:{self.helper_id}" if self.helper_id else f"task:{self.task_id}"
                 current = store.get(session, key)
@@ -97,10 +111,12 @@ class Worker:
             history = await compact.context_history(self.runtime, self.context_id)
             deps = SimpleNamespace(client=self.runtime.client,
                                    recorder=SimpleNamespace(session_id="main", turn_id=self.run_id))
-            system_prompt = _PROMPT + skills.skill_prompt()
+            system_prompt = _PROMPT + skills.skill_prompt() + self.runtime.memory_prompt(self.memory)
             with record_model_step(deps, system_prompt, history, WORKER_TOOLS, subtask_id=self.task_id) as reply:
-                async for event in self.runtime.client.stream(system=system_prompt, messages=history, tools=WORKER_TOOLS):
-                    reply.accept(event)
+                async def model_step():
+                    async for event in self.runtime.client.stream(system=system_prompt, messages=history, tools=WORKER_TOOLS):
+                        reply.accept(event)
+                await self.runtime.graph.invoke(self.context_id, history=history, memory=self.memory, action=model_step)
             if reply.stop_reason == "max_tokens":
                 await self.finish("failed", "模型输出达到上限，本轮未完成。")
                 return
@@ -146,13 +162,20 @@ class Worker:
             await self.runtime.change(save_group)
             await self.process_group(group_id)
 
-    async def deliver_messages(self) -> None:
+    async def deliver_messages(self) -> bool:
+        with db.new_session() as session:
+            messages = store.records(session, "agent_message", context_id=self.context_id)
+        for message in messages:
+            if message["delivery"] in {"pending", "applying", "unknown"}:
+                if not await self.runtime.deliver_message(message):
+                    return False
+
         def deliver(session):
             for message in store.records(session, "agent_message", context_id=self.context_id):
-                if message["delivery"] == "pending":
-                    agent_bus.deliver(session, message)
+                if message["delivery"] == "delivered":
                     agent_bus.processed(session, message)
         await self.runtime.change(deliver)
+        return True
 
     async def resume_groups(self) -> None:
         with db.new_session() as session:
@@ -206,48 +229,20 @@ class Worker:
         name, args = execution["name"], execution["input"]
         if not isinstance(args, dict):
             return "Error: 工具参数必须是对象"
+        from app.agent import coordination
+
+        if name in coordination.NAMES:
+            try:
+                return await self.runtime.change(lambda session: coordination.call(
+                    session, name, args, actor=self.context_id, task_id=self.task_id, request_id=execution["id"]))
+            except (KeyError, TypeError, ValueError) as exc:
+                return f"Error: {exc}"
         if name in {"task_report", "agent_list", "agent_send", "agent_wait", "agent_help", "read_tool_output"}:
             return await self.communicate(name, args, execution["id"])
         if name in RAG_NAMES:
-            if name in {"rag_ingest", "rag_remove"} and not self.knowledge_authorized(name):
-                return "Error: 需要用户明确指定知识库入库或移出操作。"
-            with db.new_session() as session:
-                pending = [item for item in store.records(session, "agent_message", context_id=self.context_id,
-                                                         delivery="pending") if item.get("source") == "main"]
-                task = store.get(session, f"task:{self.task_id}")
-                previous = [item for item in store.records(session, "tool_execution")
-                            if item.get("id") != execution["id"]
-                            and item.get("name") == name and item.get("input") == args and item.get("result_unknown")]
-            if pending:
-                return "Error: 收到新的用户要求，请先处理后再调用知识库。"
-            if previous:
-                since = max(item.get("user_seq", task["order"]) for item in previous)
-                if not self.knowledge_authorized(name, after=since):
-                    return "Error: 此前知识库操作结果未知，请先检查并等待用户明确要求重试。"
-            error = await self.authorize(execution)
-            if error:
-                return error
-            error = await self.started(execution, task.get("latest_user_seq", task["order"]))
-            if error:
-                return error
-            call = asyncio.create_task(self.runtime.rag.call(name, {**args, "operation_id": execution["id"]}))
-            stopped = asyncio.create_task(self.stop.wait())
-            try:
-                await asyncio.wait([call, stopped], return_when=asyncio.FIRST_COMPLETED)
-                if self.stop.is_set():
-                    await self.runtime.rag.cancel(execution["id"])
-                    call.cancel()
-                    await asyncio.gather(call, return_exceptions=True)
-                    return "Error: 操作已停止，知识库工具结果可能未知，请先检查。"
-                return await call
-            except asyncio.CancelledError:
-                await asyncio.shield(self.runtime.rag.cancel(execution["id"]))
-                raise
-            finally:
-                if not call.done():
-                    call.cancel()
-                stopped.cancel()
-                await asyncio.gather(call, stopped, return_exceptions=True)
+            return "Error: 知识库工具暂不可用。"
+        if name == "bash":
+            return "Error: 当前沙箱禁止宿主命令。"
         if name not in tools.TOOL_HANDLERS and name != "todo_write":
             return f"Error: 未知工具 {name}"
         if name in {"read_file", "write_file", "edit_file", "delete_file"}:
@@ -264,17 +259,8 @@ class Worker:
             items, error = parse_items(args.get("items"))
             if error:
                 return error
-            await self.runtime.change(lambda session: replace_todos(session, "main", items, commit=False))
+            await self.runtime.change(lambda session: replace_todos(session, scoped("main"), items, commit=False))
             return render_panel(items)
-        if name == "bash":
-            try:
-                output, failed = await self.runtime.run_tool(tools.capture_bash, **args)
-            except TypeError as exc:
-                return f"Error: 参数不匹配：{exc}"
-            output_id = new_id()
-            await self.runtime.change(lambda session: store.put(session, f"output:{output_id}", {
-                "type": "tool_output", "id": output_id, "task_id": self.task_id, "content": output}))
-            return f"{'Error: ' if failed else ''}[输出 ID: {output_id}]\n{tools.output_preview(output, limit=29900)}"
         return await self.runtime.run_tool(tools.execute_tool, name, args)
 
     def knowledge_authorized(self, name: str, after: int = -1) -> bool:
@@ -303,7 +289,7 @@ class Worker:
 
     async def authorize(self, execution: dict) -> str | None:
         name, args = execution["name"], execution["input"]
-        deps = SimpleNamespace(recorder=SimpleNamespace(session_id="main"),
+        deps = SimpleNamespace(recorder=SimpleNamespace(session_id=scoped("main")),
                                stop_flag=lambda: self.stop.is_set(),
                                approver=lambda tool, inputs, reason: self.approve(execution, reason))
         return await approvals.authorize_tool(deps, name, args, data_dir=settings.data_dir)
@@ -483,7 +469,7 @@ class Worker:
             allowed = (evaluate(settings.data_dir, execution["name"], execution["input"])["decision"] != "deny"
                        and scope == session_permissions.scope_for(execution["name"], execution["input"]))
         if allowed and record["option_id"] == "allowSession" and scope is not None:
-            session_permissions.grant("main", scope)
+            session_permissions.grant(scoped("main"), scope)
         def resolved(session):
             state_key = f"helper:{self.helper_id}" if self.helper_id else f"task:{self.task_id}"
             state = store.get(session, state_key)
@@ -549,7 +535,7 @@ class Worker:
                     return None
                 pending = sum(1 for h in helpers if h["status"] == "queued")
                 active = sum(1 for w in self.runtime.workers.values() if not w.done())
-                if active + pending >= 3:
+                if active + pending >= 6:
                     return None
                 context_id, run_id = new_id(), new_id()
                 helper = {"type": "agent_run", "task_id": self.task_id, "context_id": context_id,
@@ -567,6 +553,12 @@ class Worker:
 
     async def wait_for_agent(self, target: str, identity: str) -> str:
         key = f"agent-wait:{identity}"
+        with db.new_session() as session:
+            incoming = store.records(session, "agent_message", context_id=self.context_id)
+        for message in incoming:
+            if message["delivery"] in {"pending", "applying", "unknown"}:
+                if not await self.runtime.deliver_message(message):
+                    raise AgentWaiting
 
         def check(session):
             previous = store.get(session, f"wait-result:{identity}")
@@ -576,7 +568,7 @@ class Worker:
             task = store.get(session, f"task:{self.task_id}")
             if not (any(t["context_id"] == target for t in tasks) or any(a["context_id"] == target for a in agents)) or target == self.context_id:
                 return "Error: 目标助手无效"
-            messages = store.records(session, "agent_message", context_id=self.context_id, delivery="pending")
+            messages = store.records(session, "agent_message", context_id=self.context_id, delivery="delivered")
             reply = next((message for message in messages if message["source"] == target), None)
             other = next((t for t in tasks if t["context_id"] == target), None)
             helper = next((a for a in agents if a["context_id"] == target), None)
@@ -632,7 +624,7 @@ class Worker:
                 store.put(session, f"helper:{self.helper_id}", helper)
                 if task["status"] not in {"completed", "failed", "stopped"}:
                     agent_bus.send(session, source=self.context_id, target=helper["caller"], task_id=self.task_id,
-                                   content=f"协助助手结果（{result}）：{content}", message_id=f"finish:{self.helper_id}:{self.run_id}",
+                                   content=_limit_result(f"协助助手结果（{result}）：{content}"), message_id=f"finish:{self.helper_id}:{self.run_id}",
                                    run_id=self.run_id)
                 return
             if task["status"] in {"completed", "failed", "stopped"}:
@@ -657,7 +649,7 @@ class Worker:
                                        message_id=f"finish:{self.task_id}:{self.run_id}", run_id=self.run_id)
                         return
             agent_bus.send(session, source=self.context_id, target="main", task_id=self.task_id,
-                           content=f"任务【{task['title']}】一轮结束（{result}）：{content}",
+                           content=_limit_result(f"任务【{task['title']}】一轮结束（{result}）：{content}"),
                            kind="result" if result == "stopped" else "review",
                            message_id=f"finish:{self.task_id}:{self.run_id}", run_id=self.run_id)
         await self.runtime.change(save)

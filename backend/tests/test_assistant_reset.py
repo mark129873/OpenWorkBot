@@ -15,17 +15,18 @@ from app.models import Message, Part, Session, Todo, TurnUsage
 from app.sessions import chat_store as store
 from app.sessions import execution_state, session_permissions
 from app.sessions import store as legacy_store
+from app.user_context import scoped
 
 
 @pytest.fixture
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "modelio_dir", tmp_path / "log")
-    (tmp_path / "workspace").mkdir()
+    (tmp_path / ("a" * 32)).mkdir()
     db.dispose_engine()
     db.init_db(tmp_path)
     yield tmp_path
-    session_permissions.forget_session("main")
+    session_permissions.forget_session(scoped("main"))
     db.dispose_engine()
 
 
@@ -52,7 +53,7 @@ def test_existing_chat_gets_identity_without_losing_data(isolated):
         assert store.visible(session)[0]["text"] == "已有对话"
 
 
-def test_reset_waits_for_tool_and_archives_without_leaking_context(isolated):
+def test_reset_waits_for_tool_and_deletes_old_context(isolated):
     async def run():
         runtime = Runtime()
         runtime.client = None
@@ -61,7 +62,7 @@ def test_reset_waits_for_tool_and_archives_without_leaking_context(isolated):
         started = threading.Event()
         tool = None
         try:
-            workspace_file = isolated / "workspace" / "result.txt"
+            workspace_file = isolated / ("a" * 32) / "result.txt"
             workspace_file.write_text("任务结果", encoding="utf-8")
             log_file = isolated / "log" / "model-io-main.jsonl"
             log_file.parent.mkdir()
@@ -72,7 +73,7 @@ def test_reset_waits_for_tool_and_archives_without_leaking_context(isolated):
             execution_state.save_permission_rules(isolated, rules)
             execution_state.save_execution_state(isolated, "yolo")
             scope = session_permissions.scope_for("bash", {"command": "pwd"})
-            session_permissions.grant("main", scope)
+            session_permissions.grant(scoped("main"), scope)
 
             def seed(session):
                 store.bump(session, user_event=True)
@@ -85,8 +86,8 @@ def test_reset_waits_for_tool_and_archives_without_leaking_context(isolated):
                                                    "content": "旧报告", "delivery": "processed"})
                 store.put(session, "output:old", {"type": "tool_output", "id": "old", "task_id": task["id"], "content": "旧输出"})
                 store.put(session, "summary:old", {"type": "agent_summary", "content": "旧摘要"})
-                session.add(Todo(session_id="main", position=0, content="旧清单", status="completed"))
-                session.add(TurnUsage(session_id="main", turn_id="old", status="completed", started_at=1))
+                session.add(Todo(session_id=scoped("main"), position=0, content="旧清单", status="completed"))
+                session.add(TurnUsage(session_id=scoped("main"), turn_id="old", status="completed", started_at=1))
                 return task
             task = await runtime.change(seed)
             worker = Worker(runtime, task["id"])
@@ -123,7 +124,7 @@ def test_reset_waits_for_tool_and_archives_without_leaking_context(isolated):
             after = await runtime.snapshot()
             assert after["reset"] is None and after["messages"] == [] and after["approvals"] == []
             assert after["revision"] > before["revision"] and after["permission_mode"] == "build"
-            assert not session_permissions.allows("main", "bash", {"command": "pwd"})
+            assert not session_permissions.allows(scoped("main"), "bash", {"command": "pwd"})
             assert execution_state.load_permission_rules(isolated) == rules
             assert workspace_file.read_text(encoding="utf-8") == "任务结果"
             assert log_file.read_text(encoding="utf-8") == "旧模型记录"
@@ -135,23 +136,10 @@ def test_reset_waits_for_tool_and_archives_without_leaking_context(isolated):
             with pytest.raises(Conflict):
                 await runtime.accept("late", "旧页面消息", None, assistant_id=old_id)
             with db.new_session() as session:
-                archive = session.get(Session, replay["archive_id"])
-                assert archive.time_archived is not None
-                assert all(row.id != archive.id for row in legacy_store.list_sessions(session))
-                messages = list(session.scalars(select(Message).where(Message.session_id == archive.id)))
-                parts = list(session.scalars(select(Part).where(Part.session_id == archive.id)))
-                assert any(row.id.endswith(":user:old") for row in messages)
-                assert any(store.read(row).get("text") == "旧对话" for row in parts)
-                assert any(store.read(row).get("content") == "旧输出" for row in parts)
-                assert any(store.read(row).get("content") == "旧报告" for row in parts)
-                archived_task = next(store.read(row) for row in parts if store.read(row).get("type") == "task_state")
-                archived_helper = next(store.read(row) for row in parts if store.read(row).get("type") == "agent_run")
-                archived_approval = next(store.read(row) for row in parts if store.read(row).get("type") == "approval")
-                assert archived_task["status"] == "stopped" and archived_task["stop_requested"]
-                assert archived_helper["status"] == "stopped" and archived_approval["status"] == "expired"
-                assert {store.read(row).get("type") for row in parts}.isdisjoint({"agent_context", "agent_summary"})
-                assert session.get(Todo, (archive.id, 0)).content == "旧清单"
-                assert session.get(TurnUsage, (archive.id, "old")) is not None
+                assert not list(session.scalars(select(Session).where(Session.time_archived.is_not(None))))
+                assert session.get(Message, scoped("user:old")) is None
+                assert session.get(Todo, (scoped("main"), 0)) is None
+                assert session.get(TurnUsage, (scoped("main"), "old")) is None
                 assert store.history(session, "main") == []
                 assert store.records(session, "task_state") == []
                 assert store.get(session, "meta")["user_seq"] >= 1
@@ -400,10 +388,10 @@ def test_duplicate_reset_does_not_interrupt_main_cleanup(isolated):
             release.set()
             await asyncio.wait_for(cleaned.wait(), 3)
             await wait_for(lambda: snapshot_now(runtime)["assistant_id"] != old_id)
-            replay = await runtime.reset(old_id, "duplicate")
+            await runtime.reset(old_id, "duplicate")
             with db.new_session() as session:
-                parts = session.scalars(select(Part).where(Part.session_id == replay["archive_id"]))
-                assert any(store.read(part).get("text") == "已保存的中断结果" for part in parts)
+                parts = session.scalars(select(Part).where(Part.session_id == scoped("main")))
+                assert not any(store.read(part).get("text") == "已保存的中断结果" for part in parts)
         finally:
             release.set()
             await runtime.close()
@@ -500,9 +488,9 @@ def test_reset_ignores_late_reconciliation_result(isolated):
             await runtime.reset(old_id, "reconcile-reset")
             model.release.set()
             await wait_for(lambda: snapshot_now(runtime)["assistant_id"] != old_id)
-            replay = await runtime.reset(old_id, "reconcile-reset")
+            await runtime.reset(old_id, "reconcile-reset")
             with db.new_session() as session:
-                parts = session.scalars(select(Part).where(Part.session_id == replay["archive_id"]))
+                parts = session.scalars(select(Part).where(Part.session_id == scoped("main")))
                 assert not any("继续旧任务" in str(store.read(part)) for part in parts)
             assert model.calls == 1
         finally:
@@ -511,7 +499,7 @@ def test_reset_ignores_late_reconciliation_result(isolated):
     asyncio.run(run())
 
 
-def test_archive_failure_rolls_back_and_can_retry(isolated, monkeypatch):
+def test_deletion_failure_cannot_cancel_and_can_retry(isolated, monkeypatch):
     async def run():
         runtime = Runtime()
         runtime.client = None
@@ -520,19 +508,21 @@ def test_archive_failure_rolls_back_and_can_retry(isolated, monkeypatch):
             await runtime.change(lambda session: store.add_visible(session, "user", "保留的对话"))
             execution_state.save_execution_state(isolated, "edit")
             old_id = (await runtime.snapshot())["assistant_id"]
-            archive = store.archive
-            def fail_after_archive(session):
-                archive(session)
+            clear = runtime.memory.clear
+            async def fail_clear():
                 raise RuntimeError("test failure")
-            monkeypatch.setattr(store, "archive", fail_after_archive)
+            monkeypatch.setattr(runtime.memory, "clear", fail_clear)
             await runtime.reset(old_id, "archive-error")
             await wait_for(lambda: (snapshot_now(runtime)["reset"] or {}).get("status") == "blocked")
             snapshot = await runtime.snapshot()
             assert snapshot["assistant_id"] == old_id and snapshot["messages"][0]["text"] == "保留的对话"
             assert snapshot["permission_mode"] == "edit" and snapshot["reset"]["reason"] == "error"
+            assert snapshot["reset"]["deletion_started"]
+            with pytest.raises(Conflict, match="不能取消"):
+                await runtime.cancel_reset(old_id, "archive-error")
             with db.new_session() as session:
                 assert not list(session.scalars(select(Session).where(Session.time_archived.is_not(None))))
-            monkeypatch.setattr(store, "archive", archive)
+            monkeypatch.setattr(runtime.memory, "clear", clear)
             await runtime.reset(old_id, "archive-error")
             await wait_for(lambda: snapshot_now(runtime)["assistant_id"] != old_id)
         finally:
@@ -546,7 +536,8 @@ def test_http_requires_assistant_identity_and_rejects_stale_tab(isolated):
         runtime.client = None
         await runtime.start()
         app = FastAPI()
-        app.state.runtime = runtime
+        from conftest import install_runtime
+        install_runtime(app, runtime)
         app.include_router(router)
         try:
             async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:

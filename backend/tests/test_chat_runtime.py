@@ -9,6 +9,7 @@ from app.agent.runtime import Conflict, Runtime
 from app.config import settings
 from app.models import new_id
 from app.sessions import chat_store as store
+from app.user_context import scoped
 
 
 class FakeModel:
@@ -65,7 +66,7 @@ async def decide(runtime, *args, **kwargs):
 def isolated(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "modelio_dir", tmp_path / "modelio")
-    (tmp_path / "workspace").mkdir()
+    (tmp_path / ("a" * 32)).mkdir()
     db.dispose_engine()
     db.init_db(tmp_path)
     yield tmp_path
@@ -449,7 +450,8 @@ def test_http_stream_disconnect_keeps_worker_running(isolated):
         runtime = Runtime(client=model)
         await runtime.start()
         app = FastAPI()
-        app.state.runtime = runtime
+        from conftest import install_runtime
+        install_runtime(app, runtime)
         app.include_router(router)
         listener = socket.socket()
         listener.bind(("127.0.0.1", 0))
@@ -526,7 +528,7 @@ def test_approval_stays_available_and_session_grant_is_shared(isolated):
             assert (await runtime.snapshot())["approvals"][0]["request_id"] == request_id
             assert (await decide(runtime, request_id, "allowSession"))["ok"]
             assert (await waiting)["approved"]
-            assert session_permissions.allows("main", "write_file", {"path": "x", "content": "b"})
+            assert session_permissions.allows(scoped("main"), "write_file", {"path": "x", "content": "b"})
             with db.new_session() as session:
                 approval = store.get(session, f"approval:{request_id}")
                 assert approval["user_seq"] > message["user_seq"]
@@ -536,7 +538,7 @@ def test_approval_stays_available_and_session_grant_is_shared(isolated):
             if not waiting.done():
                 waiting.cancel()
                 await asyncio.gather(waiting, return_exceptions=True)
-            session_permissions.forget_session("main")
+            session_permissions.forget_session(scoped("main"))
     asyncio.run(run())
 
 
@@ -579,7 +581,7 @@ def test_file_owner_requires_reread_before_other_task_writes(isolated):
         assert "重新读取" in await asyncio.wait_for(pending, 3)
         assert "原始" in await call(workers[1], "read_file", {"path": "x.txt"})
         assert "已写入" in await call(workers[1], "write_file", {"path": "x.txt", "content": "覆盖"})
-        assert (isolated / "workspace" / "x.txt").read_text(encoding="utf-8") == "覆盖"
+        assert (isolated / ("a" * 32) / "x.txt").read_text(encoding="utf-8") == "覆盖"
     asyncio.run(run())
 
 
@@ -610,22 +612,22 @@ def test_thirtieth_tool_step_requires_review(isolated, monkeypatch):
     asyncio.run(run())
 
 
-def test_scheduler_caps_parallel_workers_at_three(isolated):
+def test_scheduler_caps_parallel_workers_at_six(isolated):
     async def run():
         model = FakeModel()
         runtime = Runtime(client=model)
         await runtime.start()
         try:
             def create(session):
-                for number in range(4):
+                for number in range(7):
                     runtime.create_task(session, f"任务 {number}", number + 1)
             await runtime.change(create)
-            await wait_for(lambda: model.workers == 3)
+            await wait_for(lambda: model.workers == 6)
             await asyncio.sleep(0.4)
             with db.new_session() as session:
                 states = [t["status"] for t in store.records(session, "task_state")]
-            assert states.count("running") == 3 and states.count("queued") == 1
-            assert model.max_workers == 3
+            assert states.count("running") == 6 and states.count("queued") == 1
+            assert model.max_workers == 6
             model.release_worker.set()
             def all_done():
                 with db.new_session() as session:
@@ -751,7 +753,7 @@ def test_restart_reissues_pending_approval(isolated):
                 with db.new_session() as session:
                     return store.get(session, f"execution:{execution_id}")["status"] == "completed"
             await wait_for(execution_finished)
-            assert not (isolated / "workspace" / "x").exists()
+            assert not (isolated / ("a" * 32) / "x").exists()
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -788,7 +790,7 @@ def test_started_external_tool_is_not_replayed_on_restart(isolated):
                           if isinstance(message["content"], list) for block in message["content"]]
                 result = next(block for block in blocks if block["type"] == "tool_result")
                 assert result["is_error"] and "结果未知" in result["content"]
-            assert not (isolated / "workspace" / "x").exists()
+            assert not (isolated / ("a" * 32) / "x").exists()
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -1440,8 +1442,8 @@ def test_task_context_is_bounded_and_old_details_remain_searchable(isolated):
             task = runtime.create_task(session, f"近期关键词 {index}", 101 + index)
             task["status"] = "completed"
             store.put(session, f"task:{task['id']}", task)
-            session.get(Part, f"task:{task['id']}").time_updated = 1000 + index
-        session.get(Part, f"task:{old['id']}").time_updated = 1
+            session.get(Part, scoped(f"task:{task['id']}")).time_updated = 1000 + index
+        session.get(Part, scoped(f"task:{old['id']}")).time_updated = 1
         session.commit()
         summaries, omitted = _task_context(session)
         assert omitted and len(store.dump(summaries)) <= _TASK_CONTEXT_LIMIT
@@ -1521,8 +1523,8 @@ def test_old_task_can_be_found_from_main_chat(isolated):
                 task = runtime.create_task(session, f"近期任务 {index}", index + 2)
                 task["status"] = "completed"
                 store.put(session, f"task:{task['id']}", task)
-                session.get(Part, f"task:{task['id']}").time_updated = 1000 + index
-            session.get(Part, f"task:{old['id']}").time_updated = 1
+                session.get(Part, scoped(f"task:{task['id']}")).time_updated = 1000 + index
+            session.get(Part, scoped(f"task:{old['id']}")).time_updated = 1
             session.commit()
         await runtime.start()
         try:
@@ -1586,18 +1588,12 @@ def test_omitted_active_task_can_be_found_and_stopped(isolated):
     asyncio.run(run())
 
 
-@pytest.mark.parametrize(("script", "failed"), [
-    ("import sys; print('failure'); sys.exit(7)", True),
-    ("print('Error: ordinary output')", False),
-])
-def test_worker_bash_reports_actual_exit_status(isolated, monkeypatch, script, failed):
-    import sys
+def test_worker_rejects_host_commands(isolated, monkeypatch):
     from app.agent import hooks, tools
     from app.agent.worker import Worker
 
-    popen = tools.subprocess.Popen
-    monkeypatch.setattr(tools.subprocess, "Popen", lambda *_args, **kwargs: popen(
-        [sys.executable, "-c", script], **kwargs))
+    calls = []
+    monkeypatch.setattr(tools.subprocess, "Popen", lambda *_args, **_kwargs: calls.append(True))
     states = []
     monkeypatch.setattr(hooks, "trigger", lambda event, data: states.append(data["status"]) if event == "PostToolUse" else None)
 
@@ -1622,11 +1618,8 @@ def test_worker_bash_reports_actual_exit_status(isolated, monkeypatch, script, f
         await worker.process_group("one")
         with db.new_session() as session:
             result = store.history(session, worker.context_id)[-1]["content"][0]
-            output = store.records(session, "tool_output")[0]
-        assert bool(result.get("is_error")) is failed
-        assert states == ["error" if failed else "completed"]
-        assert "[输出 ID:" in result["content"] and output["content"] in result["content"]
-        assert len(result["content"]) <= 30000
+        assert result.get("is_error") and "禁止宿主命令" in result["content"]
+        assert states == ["error"] and not calls
     asyncio.run(run())
 
 
@@ -1668,21 +1661,17 @@ class DirectModel:
         yield {"type": "stop_reason", "reason": "end_turn"}
 
 
-def test_quick_command_runs_without_worker_model(isolated, monkeypatch):
-    from app.agent import tools
-
-    calls = []
-    monkeypatch.setattr(tools, "capture_bash", lambda command: (calls.append(command) or "workspace", False))
+def test_quick_file_read_runs_without_worker_model(isolated):
+    (isolated / ("a" * 32) / "note.txt").write_text("workspace", encoding="utf-8")
 
     async def run():
-        model = DirectModel("bash", {"command": "pwd"})
+        model = DirectModel("read_file", {"path": "note.txt"})
         runtime = Runtime(client=model)
         await runtime.start()
         try:
-            await accept(runtime, "pwd", "pwd", "build")
+            await accept(runtime, "read", "读取 note.txt", "build")
             await wait_for(lambda: bool(model.reports))
-            assert calls == ["pwd"]
-            assert model.worker_calls == 0 and "bash" in model.direct_tools
+            assert model.worker_calls == 0 and "read_file" in model.direct_tools and "bash" not in model.direct_tools
             assert "workspace" in model.reports[0]
             def completed():
                 with db.new_session() as session:
@@ -1694,24 +1683,22 @@ def test_quick_command_runs_without_worker_model(isolated, monkeypatch):
     asyncio.run(run())
 
 
-def test_direct_command_runs_while_worker_slots_are_full(isolated, monkeypatch):
-    from app.agent import tools
-
-    monkeypatch.setattr(tools, "capture_bash", lambda command: ("workspace", False))
+def test_direct_read_runs_while_worker_slots_are_full(isolated):
+    (isolated / ("a" * 32) / "note.txt").write_text("workspace", encoding="utf-8")
 
     async def run():
         background = FakeModel()
         runtime = Runtime(client=background)
         await runtime.start()
         try:
-            for index in range(3):
+            for index in range(6):
                 await accept(runtime, f"task-{index}", f"任务 {index}", "build")
                 await wait_for(lambda: background.workers == index + 1)
-            model = DirectModel("bash", {"command": "pwd"})
+            model = DirectModel("read_file", {"path": "note.txt"})
             runtime.client = model
-            await accept(runtime, "pwd", "pwd", "build")
+            await accept(runtime, "read", "读取 note.txt", "build")
             await wait_for(lambda: bool(model.reports))
-            assert background.workers == 3 and model.worker_calls == 0
+            assert background.workers == 6 and model.worker_calls == 0
         finally:
             background.release_worker.set()
             await runtime.close()
@@ -1737,7 +1724,7 @@ def test_direct_steps_preserve_file_version_check(isolated):
                 yield event
 
     async def run():
-        path = isolated / "workspace" / "note.txt"
+        path = isolated / ("a" * 32) / "note.txt"
         path.write_text("old", encoding="utf-8")
         model = MultiStepModel()
         runtime = Runtime(client=model)
@@ -1769,7 +1756,7 @@ def test_direct_approval_does_not_block_chat(isolated, option):
             await accept(runtime, "write", "创建文件", "build")
             await wait_for(lambda: bool(runtime.approval_events))
             request_id = next(iter(runtime.approval_events))
-            assert not (isolated / "workspace" / "quick.txt").exists()
+            assert not (isolated / ("a" * 32) / "quick.txt").exists()
             await accept(runtime, "question", "另一个问题", "build")
             def answered():
                 with db.new_session() as session:
@@ -1778,7 +1765,7 @@ def test_direct_approval_does_not_block_chat(isolated, option):
             assert request_id in runtime.approval_events
             await decide(runtime, request_id, option)
             await wait_for(lambda: bool(model.reports))
-            assert (isolated / "workspace" / "quick.txt").exists() == (option == "allowOnce")
+            assert (isolated / ("a" * 32) / "quick.txt").exists() == (option == "allowOnce")
             assert model.worker_calls == 0
         finally:
             await runtime.close()
@@ -1820,7 +1807,7 @@ def test_direct_operation_respects_update_and_approval_order(isolated, monkeypat
                 await asyncio.wait_for(reached_start.wait(), 3)
             release_start.set()
             await wait_for(lambda: bool(model.reports))
-            assert (isolated / "workspace" / "ordered.txt").exists() == update_first
+            assert (isolated / ("a" * 32) / "ordered.txt").exists() == update_first
             if not update_first:
                 assert "收到新的用户要求" in model.reports[0]
             assert model.worker_calls == 0
@@ -1834,10 +1821,10 @@ def test_direct_started_tool_is_not_replayed_after_restart(isolated, monkeypatch
     from app.agent import tools
 
     calls = []
-    monkeypatch.setattr(tools, "capture_bash", lambda command: (calls.append(command) or "unexpected", False))
+    monkeypatch.setattr(tools, "execute_tool", lambda *args: calls.append(args) or "unexpected")
 
     async def run():
-        model = DirectModel("bash", {"command": "pwd"})
+        model = DirectModel("read_file", {"path": "note.txt"})
         model.issued = True
         runtime = Runtime(client=model)
         with db.new_session() as session:
@@ -1848,10 +1835,10 @@ def test_direct_started_tool_is_not_replayed_after_restart(isolated, monkeypatch
             task.update(status="running", run_id="run", direct=True, direct_phase="executing", direct_group=group)
             store.put(session, f"task:{task['id']}", task)
             store.append_history(session, task["context_id"], "assistant", [{
-                "type": "tool_use", "id": "call", "name": "bash", "input": {"command": "pwd"}}])
+                "type": "tool_use", "id": "call", "name": "read_file", "input": {"path": "note.txt"}}])
             store.put(session, f"execution:{identity}", {"type": "tool_execution", "id": identity,
                       "task_id": task["id"], "context_id": task["context_id"], "run_id": "run", "call_id": "call",
-                      "name": "bash", "input": {"command": "pwd"}, "status": "started"})
+                      "name": "read_file", "input": {"path": "note.txt"}, "status": "started"})
             store.put(session, f"group:{group}", {"type": "tool_group", "id": group,
                       "context_id": task["context_id"], "calls": [identity], "status": "pending"})
             session.commit()
@@ -1895,7 +1882,7 @@ def test_direct_pending_approval_is_reissued_after_restart(isolated):
                 assert store.get(session, "approval:old")["status"] == "expired"
             await decide(runtime, request, "allowOnce")
             await wait_for(lambda: bool(model.reports))
-            assert (isolated / "workspace" / "recovered.txt").read_text(encoding="utf-8") == "ok"
+            assert (isolated / ("a" * 32) / "recovered.txt").read_text(encoding="utf-8") == "ok"
             assert model.worker_calls == 0
         finally:
             await runtime.close()
@@ -2002,28 +1989,25 @@ def test_first_action_can_load_skill(isolated, monkeypatch):
     asyncio.run(run())
 
 
-def test_first_action_runs_pwd_in_two_model_calls(isolated, monkeypatch):
-    from app.agent import tools
-
-    calls = []
-    monkeypatch.setattr(tools, "capture_bash", lambda command: (calls.append(command) or "workspace", False))
+def test_first_action_reads_file_in_two_model_calls(isolated):
+    (isolated / ("a" * 32) / "note.txt").write_text("workspace", encoding="utf-8")
 
     async def run():
-        model = FirstActionModel("bash", {"command": "pwd"})
+        model = FirstActionModel("read_file", {"path": "note.txt"})
         runtime = Runtime(client=model)
         await runtime.start()
         try:
-            await accept(runtime, "pwd-first", "pwd", "build")
+            await accept(runtime, "read-first", "读取 note.txt", "build")
             await wait_for(lambda: bool(model.reply_messages))
-            assert model.calls == ["first", "reply"] and calls == ["pwd"]
+            assert model.calls == ["first", "reply"]
             assert "workspace" in json.dumps(model.reply_messages, ensure_ascii=False)
             with db.new_session() as session:
                 history = store.history(session, "main")
                 action = next(block for entry in history if isinstance(entry["content"], list)
                               for block in entry["content"] if block.get("type") == "tool_use")
                 assert action["name"] == "route_input"
-                assert action["input"]["first_action"]["name"] == "bash"
-                assert action["input"]["first_action"]["input"] == {"command": "pwd"}
+                assert action["input"]["first_action"]["name"] == "read_file"
+                assert action["input"]["first_action"]["input"] == {"path": "note.txt"}
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -2071,11 +2055,11 @@ def test_first_action_ids_are_scoped_to_the_user_message(isolated):
 
 
 @pytest.mark.parametrize("action", [
-    {"intent_index": True, "name": "bash", "input": {"command": "pwd"}},
-    {"intent_index": 1, "name": "bash", "input": {"command": "pwd"}},
+    {"intent_index": True, "name": "read_file", "input": {"path": "note.txt"}},
+    {"intent_index": 1, "name": "read_file", "input": {"path": "note.txt"}},
     {"intent_index": 0, "name": "task_stop", "input": {"task_id": "x"}},
-    {"intent_index": 0, "name": "bash", "input": {"command": 1}},
-    {"intent_index": 0, "name": "bash", "input": {"command": "pwd", "extra": "x"}},
+    {"intent_index": 0, "name": "read_file", "input": {"path": 1}},
+    {"intent_index": 0, "name": "read_file", "input": {"path": "note.txt", "extra": "x"}},
     {"intent_index": 0, "name": "read_file", "input": {"path": "a.txt", "offset": 0}},
     {"intent_index": 0, "name": "todo_write", "input": {"items": [{"content": "a", "status": "invalid"}]}},
 ])
@@ -2092,7 +2076,7 @@ def test_first_action_requires_a_nonempty_intent():
     event = {"message_id": "user:one", "user_seq": 1}
     route = {"message_id": event["message_id"], "user_seq": 1,
              "intents": [{"type": "chat", "instruction": "  "}], "needs_clarification": False,
-             "first_action": {"intent_index": 0, "name": "bash", "input": {"command": "pwd"}}}
+             "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "note.txt"}}}
     with pytest.raises(ValueError):
         Runtime._validate_route(route, event)
 
@@ -2101,7 +2085,7 @@ def test_first_action_requires_a_nonempty_intent():
 def test_first_action_keeps_mixed_intents_and_approval_order(isolated, newer_approval):
     with db.new_session() as session:
         store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("bash", {"command": "pwd"}))
+        runtime = Runtime(client=FirstActionModel("read_file", {"path": "note.txt"}))
         task = runtime.create_task(session, "删除 A", 1)
         task["status"] = "waiting_user"
         store.put(session, f"task:{task['id']}", task)
@@ -2118,13 +2102,13 @@ def test_first_action_keeps_mixed_intents_and_approval_order(isolated, newer_app
         route = {"message_id": event["message_id"], "user_seq": event["user_seq"],
                  "intents": [{"type": "update", "task_id": task["id"], "instruction": "不要删除 A", "approval_ids": ["a"]},
                              {"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": False,
-                 "first_action": {"intent_index": 1, "name": "bash", "input": {"command": "pwd"}}}
+                 "first_action": {"intent_index": 1, "name": "read_file", "input": {"path": "note.txt"}}}
         runtime._validate_route(route, event)
         runtime._apply_route(session, event, route, {"a"}, "first-call")
         direct = [t for t in store.records(session, "task_state") if t.get("direct")]
         assert len(direct) == 1 and direct[0]["direct_phase"] == "executing"
         assert store.get(session, "reply:mixed")["status"] == "completed"
-        assert store.records(session, "tool_execution")[0]["input"] == {"command": "pwd"}
+        assert store.records(session, "tool_execution")[0]["input"] == {"path": "note.txt"}
         updates = store.records(session, "agent_message", context_id=task["context_id"])
         assert bool(updates) != newer_approval
         if newer_approval:
@@ -2136,7 +2120,7 @@ def test_first_action_keeps_mixed_intents_and_approval_order(isolated, newer_app
 def test_first_action_is_not_started_after_newer_user_message(isolated):
     with db.new_session() as session:
         store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("bash", {"command": "pwd"}))
+        runtime = Runtime(client=FirstActionModel("read_file", {"path": "note.txt"}))
         event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
                  "text": "pwd", "user_seq": 1, "status": "pending"}
         store.put(session, "input:old", event)
@@ -2144,7 +2128,7 @@ def test_first_action_is_not_started_after_newer_user_message(isolated):
                   "message_id": "user:new", "text": "先不要执行", "user_seq": 2, "status": "pending"})
         route = {"message_id": event["message_id"], "user_seq": 1,
                  "intents": [{"type": "chat", "instruction": "pwd"}], "needs_clarification": False,
-                 "first_action": {"intent_index": 0, "name": "bash", "input": {"command": "pwd"}}}
+                 "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "note.txt"}}}
         runtime._apply_route(session, event, route, set(), "first-call")
         assert not store.records(session, "tool_execution")
 
@@ -2152,13 +2136,13 @@ def test_first_action_is_not_started_after_newer_user_message(isolated):
 def test_first_action_waits_if_intent_needs_clarification(isolated):
     with db.new_session() as session:
         store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("bash", {"command": "pwd"}))
+        runtime = Runtime(client=FirstActionModel("read_file", {"path": "note.txt"}))
         event = {"type": "user_event", "event_type": "message", "id": "unclear", "message_id": "user:unclear",
                  "text": "先确认再运行", "user_seq": 1, "status": "pending"}
         store.put(session, "input:unclear", event)
         route = {"message_id": event["message_id"], "user_seq": 1,
                  "intents": [{"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": True,
-                 "first_action": {"intent_index": 0, "name": "bash", "input": {"command": "pwd"}}}
+                 "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "note.txt"}}}
         blocks = [{"type": "tool_use", "id": "first-call", "name": "route_input", "input": route}]
         runtime._apply_route(session, event, route, set(), "first-call", blocks)
         assert not store.records(session, "tool_execution")
@@ -2170,17 +2154,17 @@ def test_first_action_waits_if_intent_needs_clarification(isolated):
 def test_first_action_keeps_a_clear_intent_when_another_needs_clarification(isolated):
     with db.new_session() as session:
         store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("bash", {"command": "pwd"}))
+        runtime = Runtime(client=FirstActionModel("read_file", {"path": "note.txt"}))
         event = {"type": "user_event", "event_type": "message", "id": "mixed-unclear",
                  "message_id": "user:mixed-unclear", "text": "处理之前的文件，同时运行 pwd", "user_seq": 1, "status": "pending"}
         store.put(session, "input:mixed-unclear", event)
         route = {"message_id": event["message_id"], "user_seq": 1,
                  "intents": [{"type": "unclear", "instruction": "不确定要处理哪个文件"},
                              {"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": True,
-                 "first_action": {"intent_index": 1, "name": "bash", "input": {"command": "pwd"}}}
+                 "first_action": {"intent_index": 1, "name": "read_file", "input": {"path": "note.txt"}}}
         runtime._validate_route(route, event)
         runtime._apply_route(session, event, route, set(), "first-call")
-        assert store.records(session, "tool_execution")[0]["input"] == {"command": "pwd"}
+        assert store.records(session, "tool_execution")[0]["input"] == {"path": "note.txt"}
         assert "需要向用户澄清" in str(store.history(session, "main")[-1]["content"])
 
 
@@ -2230,10 +2214,10 @@ def test_first_action_started_before_restart_is_not_replayed(isolated, monkeypat
     from app.agent import tools
 
     calls = []
-    monkeypatch.setattr(tools, "capture_bash", lambda command: (calls.append(command) or "unexpected", False))
+    monkeypatch.setattr(tools, "execute_tool", lambda *args: calls.append(args) or "unexpected")
 
     async def run():
-        model = FirstActionModel("bash", {"command": "pwd"})
+        model = FirstActionModel("read_file", {"path": "note.txt"})
         runtime = Runtime(client=model)
         with db.new_session() as session:
             store.initialize(session, isolated)
@@ -2242,7 +2226,7 @@ def test_first_action_started_before_restart_is_not_replayed(isolated, monkeypat
             store.put(session, "input:recover-first", event)
             route = {"message_id": event["message_id"], "user_seq": 1,
                      "intents": [{"type": "chat", "instruction": "pwd"}], "needs_clarification": False,
-                     "first_action": {"intent_index": 0, "name": "bash", "input": {"command": "pwd"}}}
+                     "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "note.txt"}}}
             blocks = [{"type": "tool_use", "id": "first-call", "name": "route_input", "input": route}]
             runtime._apply_route(session, event, route, set(), "first-call", blocks)
             execution = store.records(session, "tool_execution")[0]
