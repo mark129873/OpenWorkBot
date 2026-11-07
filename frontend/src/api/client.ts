@@ -65,8 +65,9 @@ export interface ChatMessage {
 
 export interface ChatApproval {
   request_id: string
-  task_id: string
-  task_title: string
+  task_id: string | null
+  task_title: string | null
+  kind?: 'sandbox_network'
   tool: string
   input: unknown
   reason: string

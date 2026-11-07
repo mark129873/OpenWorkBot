@@ -363,6 +363,7 @@ function ApprovalCard({ approval, decide, disabled }: {
   const [feedback, setFeedback] = useState('')
   const [error, setError] = useState<string | null>(null)
   const busyRef = useRef(false)
+  const owner = approval.kind === 'sandbox_network' ? '当前用户的共享沙箱' : `任务「${approval.task_title}」`
   const options = approval.options.filter((option) => ['allowOnce', 'allowSession', 'deny'].includes(option.option_id))
   const select = (option: ApprovalOptionId) => {
     if (busyRef.current || disabled) return
@@ -376,8 +377,8 @@ function ApprovalCard({ approval, decide, disabled }: {
     })
   }
   return (
-    <section aria-label={`任务 ${approval.task_title} 的审批`} className="rounded-xl border border-amber-200 bg-amber-50/40 p-5">
-      <h2 className="flex items-center gap-2 text-[14px] font-semibold text-zinc-800"><ShieldCheck size={20} />任务「{approval.task_title}」需要确认</h2>
+    <section aria-label={`${owner}的审批`} className="rounded-xl border border-amber-200 bg-amber-50/40 p-5">
+      <h2 className="flex items-center gap-2 text-[14px] font-semibold text-zinc-800"><ShieldCheck size={20} />{owner}需要确认</h2>
       <p className="mt-2 text-[13px] leading-6 text-zinc-600">{approval.reason}（{approval.tool}）</p>
       <pre className="mt-3 max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-white p-3 text-[12px] text-zinc-700">{JSON.stringify(approval.input ?? {}, null, 2)}</pre>
       <div className="mt-3 flex flex-wrap gap-2">

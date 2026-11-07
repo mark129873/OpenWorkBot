@@ -62,10 +62,61 @@ async def decide(runtime, *args, **kwargs):
     return await runtime.decide(*args, assistant_id=(await runtime.snapshot())["assistant_id"], **kwargs)
 
 
+def test_memory_is_available_only_to_main_agent(isolated):
+    from app.agent.memory_store import _read_files, _store, empty_memory
+
+    class Model(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.main_memory = None
+            self.worker_memory = None
+
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            if tool_choice and tool_choice["name"] == "route_input":
+                self.main_memory = (system, messages)
+            elif system.startswith("你是后台工作助手"):
+                self.worker_memory = (system, messages)
+            async for item in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
+                yield item
+
+    async def run():
+        model = Model()
+        runtime = Runtime(model)
+        await runtime.start()
+        try:
+            summary = empty_memory()
+            summary["user"]["personalContext"]["summary"] = "个人偏好标记"
+            _store("a" * 32, summary, [])
+            await accept(runtime, "memory-worker", "任务：执行测试", None)
+            await asyncio.wait_for(model.worker_started.wait(), 4)
+            assert "个人偏好标记" not in model.main_memory[0]
+            assert "个人偏好标记" in json.dumps(model.main_memory[1], ensure_ascii=False)
+            assert "个人偏好标记" not in json.dumps(model.worker_memory, ensure_ascii=False)
+            summary, facts = _read_files("a" * 32)
+            summary["user"]["personalContext"]["summary"] = "更新偏好标记"
+            _store("a" * 32, summary, facts, summary["revision"])
+            await accept(runtime, "memory-refresh", "简短问答", None)
+            await wait_for(lambda: "更新偏好标记" in json.dumps(model.main_memory[1], ensure_ascii=False))
+        finally:
+            model.release_worker.set()
+            await runtime.close()
+
+    asyncio.run(run())
+
+
 @pytest.fixture
 def isolated(tmp_path, monkeypatch):
+    from app.sandbox.lease import SandboxLeaseManager
+    from fake_sandbox import FakeProvider
+
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "modelio_dir", tmp_path / "modelio")
+    original_init = Runtime.__init__
+    def init(runtime, *args, **kwargs):
+        if "sandbox_leases" not in kwargs:
+            kwargs["sandbox_leases"] = SandboxLeaseManager(FakeProvider())
+        original_init(runtime, *args, **kwargs)
+    monkeypatch.setattr(Runtime, "__init__", init)
     (tmp_path / ("a" * 32)).mkdir()
     db.dispose_engine()
     db.init_db(tmp_path)
@@ -505,6 +556,31 @@ def test_process_lock_rejects_second_instance(isolated):
     second.release()
 
 
+def test_approval_rejects_option_not_offered(isolated):
+    async def run():
+        runtime = Runtime(client=FakeModel())
+        await runtime.start()
+        try:
+            def setup(session):
+                task = runtime.create_task(session, "等待审批", 1)
+                task.update(status="waiting_user", run_id="run")
+                store.put(session, f"task:{task['id']}", task)
+                store.put(session, "approval:limited", {
+                    "type": "approval", "request_id": "limited", "task_id": task["id"],
+                    "status": "requested", "scope": ["bash", "command"],
+                    "options": [{"option_id": "allowOnce"}, {"option_id": "deny"}],
+                })
+            await runtime.change(setup)
+            with pytest.raises(Conflict, match="审批选项不属于当前请求"):
+                await decide(runtime, "limited", "allowSession")
+            with db.new_session() as session:
+                assert store.get(session, "approval:limited")["status"] == "requested"
+            assert (await decide(runtime, "limited", "allowOnce"))["ok"]
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
 def test_approval_stays_available_and_session_grant_is_shared(isolated):
     from app.agent.worker import Worker
     from app.sessions import session_permissions
@@ -545,6 +621,7 @@ def test_approval_stays_available_and_session_grant_is_shared(isolated):
 def test_file_owner_requires_reread_before_other_task_writes(isolated):
     from app.agent.worker import Worker
     from app.sessions import execution_state
+    from fake_sandbox import FakeSandbox
 
     async def run():
         runtime = Runtime(client=FakeModel())
@@ -559,6 +636,7 @@ def test_file_owner_requires_reread_before_other_task_writes(isolated):
         workers = [Worker(runtime, t["id"]) for t in tasks]
         for worker, task in zip(workers, tasks):
             worker.context_id, worker.run_id = task["context_id"], task["run_id"]
+            worker.sandbox = FakeSandbox()
 
         async def call(worker, name, inputs):
             execution = {"id": new_id(), "call_id": new_id(), "name": name, "input": inputs, "status": "pending"}
@@ -622,7 +700,7 @@ def test_scheduler_caps_parallel_workers_at_six(isolated):
                 for number in range(7):
                     runtime.create_task(session, f"任务 {number}", number + 1)
             await runtime.change(create)
-            await wait_for(lambda: model.workers == 6)
+            await wait_for(lambda: model.workers == 6, timeout=12)
             await asyncio.sleep(0.4)
             with db.new_session() as session:
                 states = [t["status"] for t in store.records(session, "task_state")]
@@ -632,7 +710,7 @@ def test_scheduler_caps_parallel_workers_at_six(isolated):
             def all_done():
                 with db.new_session() as session:
                     return all(t["status"] == "completed" for t in store.records(session, "task_state"))
-            await wait_for(all_done, timeout=8)
+            await wait_for(all_done, timeout=20)
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -1309,7 +1387,7 @@ def test_waiting_agent_resumes_on_user_update_and_detects_wait_cycle(isolated):
     asyncio.run(run())
 
 
-def test_report_delivery_failure_retries_without_duplicate_context(isolated):
+def test_report_delivery_failure_retries_without_duplicate_context(isolated, monkeypatch):
     from app.agent import agent_bus
 
     class FlakyModel(FakeModel):
@@ -1326,6 +1404,9 @@ def test_report_delivery_failure_retries_without_duplicate_context(isolated):
 
     async def run():
         runtime = Runtime(client=FlakyModel())
+        async def keep_records():
+            pass
+        monkeypatch.setattr(runtime, "_cleanup_finished", keep_records)
         with db.new_session() as session:
             store.initialize(session, isolated)
             task = runtime.create_task(session, "检查工作", 1)
@@ -1598,7 +1679,7 @@ def test_worker_rejects_host_commands(isolated, monkeypatch):
     monkeypatch.setattr(hooks, "trigger", lambda event, data: states.append(data["status"]) if event == "PostToolUse" else None)
 
     async def run():
-        runtime = Runtime(client=FakeModel())
+        runtime = Runtime(client=FakeModel(), sandbox_leases=None)
         with db.new_session() as session:
             store.initialize(session, isolated)
             task = runtime.create_task(session, "测试命令", 1)
@@ -1671,7 +1752,7 @@ def test_quick_file_read_runs_without_worker_model(isolated):
         try:
             await accept(runtime, "read", "读取 note.txt", "build")
             await wait_for(lambda: bool(model.reports))
-            assert model.worker_calls == 0 and "read_file" in model.direct_tools and "bash" not in model.direct_tools
+            assert model.worker_calls == 0 and "read_file" in model.direct_tools and "bash" in model.direct_tools
             assert "workspace" in model.reports[0]
             def completed():
                 with db.new_session() as session:

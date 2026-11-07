@@ -3,25 +3,27 @@
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import time
 from types import SimpleNamespace
 
+from jsonschema import ValidationError, validate
+
 from app import db
-from app.agent import agent_bus, compact, hooks, skills, tools
-from app.agent.model_call import record_model_step
+from app.agent import agent_bus, hooks, tools
 from app.agent.rag_client import RAG_NAMES
 from app.agent.runtime import read_output
-from app.agent.task_tools import WORKER_TOOLS
 from app.config import settings
 from app.models import new_id
-from app.sessions import approvals, chat_store as store, session_permissions
+from app.sessions import approvals, chat_store as store, execution_state, session_permissions
 from app.user_context import scoped
 
 _PROMPT = """你是后台工作助手，专注完成给定任务。独立保存工作上下文；先读后改，工具执行失败不能当作成功。
 知识库由所有用户共享。查询用 rag_search；仅在用户明确要求时调用 rag_ingest 或 rag_remove。
-已指定文件时直接入库；移出前用 rag_list 查文件 ID。普通知识问答完整返回工具答案。宿主命令不可用。
+已指定文件时直接入库；移出前用 rag_list 查文件 ID。普通知识问答完整返回工具答案。
+bash 仅在用户共享沙箱内运行，并按权限审批；宿主命令不可用。
 必须遵守用户限定的操作和顺序；不确定时询问主助手。
 关键进展或需要用户确认的问题使用 task_report 告诉主助手。完成后简短汇报结果、验证及未解决的问题。
 收到用户修改、停止或同伴消息时按最新要求调整；不要冒充主助手或其他助手。"""
@@ -60,7 +62,9 @@ class Worker:
         self.stop = runtime.stops.setdefault(task_id, asyncio.Event())
         self.context_id = ""
         self.run_id = ""
-        self.memory = ""
+        self.sandbox = None
+        self.sandbox_scope = ""
+        self.keep_sandbox = False
 
     def task(self) -> dict:
         with db.new_session() as session:
@@ -70,99 +74,9 @@ class Worker:
         return task
 
     async def run(self) -> None:
-        task = self.task()
-        if self.helper_id:
-            with db.new_session() as session:
-                state = store.get(session, f"helper:{self.helper_id}")
-            self.context_id, self.run_id = state["context_id"], state["run_id"]
-        else:
-            self.context_id, self.run_id = task["context_id"], task["run_id"]
-        self.memory = await self.runtime.memory_snapshot(task.get("goal", ""))
-        if not await self.runtime.reconcile_incoming(self.context_id):
-            return
-        await self.resume_groups()
-        while True:
-            task = self.task()
-            if task.get("stop_requested") or self.stop.is_set():
-                await self.finish("stopped", "任务已停止；已开始的操作可能已产生副作用。")
-                return
-            if task.get("dependency") and not self.helper_id:
-                def pause(session):
-                    current = store.get(session, f"task:{self.task_id}")
-                    current["status"] = "waiting_dependency"
-                    store.put(session, f"task:{self.task_id}", current)
-                await self.runtime.change(pause)
-                return
-            if self.helper_id:
-                with db.new_session() as session:
-                    state = store.get(session, f"helper:{self.helper_id}")
-            else:
-                state = task
-            if state["steps"] >= 30:
-                await self.finish("limit", "本轮达到 30 步上限，请判断是否继续或停止。")
-                return
-            if not await self.deliver_messages():
-                return
-            def step(session):
-                key = f"helper:{self.helper_id}" if self.helper_id else f"task:{self.task_id}"
-                current = store.get(session, key)
-                current["steps"] += 1
-                store.put(session, key, current)
-                return current["steps"]
-            step_number = await self.runtime.change(step)
-            history = await compact.context_history(self.runtime, self.context_id)
-            deps = SimpleNamespace(client=self.runtime.client,
-                                   recorder=SimpleNamespace(session_id="main", turn_id=self.run_id))
-            system_prompt = _PROMPT + skills.skill_prompt() + self.runtime.memory_prompt(self.memory)
-            with record_model_step(deps, system_prompt, history, WORKER_TOOLS, subtask_id=self.task_id) as reply:
-                async def model_step():
-                    async for event in self.runtime.client.stream(system=system_prompt, messages=history, tools=WORKER_TOOLS):
-                        reply.accept(event)
-                await self.runtime.graph.invoke(self.context_id, history=history, memory=self.memory, action=model_step)
-            if reply.stop_reason == "max_tokens":
-                await self.finish("failed", "模型输出达到上限，本轮未完成。")
-                return
-            blocks = reply.assistant_blocks()
-            if not blocks:
-                await self.finish("failed", "模型没有返回内容，本轮未完成。")
-                return
-            if not reply.tool_uses:
-                await self.runtime.change(lambda session: store.append_history(session, self.context_id, "assistant", blocks))
-                with db.new_session() as session:
-                    incoming = store.records(session, "agent_message", context_id=self.context_id, delivery="pending")
-                if incoming or self.stop.is_set() or self.task().get("dependency"):
-                    continue
-                injection = hooks.trigger("Stop", {"turn_id": self.run_id, "task_id": self.task_id, "steps": step_number})
-                if isinstance(injection, str) and injection:
-                    await self.runtime.change(lambda session: store.append_history(session, self.context_id, "user", injection))
-                    continue
-                await self.finish("result", reply.text or "助手未提供结果。")
-                return
-            group_id = f"{self.task_id}:{self.run_id}:{step_number}"
-            ids = [call.get("id") for call in reply.tool_uses]
-            if any(not isinstance(item, str) or not item for item in ids) or len(ids) != len(set(ids)):
-                await self.finish("failed", "模型返回了无效或重复的工具调用 ID。")
-                return
-            def save_group(session):
-                store.append_history(session, self.context_id, "assistant", blocks, key=f"step:{group_id}")
-                calls = []
-                for call in reply.tool_uses:
-                    identity = f"{self.task_id}:{self.run_id}:{call['id']}"
-                    existing = store.get(session, f"execution:{identity}")
-                    if existing and (existing["name"] != call["name"] or existing["input"] != (call.get("input") or {})):
-                        raise ValueError("重复工具调用 ID 的参数不一致")
-                    if not existing:
-                        task = store.get(session, f"task:{self.task_id}")
-                        store.put(session, f"execution:{identity}", {
-                            "type": "tool_execution", "id": identity, "task_id": self.task_id,
-                            "context_id": self.context_id, "run_id": self.run_id, "call_id": call["id"],
-                            "name": call["name"], "input": call.get("input") or {}, "status": "pending",
-                            "user_seq": task.get("latest_user_seq", task["order"])})
-                    calls.append(identity)
-                store.put(session, f"group:{group_id}", {"type": "tool_group", "id": group_id,
-                          "context_id": self.context_id, "calls": calls, "status": "pending"})
-            await self.runtime.change(save_group)
-            await self.process_group(group_id)
+        from app.agent.worker_graph import run
+
+        await run(self)
 
     async def deliver_messages(self) -> bool:
         with db.new_session() as session:
@@ -187,31 +101,45 @@ class Worker:
             await self.process_group(group_id)
 
     async def process_group(self, group_id: str) -> None:
+        from app.agent.worker_graph import process_group
+
+        await process_group(self, group_id)
+
+    async def process_execution(self, identity: str) -> str:
         with db.new_session() as session:
-            group = store.get(session, f"group:{group_id}")
-        for identity in group["calls"]:
-            with db.new_session() as session:
-                execution = store.get(session, f"execution:{identity}")
-            if execution["status"] != "completed":
-                started_at = time.monotonic()
-                context = {"name": execution["name"], "tool_call_id": execution["call_id"], "task_id": self.task_id}
-                hooks.trigger("PreToolUse", context)
-                try:
-                    output = await self.execute(execution)
-                except AgentWaiting:
-                    raise
-                except Exception:
-                    hooks.trigger("PostToolUse", {**context, "status": "error", "duration_ms": (time.monotonic() - started_at) * 1000})
-                    raise
-                hooks.trigger("PostToolUse", {**context, "status": "error" if output.startswith("Error:") else "completed",
-                                               "duration_ms": (time.monotonic() - started_at) * 1000})
-                def save_result(session):
-                    current = store.get(session, f"execution:{identity}")
-                    current.update(status="completed", output=output)
-                    if "结果未知" in output or "结果可能未知" in output:
-                        current["result_unknown"] = True
-                    store.put(session, f"execution:{identity}", current)
-                await self.runtime.change(save_result)
+            execution = store.get(session, f"execution:{identity}")
+        if execution["status"] == "completed":
+            return execution["output"]
+        if execution["status"] == "started":
+            output = "Error: 工具结果未知，可能已产生副作用；请先检查，不要自动重跑。"
+            def unknown(session):
+                current = store.get(session, f"execution:{identity}")
+                current.update(status="completed", output=output, result_unknown=True)
+                store.put(session, f"execution:{identity}", current)
+            await self.runtime.change(unknown)
+            return output
+        started_at = time.monotonic()
+        context = {"name": execution["name"], "tool_call_id": execution["call_id"], "task_id": self.task_id}
+        hooks.trigger("PreToolUse", context)
+        try:
+            output = await self.execute(execution)
+        except AgentWaiting:
+            raise
+        except Exception:
+            hooks.trigger("PostToolUse", {**context, "status": "error", "duration_ms": (time.monotonic() - started_at) * 1000})
+            raise
+        hooks.trigger("PostToolUse", {**context, "status": "error" if output.startswith("Error:") else "completed",
+                                       "duration_ms": (time.monotonic() - started_at) * 1000})
+        def save_result(session):
+            current = store.get(session, f"execution:{identity}")
+            current.update(status="completed", output=output)
+            if "结果未知" in output or "结果可能未知" in output:
+                current["result_unknown"] = True
+            store.put(session, f"execution:{identity}", current)
+        await self.runtime.change(save_result)
+        return output
+
+    async def finish_group(self, group_id: str) -> None:
         def finish_group(session):
             current = store.get(session, f"group:{group_id}")
             outputs = []
@@ -220,6 +148,11 @@ class Worker:
                 output = execution["output"]
                 outputs.append({"type": "tool_result", "tool_use_id": execution["call_id"], "content": output,
                                 **({"is_error": True} if output.startswith("Error:") else {})})
+                if execution["name"] == "agent_wait":
+                    wait = store.get(session, f"agent-wait:{identity}")
+                    if wait:
+                        wait["status"] = "completed"
+                        store.put(session, f"agent-wait:{identity}", wait)
             store.append_history(session, self.context_id, "user", outputs, key=f"result:{group_id}")
             current["status"] = "completed"
             store.put(session, f"group:{group_id}", current)
@@ -231,6 +164,12 @@ class Worker:
         name, args = execution["name"], execution["input"]
         if not isinstance(args, dict):
             return "Error: 工具参数必须是对象"
+        if name in {"read_file", "write_file", "edit_file", "glob", "delete_file"}:
+            schema = next(spec["input_schema"] for spec in tools.TOOLS if spec["name"] == name)
+            try:
+                validate(args, {**schema, "additionalProperties": False})
+            except ValidationError:
+                return "Error: 文件工具参数无效。"
         from app.agent import coordination
 
         if name in coordination.NAMES:
@@ -244,11 +183,21 @@ class Worker:
         if name in RAG_NAMES:
             return await self.rag_tool(execution)
         if name == "bash":
-            return "Error: 当前沙箱禁止宿主命令。"
+            return await self.bash_tool(execution)
         if name not in tools.TOOL_HANDLERS and name != "todo_write":
             return f"Error: 未知工具 {name}"
         if name in {"read_file", "write_file", "edit_file", "delete_file"}:
             return await self.file_tool(execution)
+        if name == "glob":
+            if self.sandbox is None:
+                return "Error: 沙箱不可用，文件操作未执行。"
+            error = await self.authorize(execution)
+            if error:
+                return error
+            error = await self.started(execution)
+            if error:
+                return error
+            return await self.runtime.run_tool(self.sandbox.file_operation, name, args)
         error = await self.authorize(execution)
         if error:
             return error
@@ -264,6 +213,46 @@ class Worker:
             await self.runtime.change(lambda session: replace_todos(session, scoped("main"), items, commit=False))
             return render_panel(items)
         return await self.runtime.run_tool(tools.execute_tool, name, args)
+
+    async def bash_tool(self, execution: dict) -> str:
+        from app.agent.permission_service import evaluate
+
+        args = execution["input"]
+        command = args.get("command")
+        if set(args) != {"command"} or not isinstance(command, str) or not command.strip():
+            return "Error: 命令参数无效。"
+        if self.sandbox is None or not self.sandbox_scope:
+            return "Error: 沙箱不可用，禁止宿主命令。"
+        if (type(settings.bash_timeout) not in {int, float} or not math.isfinite(settings.bash_timeout)
+                or settings.bash_timeout <= 0):
+            return "Error: 命令超时配置无效。"
+        before = execution_state.load_execution_state(settings.data_dir)["mode"]
+        error = await self.authorize(execution, sandboxed=True)
+        if error:
+            return error
+        current = execution_state.load_execution_state(settings.data_dir)["mode"]
+        if evaluate(settings.data_dir, "bash", args, sandboxed=True)["decision"] == "deny":
+            return "Error: 命令已被安全策略拒绝。"
+        if before == "yolo" and current != "yolo":
+            return "Error: 权限模式已变化，请重新发起命令并审批。"
+        error = await self.started(execution, execution.get("user_seq"))
+        if error:
+            return error
+        command_task = asyncio.create_task(self.runtime.run_tool(
+            self.sandbox.execute_command_in_scope, command, timeout=settings.bash_timeout, scope_id=self.sandbox_scope))
+        stop_task = asyncio.create_task(self.stop.wait())
+        try:
+            await asyncio.wait([command_task, stop_task], return_when=asyncio.FIRST_COMPLETED)
+            if self.stop.is_set():
+                self.sandbox.request_command_cancel(self.sandbox_scope)
+            return await asyncio.shield(command_task)
+        except asyncio.CancelledError:
+            self.sandbox.request_command_cancel(self.sandbox_scope)
+            await asyncio.shield(command_task)
+            raise
+        finally:
+            stop_task.cancel()
+            await asyncio.gather(stop_task, return_exceptions=True)
 
     async def rag_tool(self, execution: dict) -> str:
         from app.agent.permission_service import evaluate
@@ -398,12 +387,12 @@ class Worker:
                 return not bool(re.search(r"(?:不要|禁止|不许|别|无需|不必|do not|don't|never).{0,30}(?:" + actions + r"|重试|再试|retry)", text))
         return False
 
-    async def authorize(self, execution: dict) -> str | None:
+    async def authorize(self, execution: dict, *, sandboxed: bool = False) -> str | None:
         name, args = execution["name"], execution["input"]
         deps = SimpleNamespace(recorder=SimpleNamespace(session_id=scoped("main")),
                                stop_flag=lambda: self.stop.is_set(),
-                               approver=lambda tool, inputs, reason: self.approve(execution, reason))
-        return await approvals.authorize_tool(deps, name, args, data_dir=settings.data_dir)
+                               approver=lambda tool, inputs, reason: self.approve(execution, reason, sandboxed=sandboxed))
+        return await approvals.authorize_tool(deps, name, args, data_dir=settings.data_dir, sandboxed=sandboxed)
 
     async def started(self, execution: dict, expected_user_seq: int | None = None) -> str | None:
         def started(session):
@@ -438,6 +427,8 @@ class Worker:
 
     async def file_tool(self, execution: dict) -> str:
         name, args = execution["name"], execution["input"]
+        if self.sandbox is None:
+            return "Error: 沙箱不可用，文件操作未执行。"
         try:
             path = os.path.normcase(str(tools.safe_path(args["path"])))
         except (KeyError, TypeError, ValueError, OSError) as exc:
@@ -451,7 +442,9 @@ class Worker:
         async with lock:
             if self.stop.is_set():
                 return "Error: 用户已停止任务，工具未执行。"
-            initial_version = await self.runtime.run_tool(file_version, path)
+            initial_version = await self.runtime.run_tool(self.sandbox.file_operation, "version", {"path": args["path"]})
+            if initial_version.startswith("Error:"):
+                return initial_version
             if writing:
                 current_version = initial_version
                 version_key = f"version:{self.context_id}:{hashlib.sha256(path.encode()).hexdigest()}"
@@ -479,14 +472,17 @@ class Worker:
                         task["files"].append(path)
                         store.put(session, f"task:{self.task_id}", task)
                 await self.runtime.change(claim)
-                if read_version and read_version["version"] != await self.runtime.run_tool(file_version, path):
+                if read_version and read_version["version"] != await self.runtime.run_tool(
+                        self.sandbox.file_operation, "version", {"path": args["path"]}):
                     return "Error: 审批期间文件已被修改，请重新读取并重新发起操作。"
             error = await self.started(execution)
             if error:
                 return error
-            result = await self.runtime.run_tool(tools.execute_tool, name, args)
+            result = await self.runtime.run_tool(self.sandbox.file_operation, name, args)
             if not result.startswith("Error:"):
-                version = await self.runtime.run_tool(file_version, path)
+                version = await self.runtime.run_tool(self.sandbox.file_operation, "version", {"path": args["path"]})
+                if version.startswith("Error:"):
+                    return "Error: 文件操作后版本结果未知，请先核查。"
                 if not writing and version != initial_version:
                     return "Error: 读取期间文件发生变化，请重新读取。"
                 key = f"version:{self.context_id}:{hashlib.sha256(path.encode()).hexdigest()}"
@@ -546,7 +542,7 @@ class Worker:
         await self.runtime.change(lambda session: store.put(session, key, {
             "type": "file_wait", "task_id": self.task_id, "path": path, "status": "completed"}))
 
-    async def approve(self, execution: dict, reason: str) -> dict:
+    async def approve(self, execution: dict, reason: str, *, sandboxed: bool = False) -> dict:
         request_id = new_id()
         scope = session_permissions.scope_for(execution["name"], execution["input"])
         event = asyncio.Event()
@@ -581,7 +577,7 @@ class Worker:
         allowed = bool(record and record["status"] == "resolved" and record["option_id"] != "deny" and not self.stop.is_set())
         if allowed:
             from app.agent.permission_service import evaluate
-            allowed = (evaluate(settings.data_dir, execution["name"], execution["input"])["decision"] != "deny"
+            allowed = (evaluate(settings.data_dir, execution["name"], execution["input"], sandboxed=sandboxed)["decision"] != "deny"
                        and scope == session_permissions.scope_for(execution["name"], execution["input"]))
         if allowed and record["option_id"] == "allowSession" and scope is not None:
             session_permissions.grant(scoped("main"), scope)
@@ -702,7 +698,8 @@ class Worker:
             if result is not None:
                 wait = store.get(session, key)
                 if wait:
-                    wait["status"] = "completed"
+                    execution = store.get(session, f"execution:{identity}")
+                    wait["status"] = "ready" if execution and execution["status"] != "completed" else "completed"
                     store.put(session, key, wait)
                 store.put(session, f"wait-result:{identity}", {"type": "agent_wait_result",
                           "context_id": self.context_id, "content": result})
@@ -768,14 +765,3 @@ class Worker:
                            kind="result" if result == "stopped" else "review",
                            message_id=f"finish:{self.task_id}:{self.run_id}", run_id=self.run_id)
         await self.runtime.change(save)
-
-
-def file_version(path: str) -> str:
-    try:
-        digest = hashlib.sha256()
-        with open(path, "rb") as source:
-            while chunk := source.read(1024 * 1024):
-                digest.update(chunk)
-        return digest.hexdigest()
-    except FileNotFoundError:
-        return "missing"

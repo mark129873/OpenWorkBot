@@ -34,8 +34,8 @@ async def lifespan(app: FastAPI):
             await saver.setup()
             gateway = Gateway(saver)
             app.state.gateway = gateway
-            await gateway.start()
             try:
+                await gateway.start()
                 yield
             finally:
                 await gateway.close()

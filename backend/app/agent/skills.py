@@ -76,7 +76,7 @@ def tool_load_skill(name: str, path: str | None = None, offset: int = 0) -> str:
         if path is None:
             if offset:
                 return "Error: 读取技能说明不支持 offset"
-            return f"技能目录：{directory}\n\n{manifest.read_text(encoding='utf-8')}"
+            return f"技能目录：/mnt/skills/{name}\n\n{manifest.read_text(encoding='utf-8')}"
         if not isinstance(path, str) or not path or Path(path).is_absolute() or PureWindowsPath(path).anchor:
             return "Error: 资源路径必须相对技能目录"
         target = (directory / path).resolve()

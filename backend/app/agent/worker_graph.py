@@ -1,0 +1,213 @@
+from types import SimpleNamespace
+
+from langchain_core.messages import AIMessage
+
+from app import db
+from app.agent import compact, hooks, skills
+from app.agent.model_call import record_model_step
+from app.agent.task_tools import WORKER_TOOLS
+from app.models import new_id
+from app.sessions import chat_store as store
+
+
+async def _tool_call(worker, call, context):
+    with db.new_session() as session:
+        group = store.get(session, f"group:{context['group_id']}")
+        executions = [store.get(session, f"execution:{identity}") for identity in group["calls"]]
+    execution = next((item for item in executions if item["call_id"] == call["id"]), None)
+    if not execution or execution["name"] != call["name"] or execution["input"] != call["args"]:
+        raise ValueError("工具调用与执行记录不一致")
+    worker.sandbox = context.get("sandbox")
+    worker.sandbox_scope = context["owner_id"]
+    return await worker.process_execution(execution["id"])
+
+
+async def _invoke(worker, before_model, model_call, after_model=None, *, group_id=None):
+    runtime = worker.runtime
+    async with runtime.graph.write_lock:
+        thread_id = runtime.graph.thread_id(f"{worker.context_id}:loop", parent_context=worker.context_id)
+
+    async def tool_call(call, context):
+        from app.agent.worker import AgentWaiting
+
+        try:
+            return await _tool_call(worker, call, context)
+        except AgentWaiting:
+            if context.get("retain_sandbox"):
+                context["retain_on_error"] = True
+            raise
+
+    if worker.task().get("direct"):
+        context = runtime.direct_sandboxes.setdefault(worker.task_id, {
+            "user_id": runtime.user_id, "thread_id": f"{runtime.user_id}:{worker.context_id}:{worker.run_id}",
+            "owner_id": f"direct:{worker.task_id}:{worker.run_id}", "retain_sandbox": True})
+    elif worker.keep_sandbox:
+        key = f"{worker.context_id}:{worker.run_id}"
+        context = runtime.worker_sandboxes.setdefault(key, {
+            "user_id": runtime.user_id, "thread_id": f"{runtime.user_id}:{key}", "owner_id": f"worker:{key}",
+            "retain_sandbox": True, "task_id": worker.task_id, "context_id": worker.context_id,
+            "run_id": worker.run_id})
+    else:
+        context = {"user_id": runtime.user_id, "thread_id": thread_id, "owner_id": f"{worker.run_id}:{new_id()}"}
+    context.pop("injected", None)
+    context.pop("retain_on_error", None)
+    context.pop("_ordered_tool_groups", None)
+    context.update(before_model=before_model, model_call=model_call, tool_call=tool_call,
+                   after_model=after_model, group_id=group_id)
+    await runtime.graph.invoke_loop(runtime.agent_loop, thread_id, context)
+
+
+async def process_group(worker, group_id):
+    with db.new_session() as session:
+        group = store.get(session, f"group:{group_id}")
+        executions = [store.get(session, f"execution:{identity}") for identity in group["calls"]]
+    pending = [item for item in executions if item["status"] != "completed"]
+    if not pending:
+        await worker.finish_group(group_id)
+        return
+
+    async def before_model(state, context):
+        if context.get("injected"):
+            await worker.finish_group(group_id)
+            return {"jump_to": "end"}
+        context["injected"] = True
+        calls = [{"id": item["call_id"], "name": item["name"], "args": item["input"], "type": "tool_call"}
+                 for item in pending]
+        return {"messages": [AIMessage(content="", tool_calls=calls)], "jump_to": "tools"}
+
+    async def model_call(state, context):
+        raise RuntimeError("已保存的工具调用不能再次请求模型")
+
+    await _invoke(worker, before_model, model_call, group_id=group_id)
+
+
+async def run(worker):
+    from app.agent.worker import _PROMPT
+
+    runtime = worker.runtime
+    task = worker.task()
+    if worker.helper_id:
+        with db.new_session() as session:
+            state = store.get(session, f"helper:{worker.helper_id}")
+        worker.context_id, worker.run_id = state["context_id"], state["run_id"]
+    else:
+        worker.context_id, worker.run_id = task["context_id"], task["run_id"]
+    if not await runtime.reconcile_incoming(worker.context_id):
+        return
+    worker.keep_sandbox = True
+
+    async def before_model(state, context):
+        if group_id := context.pop("group_id", None):
+            await worker.finish_group(group_id)
+        task = worker.task()
+        if task.get("stop_requested") or worker.stop.is_set():
+            await worker.finish("stopped", "任务已停止；已开始的操作可能已产生副作用。")
+            return {"jump_to": "end"}
+        if task.get("dependency") and not worker.helper_id:
+            def pause(session):
+                current = store.get(session, f"task:{worker.task_id}")
+                current["status"] = "waiting_dependency"
+                store.put(session, f"task:{worker.task_id}", current)
+            await runtime.change(pause)
+            return {"jump_to": "end"}
+        if worker.helper_id:
+            with db.new_session() as session:
+                current = store.get(session, f"helper:{worker.helper_id}")
+        else:
+            current = task
+        if current["steps"] >= 30:
+            await worker.finish("limit", "本轮达到 30 步上限，请判断是否继续或停止。")
+            return {"jump_to": "end"}
+        if not await worker.deliver_messages():
+            return {"jump_to": "end"}
+
+        def step(session):
+            key = f"helper:{worker.helper_id}" if worker.helper_id else f"task:{worker.task_id}"
+            current = store.get(session, key)
+            current["steps"] += 1
+            store.put(session, key, current)
+            return current["steps"]
+        context["step_number"] = await runtime.change(step)
+
+    async def model_call(state, context):
+        history = await compact.context_history(runtime, worker.context_id)
+        deps = SimpleNamespace(client=runtime.client, recorder=SimpleNamespace(session_id="main", turn_id=worker.run_id))
+        system = _PROMPT + skills.skill_prompt()
+        with record_model_step(deps, system, history, WORKER_TOOLS, subtask_id=worker.task_id) as reply:
+            async for event in runtime.client.stream(system=system, messages=history, tools=WORKER_TOOLS):
+                reply.accept(event)
+        if reply.stop_reason == "max_tokens":
+            await worker.finish("failed", "模型输出达到上限，本轮未完成。")
+            return AIMessage(content="模型输出达到上限")
+        blocks = reply.assistant_blocks()
+        if not blocks:
+            await worker.finish("failed", "模型没有返回内容，本轮未完成。")
+            return AIMessage(content="模型没有返回内容")
+        if not reply.tool_uses:
+            await runtime.change(lambda session: store.append_history(session, worker.context_id, "assistant", blocks))
+            with db.new_session() as session:
+                incoming = store.records(session, "agent_message", context_id=worker.context_id, delivery="pending")
+            if incoming or worker.stop.is_set() or worker.task().get("dependency"):
+                context["retry"] = True
+            else:
+                injection = hooks.trigger("Stop", {"turn_id": worker.run_id, "task_id": worker.task_id,
+                                                   "steps": context["step_number"]})
+                if isinstance(injection, str) and injection:
+                    await runtime.change(lambda session: store.append_history(session, worker.context_id, "user", injection))
+                    context["retry"] = True
+                else:
+                    await worker.finish("result", reply.text or "助手未提供结果。")
+            return AIMessage(content=reply.text)
+
+        group_id = f"{worker.task_id}:{worker.run_id}:{context['step_number']}"
+        ids = [call.get("id") for call in reply.tool_uses]
+        if any(not isinstance(item, str) or not item for item in ids) or len(ids) != len(set(ids)):
+            await worker.finish("failed", "模型返回了无效或重复的工具调用 ID。")
+            return AIMessage(content="模型返回了无效的工具调用")
+
+        def save_group(session):
+            store.append_history(session, worker.context_id, "assistant", blocks, key=f"step:{group_id}")
+            calls = []
+            for call in reply.tool_uses:
+                identity = f"{worker.task_id}:{worker.run_id}:{call['id']}"
+                existing = store.get(session, f"execution:{identity}")
+                if existing and (existing["name"] != call["name"] or existing["input"] != (call.get("input") or {})):
+                    raise ValueError("重复工具调用 ID 的参数不一致")
+                if not existing:
+                    task = store.get(session, f"task:{worker.task_id}")
+                    store.put(session, f"execution:{identity}", {
+                        "type": "tool_execution", "id": identity, "task_id": worker.task_id,
+                        "context_id": worker.context_id, "run_id": worker.run_id, "call_id": call["id"],
+                        "name": call["name"], "input": call.get("input") or {}, "status": "pending",
+                        "user_seq": task.get("latest_user_seq", task["order"])})
+                calls.append(identity)
+            store.put(session, f"group:{group_id}", {"type": "tool_group", "id": group_id,
+                      "context_id": worker.context_id, "calls": calls, "status": "pending"})
+        await runtime.change(save_group)
+        context["group_id"] = group_id
+        return AIMessage(content=reply.text, tool_calls=[{"id": call["id"], "name": call["name"],
+                         "args": call.get("input") or {}, "type": "tool_call"} for call in reply.tool_uses])
+
+    async def after_model(state, context):
+        if context.pop("retry", False):
+            return {"jump_to": "model"}
+
+    from app.agent.worker import AgentWaiting
+
+    try:
+        await worker.resume_groups()
+        await _invoke(worker, before_model, model_call, after_model)
+    except AgentWaiting:
+        raise
+    except BaseException:
+        await runtime.release_worker_sandbox(worker.context_id, worker.run_id)
+        raise
+    with db.new_session() as session:
+        state = (store.get(session, f"helper:{worker.helper_id}") if worker.helper_id
+                 else store.get(session, f"task:{worker.task_id}"))
+    if (not state or state.get("run_id") != worker.run_id
+            or state["status"] not in {"waiting_agent", "waiting_dependency", "queued"}):
+        try:
+            await runtime.release_worker_sandbox(worker.context_id, worker.run_id)
+        except Exception:
+            pass

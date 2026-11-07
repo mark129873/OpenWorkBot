@@ -15,7 +15,9 @@ from app.agent.rag_client import RagClient
 from app.agent.runtime import Runtime
 from app.agent.worker import run_worker
 from app.config import Settings, settings, validate_llm_config
+from app.sandbox.lease import SandboxLeaseManager
 from app.sessions import chat_store as store
+from fake_sandbox import FakeProvider
 
 
 READ_TOOL = {"name": "read_file", "description": "读取文件", "input_schema": {
@@ -278,7 +280,7 @@ def test_main_direct_action_with_mock_openai(tmp_path, monkeypatch):
 
     async def run():
         client = make_client(handler)
-        runtime = Runtime(client=client)
+        runtime = Runtime(client=client, sandbox_leases=SandboxLeaseManager(FakeProvider()))
         await runtime.start()
         try:
             await runtime.accept("openai-test", "读取 note.txt", "build",
@@ -316,7 +318,7 @@ def test_worker_tool_round_trip_with_mock_openai(tmp_path, monkeypatch):
 
     async def run():
         client = make_client(handler)
-        runtime = Runtime(client=client)
+        runtime = Runtime(client=client, sandbox_leases=SandboxLeaseManager(FakeProvider()))
         with db.new_session() as session:
             store.initialize(session, tmp_path)
             task = runtime.create_task(session, "读取 note.txt", 1)

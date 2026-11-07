@@ -258,6 +258,10 @@ def _schema(name: str, description: str, properties: dict, required: list[str]) 
 
 TOOLS: list[dict] = [
     _schema(
+        "bash", "在用户共享的 Docker 沙箱内执行命令；工作目录为用户工作区。",
+        {"command": {"type": "string", "description": "完整 shell 命令"}}, ["command"],
+    ),
+    _schema(
         "read_file", "按行读取工作区内文本文件，超长时提示下一行。",
         {"path": {"type": "string", "description": "工作区内相对路径"},
          "offset": {"type": "integer", "minimum": 1},

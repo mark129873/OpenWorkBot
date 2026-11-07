@@ -5,6 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_SANDBOX_ALLOW_DOMAINS = "pypi.org,files.pythonhosted.org,registry.npmjs.org,github.com"
 
 # .env 优先于已有环境变量。
 load_dotenv(BACKEND_ROOT / ".env", override=True)
@@ -36,6 +37,7 @@ class Settings:
     compact_output_reserve: int = 32000
     compact_buffer: int = 13000
     microcompact_keep: int = 5
+    sandbox_allow_domains: str = DEFAULT_SANDBOX_ALLOW_DOMAINS
 
     host: str = "127.0.0.1"
     port: int = 8100
@@ -71,6 +73,7 @@ def load_settings() -> Settings:
         compact_output_reserve=_env_int("COMPACT_OUTPUT_RESERVE", 32000),
         compact_buffer=_env_int("COMPACT_BUFFER", 13000),
         microcompact_keep=_env_int("MICROCOMPACT_KEEP", 5),
+        sandbox_allow_domains=os.environ.get("SANDBOX_ALLOW_DOMAINS", DEFAULT_SANDBOX_ALLOW_DOMAINS).strip(),
         host=_env_str("HOST", "127.0.0.1"),
         port=_env_int("PORT", 8000),
         data_dir=data_dir,

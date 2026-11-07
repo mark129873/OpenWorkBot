@@ -48,7 +48,8 @@ def _options_for_scope(scope: tuple[str, str] | None) -> list[dict]:
 
 
 def build_options(tool_name: str, tool_input: dict) -> list[dict]:
-    return _options_for_scope(session_permissions.scope_for(tool_name, tool_input))
+    options = _options_for_scope(session_permissions.scope_for(tool_name, tool_input))
+    return [option for option in options if tool_name != "bash" or option["option_id"] != "allowSession"]
 
 
 def register(request_id: str, tool: str = "", input_data: dict | None = None, *, session_id: str,
@@ -60,7 +61,7 @@ def register(request_id: str, tool: str = "", input_data: dict | None = None, *,
         "event": asyncio.Event(), "approved": False, "option_id": None, "feedback": None,
         "session_id": session_id, "tool": tool, "input": snapshot,
         "scope": scope,
-        "options": _options_for_scope(scope),
+        "options": build_options(tool, snapshot),
         "stop_event": stop_event,
     }
     _pending[request_id] = slot
@@ -97,15 +98,16 @@ def resolve(request_id: str, option_id: str, *, session_id: str,
     return True
 
 
-async def authorize_tool(deps, tool_name: str, tool_input: dict, *, data_dir=None) -> str | None:
+async def authorize_tool(deps, tool_name: str, tool_input: dict, *, data_dir=None, sandboxed: bool = False) -> str | None:
     """会话授权仅覆盖 ask，不能覆盖硬拒或 deny。"""
     if deps.stop_flag():
         return "Error: 操作已停止"
-    result = evaluate(data_dir, tool_name, tool_input)
+    result = evaluate(data_dir, tool_name, tool_input, sandboxed=sandboxed)
     decision, reason = result["decision"], result["reason"]
     if decision == "deny":
         return f"Error: 已被安全策略拒绝：{reason}"
-    if decision == "allow" or session_permissions.allows(deps.recorder.session_id, tool_name, tool_input):
+    if decision == "allow" or (not (tool_name == "bash" and sandboxed)
+                                and session_permissions.allows(deps.recorder.session_id, tool_name, tool_input)):
         return None
     outcome = await deps.approver(tool_name, tool_input, reason or "该操作需要确认")
     if deps.stop_flag():
@@ -113,7 +115,7 @@ async def authorize_tool(deps, tool_name: str, tool_input: dict, *, data_dir=Non
     if not outcome["approved"]:
         return f"Error: 用户拒绝了该操作：{outcome['denial_reason'] or reason}"
     # 等待期间规则可能变化，执行前重查拒绝规则。
-    latest = evaluate(data_dir, tool_name, tool_input)
+    latest = evaluate(data_dir, tool_name, tool_input, sandboxed=sandboxed)
     if latest["decision"] == "deny":
         return f"Error: 已被安全策略拒绝：{latest['reason']}"
     return None

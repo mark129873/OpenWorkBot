@@ -51,7 +51,7 @@ class AgentGraph:
         self.graph = builder.compile(checkpointer=checkpointer)
         self.locks: dict[str, asyncio.Lock] = {}
 
-    def thread_id(self, context_id: str) -> str:
+    def thread_id(self, context_id: str, *, parent_context: str | None = None) -> str:
         with db.new_session() as session:
             meta = store.get(session, "meta")
             if not meta:
@@ -60,12 +60,17 @@ class AgentGraph:
             key = f"graph:{context_id}"
             record = store.get(session, key)
             if not record:
-                store.put(session, key, {"type": "graph_thread", "context_id": context_id,
+                store.put(session, key, {"type": "graph_thread", "context_id": parent_context or context_id,
                                          "thread_id": thread_id})
                 session.commit()
-            elif record["thread_id"] != thread_id:
+            elif record["thread_id"] != thread_id or record["context_id"] != (parent_context or context_id):
                 raise ValueError("Agent 线程归属不匹配")
         return thread_id
+
+    async def invoke_loop(self, loop, thread_id: str, context: dict):
+        async with self.locks.setdefault(thread_id, asyncio.Lock()):
+            await self.graph.checkpointer.adelete_thread(thread_id)
+            return await loop.invoke(context, thread_id=thread_id)
 
     async def invoke(self, context_id: str, *, incoming: dict | None = None,
                      history: list[dict] | None = None, memory: str | None = None,

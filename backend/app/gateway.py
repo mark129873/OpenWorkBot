@@ -6,7 +6,12 @@ from app import db
 from app.agent.runtime import Runtime
 from app.agent.memory import Memory
 from app.agent.rag_client import RagClient
+from app.agent.skills import SKILLS_DIR
+from app.community.aio_sandbox.aio_sandbox_provider import AioSandboxProvider
+from app.community.aio_sandbox.local_backend import LocalContainerBackend
+from app.config import settings
 from app.models import User
+from app.sandbox.lease import SandboxLeaseManager
 from app.user_context import bind_user
 
 
@@ -15,6 +20,10 @@ class Gateway:
         self.checkpointer = checkpointer
         self.memory = Memory()
         self.rag = RagClient()
+        backend = LocalContainerBackend(settings.data_dir, settings.workspaces_dir, SKILLS_DIR,
+                                        settings.sandbox_allow_domains)
+        self.sandbox_provider = AioSandboxProvider(backend, settings.data_dir)
+        self.sandbox_leases = SandboxLeaseManager(self.sandbox_provider)
         self.runtimes: dict[str, Runtime] = {}
         self.lock = asyncio.Lock()
 
@@ -23,7 +32,8 @@ class Gateway:
             runtime = self.runtimes.get(user_id)
             if runtime is None:
                 with bind_user(user_id):
-                    runtime = Runtime(user_id=user_id, checkpointer=self.checkpointer, memory=self.memory, rag=self.rag)
+                    runtime = Runtime(user_id=user_id, checkpointer=self.checkpointer, memory=self.memory, rag=self.rag,
+                                      sandbox_provider=self.sandbox_provider, sandbox_leases=self.sandbox_leases)
                     await runtime.start()
                 self.runtimes[user_id] = runtime
             return runtime
@@ -35,9 +45,23 @@ class Gateway:
             await self.runtime(user_id)
 
     async def close(self) -> None:
+        error = None
         for user_id, runtime in self.runtimes.items():
             with bind_user(user_id):
-                await runtime.close()
+                try:
+                    await runtime.close()
+                except Exception as exc:
+                    error = error or exc
         self.runtimes.clear()
-        await self.memory.close()
-        await self.rag.close()
+        try:
+            try:
+                await asyncio.to_thread(self.sandbox_provider.close)
+            except Exception as exc:
+                error = error or exc
+        finally:
+            try:
+                await self.memory.close()
+            finally:
+                await self.rag.close()
+        if error:
+            raise RuntimeError("运行时或沙箱清理失败") from error

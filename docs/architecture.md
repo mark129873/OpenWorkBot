@@ -2,7 +2,7 @@
 
 本文记录主聊天、多助手与已批准的 RAG 技术设计和运行边界；实现状态见进度记录。
 
-第 1–12 节记录改造前的历史基线；当前实现和差异以第 13 节为准。原 `deerflow_design.md` 和 `deerflow_runtime_design.md` 为历史草案。
+第 1–12 节记录改造前的历史基线；当前架构见第 13–14 节，已批准的沙箱改造见第 15 节。
 
 ## 1. 改造前基线
 
@@ -230,21 +230,22 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 
 ### 13.5 长期记忆、重置与工作区
 
-- 每用户一份共享记忆：摘要为 JSON、事实为 Markdown，使用独立 SQLite FTS5 和 jieba 搜索分词；主 Agent 写入，Worker 只读。静默 30 秒后按用户顺序后台提取，置信度至少 0.7，按置信度最多保留 100 条，每次注入最多 2,000 token。每次新 Run 刷新快照；读取失败或超时提示用户并继续。待提取队列在内存中，异常退出可能丢失未提取内容。
-- 重置停止该用户所有 Agent、使旧记忆提取代号失效，删除其聊天、任务、检查点、记忆、FTS 索引及可确定归属的模型日志和轮转文件；新助手使用空白会话。旧版无法确认归属的日志保留并提示；其他用户和工作区不受影响。删除开始前可取消，开始后仅可等待或失败重试；重启继续未完成的删除。
-- 用户工作区为 `backend/workspaces/<用户 ID>/`，与 `backend/data/` 分开且不入 Git；本机旧工作区已移至 `C:/Users/nnnnnn/Desktop/OpenWorkBot_旧工作区`，不导入新账号。LocalSandbox 参考实现限定文件路径，宿主命令始终关闭；不提供系统级进程隔离。
+- 每用户一份记忆，仅主 Agent 使用；分类摘要为 `memory.json`，每条事实为带 YAML 元数据的 Markdown 文件。仅提取启用后发送的用户原文和可见最终回复，过滤工具、内部消息、纯上传及纯确认；按 DeerFlow 的用户范围、持续性、描述性与置信度门槛校验，安全处理明确更正和替换。单条长消息保留首尾各 500 字；按消息 ID 去重并在写入成功后持久化水位，异常退出后由下一次主助手处理事项触发重试。
+- 同一用户提取串行，静默 30 秒、最长防抖 300 秒；多文件更新使用日志、备份和恢复，重置代号阻止旧提取回写。主 Agent 每个 Run 以用户消息或报告所属任务目标召回，按 DeerFlow 的词汇相关性与置信度各 50% 排序；纠错事实保障最多 500 token，普通预算 2,000 token。记忆以隐藏用户消息注入，不进入提取输入；Worker 不读取记忆。读取失败或超时提示用户并继续；不使用 FTS 索引。旧记忆不迁移，按用户要求删除。
+- 重置停止该用户所有 Agent、使旧记忆提取代号失效，删除其聊天、任务、检查点、记忆及可确定归属的模型日志和轮转文件；新助手使用空白会话。旧版无法确认归属的日志保留并提示；其他用户和工作区不受影响。删除开始前可取消，开始后仅可等待或失败重试；重启继续未完成的删除。
+- 用户工作区为 `backend/workspaces/<用户 ID>/`，与 `backend/data/` 分开且不入 Git；本机旧工作区已移至 `C:/Users/nnnnnn/Desktop/OpenWorkBot_旧工作区`，不导入新账号。Docker 沙箱见第 15 节，宿主命令关闭。
 
 ### 13.6 接口与配置
 
 - 保留 Vite 前端、`backend/app/main.py` Gateway 入口、`start.py` 启动方式以及聊天、上传、审批、重置和 SSE 接口。聊天默认兼容原完整历史返回，前端使用分页上翻；账号名和密码自行注册登录，Cookie 保存登录态，写请求校验 CSRF。首版仅监听和允许本机回环访问。
 - 主助手、Worker 和记忆提取共用 `OPENAI_API_KEY`、`OPENAI_BASE_URL`、`MODEL_ID` 指定的 OpenAI 兼容 Chat Completions；上下文压缩沿用 `CONTEXT_WINDOW` 等配置。`langgraph`、`langgraph-checkpoint-sqlite`、`jieba` 和 `tiktoken` 用于检查点及记忆；首次使用 token 词表可能需要联网。
-- 应用与检查点使用 `backend/data/app.db`，记忆文件放在 `backend/data/memory/`，FTS 索引使用 `backend/data/memory-index.sqlite`。不做旧数据库迁移，测试使用独立空库；重建前核对数据目录，不能删除用户工作区。Docker 和 PostgreSQL 待用户后续确认。
+- 应用与检查点使用 `backend/data/app.db`，记忆文件放在 `backend/data/memory/`。不做旧数据库迁移，测试使用独立空库；重建前核对数据目录，不能删除用户工作区。Docker 改造见第 15 节，PostgreSQL 待后续确认。
 - 共享 RAG MCP 接入见第 14 节；RAG 服务及现有知识库保持独立。
 
 ### 13.7 验证与边界
 
 - 隔离空库及模拟模型测试覆盖用户隔离、检查点同步、消息状态不确定、任务清理、重置重试与重启、记忆代号屏障、中文检索、分页、认证和每用户六个 Worker。前端执行构建、lint、现有测试及本机登录页面检查；完整结果见 [progress.md](progress.md)。
-- 尚未使用真实模型复测本次改造，也未执行真实服务崩溃或断电试验；SQLite、记忆文件及独立 FTS 不构成跨文件原子事务。参考实现不复制 DeerFlow 源码，应用当前定位为本机使用。
+- 尚未使用真实模型复测本次改造，也未执行真实服务崩溃或断电试验；SQLite 与记忆文件不构成跨存储原子事务。参考实现不复制 DeerFlow 源码，应用当前定位为本机使用。
 
 参考源码：[AgentRuns](../.github_deerflow/backend/packages/extension-api/deerflow_extension_api/agent_runs.py)、[Agent Teams](../.github_deerflow/examples/deerflow-extension-agent-teams/deerflow_extension_agent_teams/service.py)、[LocalSandbox](../.github_deerflow/backend/packages/harness/deerflow/sandbox/local/local_sandbox.py)、[记忆队列](../.github_deerflow/backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/queue.py)、[记忆存储](../.github_deerflow/backend/packages/harness/deerflow/agents/memory/backends/deermem/deermem/core/storage.py)。
 
@@ -254,3 +255,21 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 - 共用现有 `rag/data/` 目录、文档 ID 和 Milvus 集合；不迁移、重建或清空旧知识库。入库仅从当前用户工作区取文件，复制到受控临时目录后调用原 MCP；正常结束后清理，结果未知时保留临时文件待核查。按完整文件名（含扩展名、忽略大小写）查找，命中时使用旧目录路径调用入库以复用 ID；新版本成功后切换，失败保留旧版本，工作区原文件不变。共享库变更串行处理，查询可并发。
 - 停止或重置时取消尚未发出的操作，已发出的入库或移出等待返回，再停止当前用户任务；结果未知不得自动重试。共享知识库、其他用户任务与现有 Langfuse 追踪保留；固定 MCP 服务由 Gateway 启动，宿主命令仍禁用。
 - 优先只改 Gateway、Worker、MCP 客户端和项目文档；修改 `rag/` 代码前必须取得用户批准。隔离测试覆盖旧库、同名更新、权限、并发、取消和恢复；未授权真实模型或云端写入。评测重建脚本不得指向共享库。
+
+## 15. 已批准的 AIO Docker 沙箱改造
+
+本节记录已批准设计，实现与验收以代码及测试为准；不清楚或需要改变已批准行为的实现先与用户同步。
+
+- 主 Agent 和各后台 Worker 使用 LangGraph `create_agent` 管理模型与工具循环及原生 `SandboxMiddleware`；Gateway 保留独立任务调度、上下文、消息投递、审批、停止、40 / 30 步限制和后台任务生命周期。保留首轮 `route_input` 与 `first_action` 语义，同一 Agent 的工具顺序执行。
+- 参考 DeerFlow 的 `SandboxMiddleware → SandboxProvider → AioSandboxProvider → LocalContainerBackend` 及 `Sandbox → AioSandbox → agent-sandbox SDK / HTTP` 职责和接口，在本项目自行实现。Gateway 统一持有 provider；按可信用户身份获取并校验沙箱，按 Agent / Run 维护独立租约与命令会话。等待同伴或依赖时让出 Worker 槽但保留租约和 shell，直到本轮结束；等待期间不触发沙箱空闲回收。
+- 每用户共享一个 AIO 沙箱和一个辅助代理，不同用户隔离。使用 DeerFlow AIO 1.11.0 镜像及 allowlist 网络模式；隔离网络仅允许代理按域名策略转发 HTTP / HTTPS，静态域名在 `backend/.env` 配置、重启生效，默认放行 `pypi.org`、`files.pythonhosted.org`、`registry.npmjs.org`、`github.com`。其他公网域名在所有权限模式下通过现有审批交互处理，归属显示为当前用户的共享沙箱，不指定任务，不同域名分别排队；允许 5 分钟、本会话允许或拒绝；会话授权跨容器重建有效，后端重启或助手重置失效。被拦截的原命令不自动重跑；网络授权对同用户的 Agent 共用。禁止内网、回环及非 HTTP 网络访问。AIO 不直接发布端口；不挂载 Docker socket、宿主密钥、`backend/data/` 或其他用户工作区。
+- 代理使用已核对脚本哈希的 DeerFlow 官方镜像 `ghcr.io/bytedance/deer-flow-sandbox-network-proxy@sha256:ab8e86073cfef47f72b5b07ca3e92a8c9f8ff5b50328c16436f21d35ab359a40`，不复制代理源码。
+- Docker Desktop 的代理进程只解析 IPv4，以兼容其合成 DNS；纯 IPv6 网站不可访问，私网和回环限制不放宽。
+- 用户工作区挂载至 `/mnt/user-data/workspace`，项目 Skills 只读挂载至 `/mnt/skills`。文件工具通过 AIO 调用容器内固定受控程序，以原子路径校验防止工作区外链接和并发换链；文件操作沿用自身审批，不另触发 bash 审批。保留分页、唯一编辑、`.rubbish/`、占用与版本规则；共享目录不支持安全的无覆盖重命名时，先硬链接进回收站再删除原文件，中断可能暂时保留两份且结果未知不自动重跑。上传和 RAG 仍在宿主管理。命令可直接修改工作区，由 Worker 协调，不加工作区级锁。
+- build / edit 的每次 `bash` 工具调用必须单独审批，允许或会话规则不跳过；yolo 自动放行容器命令。服务端校验审批选项并在执行前重查模式、停止与权限；旧宿主命令始终禁用。单次调用中的多条 shell 子命令作为完整字符串一起审批。
+- 命令输出对齐 DeerFlow：默认最多返回 2 万字符并保留首尾，不增加 1 MiB 采集和输出分页；需要完整结果时写入工作区文件后使用文件工具读取。退出码、超时和执行异常仍单独判断；AIO 对 `exit` 可能等待超时后重建 shell，不重跑命令。单次命令的独立 `env` 参数暂不支持，普通 `export` 可在持久 shell 使用。
+- AIO 设置 1 GiB / 1 CPU / 512 进程上限，代理保持 256 MiB / 1 CPU / 128 进程上限；沿用 `no-new-privileges`、必要 capability 与已确认的 `seccomp=unconfined`，命令默认 120 秒。空闲 600 秒回收，3 个沙箱为软上限，仅淘汰空闲实例；工作区外的容器环境不保证保留。
+- 为六个后台 Worker、最多三个直接任务、主助手和清理预留容量，AIO 的 shell 与 bash 会话池上限分别设为 12；实际并发和 1 GiB 内存余量须实测。
+- 命令停止无法确认时暂停该用户沙箱复用并提示；其他已运行操作到安全边界后释放租约，再回收该用户容器。进程标记用于协作清理，不保证约束刻意去除标记的同容器进程。已开始且结果未知的操作不自动重跑。重启先核对本项目资源，未知状态隔离；Docker 不可用不回退宿主执行。重置先清理当前用户沙箱，保留工作区和其他用户。
+- 新 Agent 图使用独立检查点，模型上下文由现有聊天记录构造；图重新启动前清理上次图检查点，依据业务记录恢复，不盲目重放结果未知的工具。保留消息投递确认、权限变更和任务恢复语义；应用事务与图检查点不构成跨事务原子操作。
+- 使用假模型、独立空库和临时工作区验证路由、权限、顺序、隔离、并发、停止与恢复；专用 Docker 容器验证网络、认证、挂载、文件、进程清理和授权恢复，并执行前端构建及测试。未用真实模型或断电验证。

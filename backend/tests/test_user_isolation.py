@@ -61,7 +61,7 @@ def test_chat_pagination_keeps_history_when_new_messages_arrive(tmp_path, monkey
 
 def test_host_commands_are_unavailable_in_every_mode():
     assert "bash" not in tools.TOOL_HANDLERS
-    assert all(tool["name"] != "bash" for tool in tools.TOOLS)
+    assert any(tool["name"] == "bash" for tool in tools.TOOLS)
     for mode in ("build", "edit", "yolo"):
         result = check_permission(mode, {}, "bash", {"command": "echo hi"})
         assert result["decision"] == "deny"
@@ -187,18 +187,23 @@ def test_worker_result_truncates_at_utf8_boundary():
 def test_memory_search_is_user_scoped_and_within_token_budget(tmp_path, monkeypatch):
     import tiktoken
     from app.agent.memory import _snapshot, _store
+    from app.agent.memory_store import empty_memory
 
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
-    _store("a" * 32, "甲", [
+    summary = empty_memory()
+    summary["user"]["personalContext"]["summary"] = "甲"
+    _store("a" * 32, summary, [
         {"id": "1", "content": "每周徒步", "confidence": 0.99},
         {"id": "2", "content": "喜欢喝咖啡", "confidence": 0.8},
     ])
-    _store("b" * 32, "乙", [{"id": "3", "content": "喜欢喝绿茶", "confidence": 0.9}])
+    other = empty_memory()
+    other["user"]["personalContext"]["summary"] = "乙"
+    _store("b" * 32, other, [{"id": "3", "content": "喜欢喝绿茶", "confidence": 0.9}])
     result = _snapshot("a" * 32, "咖啡")
     assert result.index("喜欢喝咖啡") < result.index("每周徒步")
     assert "喜欢喝绿茶" not in result
     assert len(tiktoken.get_encoding("cl100k_base").encode(result)) <= 2000
-    assert (settings.data_dir / "memory-index.sqlite").exists()
+    assert not (settings.data_dir / "memory-index.sqlite").exists()
 
 
 def test_memory_keeps_the_highest_confidence_facts(tmp_path, monkeypatch):
@@ -214,15 +219,23 @@ def test_memory_keeps_the_highest_confidence_facts(tmp_path, monkeypatch):
 
     class Model:
         async def stream(self, **_kwargs):
-            facts = [{"content": f"fact-{index}", "confidence": 0.7 + index * 0.002} for index in range(110)]
-            facts.append({"content": "uncertain", "confidence": 0.2})
-            yield {"type": "text_delta", "text": json.dumps({"summary": "summary", "facts": facts})}
+            facts = [{"content": f"fact-{index}", "confidence": 0.7 + index * 0.002,
+                      "scope": "user", "durability": "durable", "authority": "descriptive"} for index in range(110)]
+            facts.append({"content": "uncertain", "confidence": 0.2,
+                          "scope": "user", "durability": "durable", "authority": "descriptive"})
+            yield {"type": "text_delta", "text": json.dumps({"user": {"personalContext": {
+                "summary": "summary", "shouldUpdate": True, "scope": "user", "authority": "descriptive"}},
+                "history": {}, "newFacts": facts})}
 
     async def run():
         memory = Memory()
-        await memory._extract("a" * 32, Model(), [], 0)
+        await memory.initialize(0, None)
+        records = [{"id": "input:one", "role": "user", "content": "内容"},
+                   {"id": "answer", "role": "assistant", "content": "完成"}]
+        events = {"one": {"user_seq": 1, "user_text": "内容"}}
+        await memory._extract("a" * 32, Model(), records, events, 0)
         summary, facts = _read_files("a" * 32)
-        assert summary == "summary" and len(facts) == 100
+        assert summary["user"]["personalContext"]["summary"] == "summary" and len(facts) == 100
         assert {item["content"] for item in facts} == {f"fact-{index}" for index in range(10, 110)}
         await memory.close()
 
@@ -234,6 +247,7 @@ def test_memory_keeps_the_highest_confidence_facts(tmp_path, monkeypatch):
 
 def test_memory_reset_fences_late_extraction_and_preserves_other_user(tmp_path, monkeypatch):
     from app.agent.memory import Memory, _read_files
+    from app.agent.memory_store import empty_memory
     from app.models import User
 
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
@@ -255,18 +269,26 @@ def test_memory_reset_fences_late_extraction_and_preserves_other_user(tmp_path, 
             if self.started:
                 self.started.set()
                 await self.release.wait()
-            yield {"type": "text_delta", "text": '{"summary":"记忆","facts":[{"content":"喜欢喝茶","confidence":0.9}]}' }
+            yield {"type": "text_delta", "text": json.dumps({"user": {}, "history": {}, "newFacts": [{
+                "content": "喜欢喝茶", "confidence": 0.9, "scope": "user", "durability": "durable",
+                "authority": "descriptive"}]}, ensure_ascii=False)}
             yield {"type": "stop_reason", "reason": "end_turn"}
 
     async def run():
         memory = Memory()
+        records = [{"id": "input:one", "role": "user", "content": "内容"},
+                   {"id": "answer", "role": "assistant", "content": "完成"}]
+        events = {"one": {"user_seq": 1, "user_text": "内容"}}
         with bind_user("b" * 32):
-            await memory._extract("b" * 32, Model(), [], 0)
+            await memory.initialize(0, None)
+            await memory._extract("b" * 32, Model(), records, events, 0)
+        with bind_user("a" * 32):
+            await memory.initialize(0, None)
         started, release = asyncio.Event(), asyncio.Event()
 
         async def old_extract():
             with bind_user("a" * 32):
-                await memory._extract("a" * 32, Model(started, release), [], 0)
+                await memory._extract("a" * 32, Model(started, release), records, events, 0)
 
         old = asyncio.create_task(old_extract())
         await started.wait()
@@ -277,10 +299,10 @@ def test_memory_reset_fences_late_extraction_and_preserves_other_user(tmp_path, 
         with bind_user("a" * 32):
             await memory.clear()
             with pytest.raises(PermissionError):
-                memory.enqueue(Model(), [], 1, role="worker")
+                memory.enqueue(Model(), [], {}, 1, role="worker")
         release.set()
         await old
-        assert _read_files("a" * 32) == ("", [])
+        assert _read_files("a" * 32) == (empty_memory(), [])
         assert _read_files("b" * 32)[1][0]["content"] == "喜欢喝茶"
         await memory.close()
 
@@ -293,6 +315,7 @@ def test_memory_reset_fences_late_extraction_and_preserves_other_user(tmp_path, 
 def test_reset_deletes_only_current_users_data(tmp_path, monkeypatch):
     from app.agent.checkpoint import SqliteSaver
     from app.agent.memory import _read_files, _store
+    from app.agent.memory_store import empty_memory
     from app.agent.runtime import Runtime
     from app.models import User
 
@@ -319,7 +342,7 @@ def test_reset_deletes_only_current_users_data(tmp_path, monkeypatch):
                     with db.new_session() as session:
                         chat_store.add_visible(session, "user", user_id[0], message_id="message")
                         session.commit()
-                    _store(user_id, "summary", [{"id": "fact", "content": user_id[0], "confidence": 0.9}])
+                    _store(user_id, empty_memory(), [{"id": "fact", "content": user_id[0], "confidence": 0.9}])
                     await runtime.graph.invoke("main", incoming={"id": "delivery", "content": user_id[0]})
                     (settings.workspaces_dir / user_id / "keep.txt").write_text("keep", encoding="utf-8")
                     log_dir = settings.modelio_dir / user_id
@@ -333,7 +356,7 @@ def test_reset_deletes_only_current_users_data(tmp_path, monkeypatch):
                 await asyncio.wait_for(runtimes[0].reset_task, 10)
                 new = await runtimes[0].snapshot()
                 assert new["assistant_id"] != old["assistant_id"] and new["messages"] == []
-                assert _read_files("a" * 32) == ("", [])
+                assert _read_files("a" * 32) == (empty_memory(), [])
                 assert not (settings.modelio_dir / ("a" * 32) / "model-io-main.jsonl").exists()
                 assert (settings.workspaces_dir / ("a" * 32) / "keep.txt").exists()
                 assert await saver.aget_tuple({"configurable": {"thread_id": old_thread}}) is None
@@ -577,6 +600,10 @@ def test_main_and_worker_execute_through_graph_and_cleanup(tmp_path, monkeypatch
                     assert any(item["text"] == "任务已完成" for item in messages)
                     main_thread = runtime.graph.thread_id("main")
                     assert await saver.aget_tuple({"configurable": {"thread_id": main_thread}})
+                    loop_thread = runtime.graph.thread_id("main:loop", parent_context="main")
+                    assert await saver.aget_tuple({"configurable": {"thread_id": loop_thread}})
+                    with db.new_session() as session:
+                        assert all(item["context_id"] == "main" for item in chat_store.records(session, "graph_thread"))
                 finally:
                     await runtime.close()
     try:
@@ -674,15 +701,17 @@ def test_login_csrf_and_account_isolation(tmp_path, monkeypatch):
         assert first.post("/api/chat/messages", json=message,
                           headers={"X-CSRF-Token": alice_csrf}).status_code == 202
 
-        second = TestClient(app, base_url="http://127.0.0.1", client=("127.0.0.1", 2222))
-        csrf = second.get("/api/auth/session").json()["csrf"]
-        response = second.post("/api/auth/register", json={"username": "bob", "password": "b"},
-                               headers={"X-CSRF-Token": csrf})
+        alice_cookies = dict(first.cookies)
+        first.cookies.clear()
+        csrf = first.get("/api/auth/session").json()["csrf"]
+        response = first.post("/api/auth/register", json={"username": "bob", "password": "b"},
+                              headers={"X-CSRF-Token": csrf})
         assert response.status_code == 201
         bob_csrf = response.json()["csrf"]
-        bob = second.get("/api/chat").json()
+        bob = first.get("/api/chat").json()
         assert bob["assistant_id"] != alice_id and bob["messages"] == []
-        assert second.post("/api/chat/messages", json=message,
-                           headers={"X-CSRF-Token": bob_csrf}).status_code == 409
+        assert first.post("/api/chat/messages", json=message,
+                          headers={"X-CSRF-Token": bob_csrf}).status_code == 409
+        first.cookies.clear()
+        first.cookies.update(alice_cookies)
         assert first.get("/api/chat").json()["messages"][0]["text"] == "alice"
-        second.close()

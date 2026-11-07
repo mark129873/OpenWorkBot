@@ -17,7 +17,7 @@
       "name": "多用户 Gateway 与长期记忆改造",
       "description": "保留主 Agent、后台 Worker 和通信架构，增加用户隔离、SQLite 检查点、本地沙箱和长期记忆。",
       "status": "passing",
-      "evidence": "隔离空库、模拟模型后端全量 151 项及补充记忆上限 1 项通过；前端 2 项、构建、lint 和本机登录页检查通过。真实模型尚未复测。"
+      "evidence": "后端隔离分组 230 项、Docker 专项 2 项和 Linux 文件操作 4 项通过；未测真实模型和断电。"
     },
     {
       "id": "Backend-01",

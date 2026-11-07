@@ -144,13 +144,13 @@ def _allow(rule_id: str, reason: str) -> dict:
 
 
 def check_permission(
-    mode: str, rules: dict, tool_name: str, tool_input: dict,
+    mode: str, rules: dict, tool_name: str, tool_input: dict, *, sandboxed: bool = False,
 ) -> dict:
     """优先级：硬拒、yolo、deny、ask、allow、edit、build。"""
     cap = _capability(tool_name, tool_input)
 
     # 硬拒优先于所有模式和规则。
-    hard = hard_deny_reason(tool_name, tool_input)
+    hard = None if tool_name == "bash" and sandboxed else hard_deny_reason(tool_name, tool_input)
     if hard:
         return _deny("hard.deny", hard)
 
@@ -160,6 +160,9 @@ def check_permission(
     rule = match_rule(rules, "deny", tool_name, tool_input)
     if rule:
         return _deny("rule.deny", f"命中拒绝规则：{rule.get('ruleContent') or rule.get('toolName')}")
+
+    if tool_name == "bash" and sandboxed:
+        return _ask("sandbox.bash", "容器命令每次执行均需确认")
 
     rule = match_rule(rules, "ask", tool_name, tool_input)
     if rule:
@@ -190,9 +193,9 @@ def check_permission(
     return _allow("mode.build.lowRisk", "低风险操作放行")
 
 
-def evaluate(data_dir, tool_name: str, tool_input: dict) -> dict:
+def evaluate(data_dir, tool_name: str, tool_input: dict, *, sandboxed: bool = False) -> dict:
     from app.sessions import execution_state
 
     state = execution_state.load_execution_state(data_dir or settings.data_dir)
     rules = execution_state.load_permission_rules(data_dir or settings.data_dir)
-    return check_permission(state["mode"], rules, tool_name, tool_input)
+    return check_permission(state["mode"], rules, tool_name, tool_input, sandboxed=sandboxed)
