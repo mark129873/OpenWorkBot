@@ -15,9 +15,9 @@
     {
       "id": "Backend-01",
       "name": "后台多助手协作",
-      "description": "主助手首轮意图和动作、直接执行、后台调度、授权与恢复。",
+      "description": "主助手直接调用工具、按序登记执行、后台调度、授权与恢复。",
       "status": "passing",
-      "evidence": "本轮隔离后端全量 151 项通过，覆盖任务顺序、审批、通信和每用户六个 Worker；真实模型尚未复测。"
+      "evidence": "隔离空库后端全量 225 项通过、2 项专用 Docker 测试未启用；任务顺序、审批及混合调用已验证，未调用真实模型。"
     },
     {
       "id": "Frontend-01",
@@ -102,6 +102,13 @@
       "description": "每用户共享容器、静态网络 deny、AIO 文件与命令接口；删除旧会话链路。",
       "status": "passing",
       "evidence": "隔离空库后端 233 项、父目录专项 2 项、Docker 专项 2 项通过；前端 2 项及构建、lint 通过。白名单实测可访问，写前读取失败沿用 DeerFlow 放行；未调用真实模型。"
+    },
+    {
+      "id": "Backend-10",
+      "name": "助手内部 TODO",
+      "description": "各助手使用独立 LangGraph state，模型通过 write_todos 维护清单。",
+      "status": "passing",
+      "evidence": "隔离测试覆盖主助手、后台和协助助手，SQLite 持久化、用户重置及混合调用；未调用真实模型，异常重启恢复尚未设计。"
     }
   ]
 }

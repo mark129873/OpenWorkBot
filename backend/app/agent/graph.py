@@ -69,7 +69,6 @@ class AgentGraph:
 
     async def invoke_loop(self, loop, thread_id: str, context: dict):
         async with self.locks.setdefault(thread_id, asyncio.Lock()):
-            await self.graph.checkpointer.adelete_thread(thread_id)
             return await loop.invoke(context, thread_id=thread_id)
 
     async def invoke(self, context_id: str, *, incoming: dict | None = None,

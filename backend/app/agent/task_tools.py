@@ -40,28 +40,8 @@ SHARED_TOOLS += [
         "topic": {"type": "string"}, "content": {"type": "string"}}, ["topic", "content"]),
 ]
 
-DIRECT_TOOLS = [tool for tool in TOOLS if tool["name"] != "subtask"]
-FIRST_ACTION_TOOLS = DIRECT_TOOLS + [tool for tool in MAIN_TOOLS if tool["name"] in {"task_search", "task_inspect"}] + SHARED_TOOLS
-
-ROUTE = _schema("route_input", "判断用户消息的完整意图和首个动作。", {
-    "message_id": {"type": "string"},
-    "user_seq": {"type": "integer"},
-    "intents": {"type": "array", "items": {"type": "object", "properties": {
-        "type": {"type": "string", "enum": ["chat", "create", "query", "update", "stop", "unclear"],
-                 "description": "chat 用于简单问答和预计可快速完成的简单任务；create 用于复杂、耗时或适合并行的独立任务。"},
-        "task_id": {"type": "string"}, "instruction": {"type": "string"},
-        "knowledge_question": {"type": "boolean", "description": "仅当 create 任务是单纯的知识库问答时为 true。"},
-        "approval_ids": {"type": "array", "items": {"type": "string"},
-                         "description": "受本意图影响的审批 ID，包括已决定的审批；确认无影响时为空数组。"},
-    }, "required": ["type", "instruction"]}},
-    "needs_clarification": {"type": "boolean"},
-    "first_action": {"type": "object", "properties": {
-        "intent_index": {"type": "integer", "minimum": 0, "description": "该动作对应的 intents 下标，从 0 开始。"},
-        "name": {"type": "string", "enum": [tool["name"] for tool in FIRST_ACTION_TOOLS]},
-        "input": {"type": "object", "description": "工具参数，必须符合提供的工具定义。"},
-    }, "required": ["intent_index", "name", "input"]},
-}, ["message_id", "user_seq", "intents", "needs_clarification"])
-
+MAIN_TOOLS += [tool for tool in TOOLS if tool["name"] == "write_todos"]
+DIRECT_TOOLS = [tool for tool in TOOLS if tool["name"] not in {"subtask", "write_todos"}]
 RAG_TOOLS = [
     _schema("rag_search", "查询知识库并返回答案。", {"query": {"type": "string"}}, ["query"]),
     _schema("rag_ingest", "用户明确要求时将工作区文件加入知识库或更新索引。", {"path": {"type": "string"}}, ["path"]),

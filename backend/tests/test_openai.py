@@ -267,14 +267,10 @@ def test_main_direct_action_with_mock_openai(tmp_path, monkeypatch):
     def handler(request):
         body = json.loads(request.content)
         requests.append(body)
-        if body.get("tool_choice"):
-            incoming = json.loads(body["messages"][-1]["content"])
-            args = {"message_id": incoming["message_id"], "user_seq": incoming["user_seq"],
-                    "intents": [{"type": "chat", "instruction": incoming["text"]}],
-                    "needs_clarification": False,
-                    "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
-            return response([chunk({"tool_calls": [{"index": 0, "id": "call-route", "type": "function",
-                            "function": {"name": "route_input", "arguments": json.dumps(args)}}]}),
+        if len(requests) == 1:
+            args = {"path": "/mnt/user-data/workspace/note.txt"}
+            return response([chunk({"tool_calls": [{"index": 0, "id": "call-read", "type": "function",
+                            "function": {"name": "read_file", "arguments": json.dumps(args)}}]}),
                             chunk(finish="tool_calls")])
         return response([chunk({"content": "已读取。"}), chunk(finish="stop")])
 

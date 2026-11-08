@@ -11,7 +11,7 @@ from app.agent.runtime import Conflict, Runtime
 from app.agent.worker import Worker
 from app.api.chat import router
 from app.config import settings
-from app.models import Message, Part, Session, Todo, TurnUsage
+from app.models import Message, Part, Session, TurnUsage
 from app.sessions import chat_store as store
 from app.sessions import execution_state, session_permissions
 from app.user_context import scoped
@@ -85,7 +85,6 @@ def test_reset_waits_for_tool_and_deletes_old_context(isolated):
                                                    "content": "旧报告", "delivery": "processed"})
                 store.put(session, "output:old", {"type": "tool_output", "id": "old", "task_id": task["id"], "content": "旧输出"})
                 store.put(session, "summary:old", {"type": "agent_summary", "content": "旧摘要"})
-                session.add(Todo(session_id=scoped("main"), position=0, content="旧清单", status="completed"))
                 session.add(TurnUsage(session_id=scoped("main"), turn_id="old", status="completed", started_at=1))
                 return task
             task = await runtime.change(seed)
@@ -137,7 +136,6 @@ def test_reset_waits_for_tool_and_deletes_old_context(isolated):
             with db.new_session() as session:
                 assert not list(session.scalars(select(Session).where(Session.time_archived.is_not(None))))
                 assert session.get(Message, scoped("user:old")) is None
-                assert session.get(Todo, (scoped("main"), 0)) is None
                 assert session.get(TurnUsage, (scoped("main"), "old")) is None
                 assert store.history(session, "main") == []
                 assert store.records(session, "task_state") == []
@@ -442,7 +440,7 @@ def test_cancel_reset_does_not_replay_interrupted_input(isolated):
     asyncio.run(run())
 
 
-def test_reset_ignores_late_reconciliation_result(isolated):
+def test_reset_ignores_late_main_tool_call(isolated):
     class LateReconcile:
         model = "fake"
 
@@ -459,9 +457,8 @@ def test_reset_ignores_late_reconciliation_result(isolated):
                 await self.release.wait()
             except asyncio.CancelledError:
                 await self.release.wait()
-            yield {"type": "tool_use", "id": "late", "name": "route_input", "input": {
-                "message_id": "user:event", "user_seq": 1, "needs_clarification": False,
-                "intents": [{"type": "update", "task_id": self.task_id, "instruction": "继续旧任务"}]}}
+            yield {"type": "tool_use", "id": "late", "name": "task_update",
+                   "input": {"task_id": self.task_id, "instruction": "继续旧任务"}}
             yield {"type": "stop_reason", "reason": "end_turn"}
 
     async def run():
@@ -476,11 +473,9 @@ def test_reset_ignores_late_reconciliation_result(isolated):
             event = {"type": "user_event", "event_type": "message", "id": "event", "message_id": "user:event",
                      "user_seq": 1, "status": "processed", "text": "旧要求"}
             store.put(session, "input:event", event)
-            store.put(session, "reconcile:old", {"type": "reconcile", "id": "reconcile:old", "event_id": "event",
-                      "task_id": task["id"], "intent": {"type": "update", "instruction": "旧要求"}, "status": "pending"})
             session.commit()
         model.task_id = task["id"]
-        runtime.main_call = asyncio.create_task(runtime._reconcile({"id": "reconcile:old"}))
+        runtime.main_call = asyncio.create_task(runtime._dialog("处理旧要求", source_seq=1))
         try:
             await asyncio.wait_for(model.started.wait(), 3)
             old_id = (await runtime.snapshot())["assistant_id"]

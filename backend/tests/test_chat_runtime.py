@@ -22,13 +22,7 @@ class FakeModel:
         self.workers = 0
 
     async def stream(self, *, system, messages, tools, tool_choice=None):
-        if tool_choice and tool_choice["name"] == "route_input":
-            request = json.loads(messages[-1]["content"])
-            yield {"type": "tool_use", "id": new_id(), "name": "route_input", "input": {
-                "message_id": request["message_id"], "user_seq": request["user_seq"],
-                "intents": [{"type": "create" if request["text"].startswith("任务") else "chat",
-                             "instruction": request["text"]}], "needs_clarification": False}}
-        elif system.startswith("你是后台工作助手"):
+        if system.startswith("你是后台工作助手"):
             self.workers += 1
             self.max_workers = max(self.max_workers, self.workers)
             self.worker_started.set()
@@ -43,8 +37,19 @@ class FakeModel:
             yield {"type": "tool_use", "id": new_id(), "name": "task_review",
                    "input": {"task_id": task["id"], "decision": "complete"}}
         else:
-            report_seen = "一轮结束" in json.dumps(messages, ensure_ascii=False)
-            yield {"type": "text_delta", "text": "任务已完成。" if report_seen else "收到。"}
+            user_text = next((message["content"] for message in reversed(messages[:-1])
+                              if message["role"] == "user" and isinstance(message["content"], str)
+                              and not message["content"].startswith(("以下是用户长期记忆", "<此前对话摘要>"))), "")
+            created = any(block.get("name") == "task_create" and block.get("input", {}).get("goal") == user_text
+                          for message in messages if isinstance(message.get("content"), list)
+                          for block in message["content"] if isinstance(block, dict))
+            if (messages[-1]["content"].startswith("直接处理用户消息") and user_text.startswith("任务")
+                    and not created):
+                yield {"type": "tool_use", "id": new_id(), "name": "task_create",
+                       "input": {"title": user_text[:40], "goal": user_text}}
+            else:
+                report_seen = "一轮结束" in json.dumps(messages, ensure_ascii=False)
+                yield {"type": "text_delta", "text": "任务已完成。" if report_seen else "收到。"}
         yield {"type": "stop_reason", "reason": "end_turn"}
 
 
@@ -72,7 +77,7 @@ def test_memory_is_available_only_to_main_agent(isolated):
             self.worker_memory = None
 
         async def stream(self, *, system, messages, tools, tool_choice=None):
-            if tool_choice and tool_choice["name"] == "route_input":
+            if not system.startswith("你是后台工作助手"):
                 self.main_memory = (system, messages)
             elif system.startswith("你是后台工作助手"):
                 self.worker_memory = (system, messages)
@@ -233,147 +238,73 @@ def test_restart_keeps_unknown_tool_result_and_invalidates_old_approval(isolated
     asyncio.run(run())
 
 
-def test_newer_approval_is_not_overridden_by_older_message(isolated):
-    with db.new_session() as session:
-        store.initialize(session, isolated)
-        runtime = Runtime(client=FakeModel())
-        task = runtime.create_task(session, "删除旧文件", 1)
-        event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
-                 "text": "不要删了，同时整理清单", "user_seq": 2, "status": "pending"}
-        store.put(session, "input:old", event)
-        store.put(session, "decision:new", {"type": "user_event", "event_type": "approval",
-                  "id": "new", "task_id": task["id"], "user_seq": 3, "status": "processed"})
-        route = {"needs_clarification": False, "intents": [
-            {"type": "stop", "task_id": task["id"], "instruction": "不要删除"},
-            {"type": "create", "instruction": "整理清单"}]}
-        notes = runtime._apply_route(session, event, route)
-        session.commit()
-        assert "更新的审批决定" in notes["summary"] and notes["needs_reply"]
-        assert not store.get(session, f"task:{task['id']}")["stop_requested"]
-        assert len(store.records(session, "task_state")) == 2
-
-
-@pytest.mark.parametrize("intent_type", ["update", "stop"])
-def test_approval_ack_uses_the_affected_operation(isolated, intent_type):
-    with db.new_session() as session:
-        store.initialize(session, isolated)
-        runtime = Runtime(client=FakeModel())
-        task = runtime.create_task(session, "两个操作", 1)
-        event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
-                 "text": "不要写入 A", "user_seq": 1, "status": "pending"}
-        store.put(session, "input:old", event)
-        for request_id, seq, option in [("a", 2, "allowOnce"), ("b", 3, "deny")]:
-            store.put(session, f"approval:{request_id}", {"type": "approval", "request_id": request_id,
-                      "task_id": task["id"], "status": "resolved", "option_id": option, "user_seq": seq})
-            store.put(session, f"decision:{request_id}", {"type": "user_event", "event_type": "approval",
-                      "id": request_id, "task_id": task["id"], "user_seq": seq, "option_id": option})
-        runtime._apply_route(session, event, {"needs_clarification": False, "intents": [{
-            "type": intent_type, "task_id": task["id"], "instruction": "不要写入 A", "approval_ids": ["a"]}]}, {"a", "b"})
-        session.commit()
-        assert "随后已批准" in store.visible(session)[-1]["text"]
-        assert not store.records(session, "agent_message", context_id=task["context_id"])
-
-
-def test_uncertain_new_approval_is_rejudged_instead_of_dropping_update(isolated):
-    with db.new_session() as session:
-        store.initialize(session, isolated)
-        runtime = Runtime(client=FakeModel())
-        task = runtime.create_task(session, "写入并整理", 1)
-        event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
-                 "text": "补充整理说明", "user_seq": 1, "status": "pending"}
-        store.put(session, "input:old", event)
-        store.put(session, "approval:a", {"type": "approval", "request_id": "a", "task_id": task["id"],
-                  "status": "resolved", "option_id": "allowOnce", "user_seq": 2})
-        store.put(session, "decision:a", {"type": "user_event", "event_type": "approval", "id": "a",
-                  "task_id": task["id"], "user_seq": 2, "option_id": "allowOnce"})
-        runtime._apply_route(session, event, {"needs_clarification": False, "intents": [{
-            "type": "update", "task_id": task["id"], "instruction": "补充整理说明"}]})
-        session.commit()
-        assert store.records(session, "agent_message", context_id="main")[0]["kind"] == "reconcile"
-        assert not store.records(session, "agent_message", context_id=task["context_id"])
-
-
-@pytest.mark.parametrize("task_status", ["running", "completed"])
-def test_older_stop_acknowledges_newer_approval_without_guessing(isolated, task_status):
-    class StaleStopModel:
+@pytest.mark.parametrize("conflict", [False, True])
+def test_newer_approval_is_reconsidered_by_main_agent(isolated, conflict):
+    class Model:
         model = "fake"
 
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.release = asyncio.Event()
+            self.calls = 0
+            self.task_id = ""
+
         async def stream(self, *, system, messages, tools, tool_choice=None):
-            assert tool_choice and tool_choice["name"] == "route_input"
-            request = json.loads(messages[-1]["content"])
-            yield {"type": "tool_use", "id": "route", "name": "route_input", "input": {
-                "message_id": request["message_id"], "user_seq": request["user_seq"],
-                "intents": [{"type": "stop", "task_id": task["id"], "instruction": "不要写入",
-                             "approval_ids": ["approval"]}], "needs_clarification": False}}
+            self.calls += 1
+            if self.calls == 1:
+                self.started.set()
+                await self.release.wait()
+                name = "task_stop" if conflict else "task_update"
+                args = {"task_id": self.task_id}
+                if not conflict:
+                    args["instruction"] = "change unrelated file"
+                yield {"type": "tool_use", "id": "first", "name": name, "input": args}
+            elif self.calls == 2:
+                assert "later-approval" in json.dumps(messages, ensure_ascii=False)
+                if conflict:
+                    yield {"type": "text_delta", "text": "newer decision applies"}
+                else:
+                    yield {"type": "tool_use", "id": "retry", "name": "task_update",
+                           "input": {"task_id": self.task_id, "instruction": "change unrelated file"}}
+            else:
+                yield {"type": "text_delta", "text": "updated"}
+            yield {"type": "stop_reason", "reason": "end_turn"}
 
     async def run():
-        nonlocal task
-        runtime = Runtime(client=StaleStopModel())
-        with db.new_session() as session:
-            store.initialize(session, isolated)
-            task = runtime.create_task(session, "写入测试文件", 1)
-            task["status"] = task_status
-            store.put(session, f"task:{task['id']}", task)
-            store.add_visible(session, "user", "不要写入", message_id="user:old")
-            event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
-                     "text": "不要写入", "user_seq": 1, "status": "pending"}
-            store.put(session, "input:old", event)
-            store.put(session, "approval:approval", {"type": "approval", "request_id": "approval",
-                      "task_id": task["id"], "status": "resolved", "option_id": "allowOnce", "user_seq": 2})
-            store.put(session, "decision:approval", {"type": "user_event", "event_type": "approval",
-                      "id": "approval", "task_id": task["id"], "user_seq": 2, "option_id": "allowOnce"})
-            session.commit()
-        await runtime._input(event)
-        with db.new_session() as session:
-            assert not store.get(session, f"task:{task['id']}")["stop_requested"]
-            assert store.get(session, "input:old")["status"] == "processed"
-            assert "随后已批准" in store.visible(session)[-1]["text"]
-    task = None
-    asyncio.run(run())
-
-
-@pytest.mark.parametrize("conflict", [False, True])
-def test_newer_message_rejudges_only_older_task_action(isolated, conflict):
-    class ReconcileModel(FakeModel):
-        async def stream(self, *, system, messages, tools, tool_choice=None):
-            if system.startswith("重新判断"):
-                data = json.loads(messages[-1]["content"])
-                original = data["original_intent"]
-                intent = {"type": "chat", "instruction": "较新的消息取代了旧要求"} if conflict else original
-                yield {"type": "tool_use", "id": new_id(), "name": "route_input", "input": {
-                    "message_id": data["message_id"], "user_seq": data["user_seq"],
-                    "intents": [intent], "needs_clarification": False}}
-                yield {"type": "stop_reason", "reason": "tool_use"}
-                return
-            async for item in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
-                yield item
-
-    async def run():
-        runtime = Runtime(client=ReconcileModel())
-        with db.new_session() as session:
-            store.initialize(session, isolated)
-            task = runtime.create_task(session, "任务 A", 1)
-            event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
-                     "text": "停止 A，并整理 B", "user_seq": 1, "status": "pending"}
-            store.put(session, "input:old", event)
-            store.put(session, "input:new", {"type": "user_event", "event_type": "message", "id": "new",
-                      "message_id": "user:new", "text": "继续 A" if conflict else "另外查一下天气",
-                      "user_seq": 2, "status": "processed"})
-            meta = store.get(session, "meta")
-            meta["user_seq"] = 2
-            store.put(session, "meta", meta)
-            route = {"needs_clarification": False, "intents": [
-                {"type": "stop", "task_id": task["id"], "instruction": "停止 A"},
-                {"type": "create", "instruction": "整理 B"}]}
-            runtime._apply_route(session, event, route)
-            session.commit()
-            assert not store.get(session, f"task:{task['id']}")["stop_requested"]
-            assert len(store.records(session, "task_state")) == 2
-            report = store.records(session, "agent_message", context_id="main")[0]
-        await runtime._report(report)
-        with db.new_session() as session:
-            assert store.get(session, f"task:{task['id']}")["stop_requested"] is (not conflict)
-            assert store.get(session, f"bus:{report['id']}")["delivery"] == "processed"
+        model = Model()
+        runtime = Runtime(client=model)
+        await runtime.start()
+        try:
+            def setup(session):
+                task = runtime.create_task(session, "existing task", 1)
+                task.update(status="waiting_user", delivery_unknown=True)
+                store.put(session, f"task:{task['id']}", task)
+                return task
+            task = await runtime.change(setup)
+            model.task_id = task["id"]
+            await accept(runtime, "older", "modify existing task", None)
+            await asyncio.wait_for(model.started.wait(), 4)
+            def approve(session):
+                seq = store.bump(session, user_event=True)["user_seq"]
+                store.put(session, "approval:later-approval", {"type": "approval", "request_id": "later-approval",
+                          "task_id": task["id"], "status": "resolved", "option_id": "allowOnce", "user_seq": seq})
+                store.put(session, "decision:later-approval", {"type": "user_event", "event_type": "approval",
+                          "id": "later-approval", "task_id": task["id"], "user_seq": seq,
+                          "option_id": "allowOnce", "status": "processed"})
+            await runtime.change(approve)
+            model.release.set()
+            def finished():
+                with db.new_session() as session:
+                    return (store.get(session, "reply:older") or {}).get("status") == "completed"
+            await wait_for(finished)
+            with db.new_session() as session:
+                current = store.get(session, f"task:{task['id']}")
+                assert not current["stop_requested"]
+                messages = store.records(session, "agent_message", context_id=task["context_id"])
+                assert bool(messages) is not conflict
+        finally:
+            model.release.set()
+            await runtime.close()
     asyncio.run(run())
 
 
@@ -722,8 +653,23 @@ def test_scheduler_caps_parallel_workers_at_six(isolated):
 def test_helper_allocation_and_busy_message_delivery(isolated):
     from app.agent.worker import Worker
 
+    class HelperModel(FakeModel):
+        def __init__(self):
+            super().__init__()
+            self.wrote_todo = False
+
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            if system.startswith("你是后台工作助手") and not self.wrote_todo:
+                self.wrote_todo = True
+                yield {"type": "tool_use", "id": "helper-todo", "name": "write_todos", "input": {
+                    "todos": [{"content": "协助事项", "status": "in_progress"}]}}
+                yield {"type": "stop_reason", "reason": "end_turn"}
+                return
+            async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
+                yield event
+
     async def run():
-        model = FakeModel()
+        model = HelperModel()
         runtime = Runtime(client=model)
         with db.new_session() as session:
             store.initialize(session, isolated)
@@ -742,6 +688,9 @@ def test_helper_allocation_and_busy_message_delivery(isolated):
             await asyncio.wait_for(model.worker_started.wait(), 3)
             with db.new_session() as session:
                 helper = store.records(session, "agent_run")[0]
+            thread = runtime.graph.thread_id(f"{helper['context_id']}:loop", parent_context=helper["context_id"])
+            state = await runtime.agent_loop.graph.aget_state({"configurable": {"thread_id": thread}})
+            assert state.values["todos"] == [{"content": "协助事项", "status": "in_progress"}]
             sent = await owner.communicate("agent_send", {"context_id": helper["context_id"], "content": "补充说明"}, "message-call")
             assert "消息已受理" in sent
             with db.new_session() as session:
@@ -1022,18 +971,19 @@ def test_restart_regenerates_unfinished_reply_without_recreating_task(isolated):
             super().__init__()
             self.interrupt = interrupt
             self.reply_started = asyncio.Event()
-            self.routes = 0
             self.replies = 0
             self.dialog_tools = set()
+            self.created = False
 
         async def stream(self, *, system, messages, tools, tool_choice=None):
-            if tool_choice and tool_choice["name"] == "route_input":
-                self.routes += 1
+            if system.startswith("你是后台工作助手"):
                 async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
                     yield event
-            elif system.startswith("你是后台工作助手"):
-                async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
-                    yield event
+            elif self.interrupt and not self.created:
+                self.created = True
+                yield {"type": "tool_use", "id": "create", "name": "task_create",
+                       "input": {"title": "检查文件", "goal": "任务检查文件"}}
+                yield {"type": "stop_reason", "reason": "end_turn"}
             else:
                 self.replies += 1
                 self.dialog_tools = {tool["name"] for tool in tools}
@@ -1071,7 +1021,7 @@ def test_restart_regenerates_unfinished_reply_without_recreating_task(isolated):
                 visible = store.visible(session)
                 assert any(m["text"] == "未完成的回复" and m["status"] == "interrupted" for m in visible)
                 assert sum(m["text"] == "恢复后的回复" for m in visible) == 1
-            assert second.routes == 0 and second.replies == 1 and "task_create" not in second.dialog_tools
+            assert second.replies == 1 and "task_create" in second.dialog_tools
         finally:
             await runtime.close()
 
@@ -1080,7 +1030,7 @@ def test_restart_regenerates_unfinished_reply_without_recreating_task(isolated):
         await runtime.start()
         try:
             await asyncio.sleep(0.3)
-            assert third.routes == 0 and third.replies == 0
+            assert third.replies == 0
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -1433,35 +1383,45 @@ def test_report_delivery_failure_retries_without_duplicate_context(isolated, mon
     asyncio.run(run())
 
 
-def test_invalid_routing_keeps_pending_approval_and_does_not_act(isolated):
-    class InvalidModel(FakeModel):
+def test_invalid_main_tool_keeps_pending_approval_and_does_not_act(isolated):
+    class InvalidModel:
+        model = "fake"
+
+        def __init__(self):
+            self.calls = 0
+
         async def stream(self, *, system, messages, tools, tool_choice=None):
-            if tool_choice:
-                yield {"type": "tool_use", "id": "bad", "name": "route_input", "input": {"user_seq": -1}}
-                return
-            async for item in super().stream(system=system, messages=messages, tools=tools):
-                yield item
+            self.calls += 1
+            if self.calls == 1:
+                yield {"type": "tool_use", "id": "bad", "name": "task_stop", "input": {"task_id": 1}}
+            else:
+                yield {"type": "text_delta", "text": "invalid action"}
+            yield {"type": "stop_reason", "reason": "end_turn"}
 
     async def run():
         runtime = Runtime(client=InvalidModel())
         await runtime.start()
         try:
             def setup(session):
-                task = runtime.create_task(session, "等待审批", 1)
-                task["status"] = "waiting_user"
+                task = runtime.create_task(session, "waiting for approval", 1)
+                task.update(status="waiting_user", delivery_unknown=True)
                 store.put(session, f"task:{task['id']}", task)
                 store.put(session, "approval:pending", {"type": "approval", "request_id": "pending",
                           "status": "requested", "task_id": task["id"]})
                 return task
             task = await runtime.change(setup)
-            await accept(runtime, "invalid-route", "停止这个任务", None)
-            def failed():
+            await accept(runtime, "invalid-action", "stop this task", None)
+            def finished():
                 with db.new_session() as session:
-                    return store.get(session, "input:invalid-route")["status"] == "failed"
-            await wait_for(failed)
+                    return (store.get(session, "reply:invalid-action") or {}).get("status") == "completed"
+            await wait_for(finished)
             with db.new_session() as session:
-                assert not store.get(session, f"task:{task['id']}")["stop_requested"]
                 assert store.get(session, "approval:pending")["status"] == "requested"
+                assert not store.get(session, f"task:{task['id']}")["stop_requested"]
+                results = [block for message in store.history(session, "main")
+                           if isinstance(message["content"], list) for block in message["content"]
+                           if block.get("type") == "tool_result"]
+                assert results[0].get("is_error")
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -1570,26 +1530,19 @@ def test_old_task_can_be_found_from_main_chat(isolated):
 
     class SearchModel(FakeModel):
         async def stream(self, *, system, messages, tools, tool_choice=None):
-            if tool_choice and tool_choice["name"] == "route_input":
-                request = json.loads(messages[-1]["content"])
-                assert "远古枫叶" not in system
-                yield {"type": "tool_use", "id": "route", "name": "route_input", "input": {
-                    "message_id": request["message_id"], "user_seq": request["user_seq"],
-                    "intents": [{"type": "query", "instruction": "查询枫叶任务"}], "needs_clarification": False}}
+            blocks = [block for message in messages if isinstance(message["content"], list)
+                      for block in message["content"]]
+            names = [block.get("name") for block in blocks if block.get("type") == "tool_use"]
+            if "task_search" not in names:
+                yield {"type": "tool_use", "id": "search", "name": "task_search", "input": {"keyword": "枫叶"}}
+            elif "task_inspect" not in names:
+                output = next(block["content"] for block in blocks if block.get("tool_use_id") == "search")
+                task_id = json.loads(output)["tasks"][0]["id"]
+                yield {"type": "tool_use", "id": "inspect", "name": "task_inspect", "input": {"task_id": task_id}}
             else:
-                blocks = [block for message in messages if isinstance(message["content"], list)
-                          for block in message["content"]]
-                names = [block.get("name") for block in blocks if block.get("type") == "tool_use"]
-                if "task_search" not in names:
-                    yield {"type": "tool_use", "id": "search", "name": "task_search", "input": {"keyword": "枫叶"}}
-                elif "task_inspect" not in names:
-                    output = next(block["content"] for block in blocks if block.get("tool_use_id") == "search")
-                    task_id = json.loads(output)["tasks"][0]["id"]
-                    yield {"type": "tool_use", "id": "inspect", "name": "task_inspect", "input": {"task_id": task_id}}
-                else:
-                    output = next(block["content"] for block in blocks if block.get("tool_use_id") == "inspect")
-                    assert "历史报告：已经完成" in output
-                    yield {"type": "text_delta", "text": "枫叶任务已经完成。"}
+                output = next(block["content"] for block in blocks if block.get("tool_use_id") == "inspect")
+                assert "历史报告：已经完成" in output
+                yield {"type": "text_delta", "text": "枫叶任务已经完成。"}
             yield {"type": "stop_reason", "reason": "end_turn"}
 
     async def run():
@@ -1625,14 +1578,7 @@ def test_old_task_can_be_found_from_main_chat(isolated):
 def test_omitted_active_task_can_be_found_and_stopped(isolated):
     class SearchAndStop(FakeModel):
         async def stream(self, *, system, messages, tools, tool_choice=None):
-            if tool_choice and tool_choice["name"] == "route_input":
-                request = json.loads(messages[-1]["content"])
-                assert "特殊目标五十五" not in system
-                yield {"type": "tool_use", "id": "route", "name": "route_input", "input": {
-                    "message_id": request["message_id"], "user_seq": request["user_seq"],
-                    "intents": [{"type": "unclear", "instruction": "找到并停止特殊目标五十五"}],
-                    "needs_clarification": True}}
-            elif system.startswith("你是后台工作助手"):
+            if system.startswith("你是后台工作助手"):
                 async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
                     yield event
                 return
@@ -1717,21 +1663,19 @@ class DirectModel:
         self.worker_calls = 0
         self.reports = []
         self.direct_tools = set()
+        self.updated = False
 
     async def stream(self, *, system, messages, tools, tool_choice=None):
-        if tool_choice and tool_choice["name"] == "route_input":
-            request = json.loads(messages[-1]["content"])
-            intent = {"type": "chat", "instruction": request["text"]}
-            if request["text"] == "不要写入":
-                with db.new_session() as session:
-                    task = next(t for t in store.records(session, "task_state") if t.get("direct"))
-                intent.update(type="update", task_id=task["id"], approval_ids=[])
-            yield {"type": "tool_use", "id": new_id(), "name": "route_input", "input": {
-                "message_id": request["message_id"], "user_seq": request["user_seq"],
-                "intents": [intent], "needs_clarification": False}}
-        elif system.startswith("你是后台工作助手"):
+        if system.startswith("你是后台工作助手"):
             self.worker_calls += 1
             raise AssertionError("简单任务不应启动后台助手模型")
+        elif not self.updated and any(message.get("role") == "user" and message.get("content") == "不要写入"
+                                      for message in messages):
+            self.updated = True
+            with db.new_session() as session:
+                task = next(t for t in store.records(session, "task_state") if t.get("direct"))
+            yield {"type": "tool_use", "id": new_id(), "name": "task_update",
+                   "input": {"task_id": task["id"], "instruction": "不要写入"}}
         elif messages[-1]["content"].startswith("请根据直接执行"):
             report = next(m["content"] for m in reversed(messages[:-1])
                           if isinstance(m.get("content"), str) and m["content"].startswith("直接执行【"))
@@ -2039,17 +1983,12 @@ class FirstActionModel:
         self.reply_messages = []
 
     async def stream(self, *, system, messages, tools, tool_choice=None):
-        if tool_choice and tool_choice["name"] == "route_input":
+        if system.startswith("你是后台工作助手"):
+            raise AssertionError("首个直接动作不应启动后台助手模型")
+        if not self.calls:
             self.calls.append("first")
             assert system.startswith("你是用户长期使用的主助手")
-            request = json.loads(messages[-1]["content"])
-            yield {"type": "tool_use", "id": new_id(), "name": "route_input", "input": {
-                "message_id": request["message_id"], "user_seq": request["user_seq"],
-                "intents": [{"type": self.intent, "instruction": request["text"]}],
-                "needs_clarification": False,
-                "first_action": {"intent_index": 0, "name": self.name, "input": self.args}}}
-        elif system.startswith("你是后台工作助手"):
-            raise AssertionError("首个直接动作不应启动后台助手模型")
+            yield {"type": "tool_use", "id": new_id(), "name": self.name, "input": self.args}
         else:
             self.calls.append("reply")
             self.reply_messages = messages
@@ -2096,9 +2035,8 @@ def test_first_action_reads_file_in_two_model_calls(isolated):
                 history = store.history(session, "main")
                 action = next(block for entry in history if isinstance(entry["content"], list)
                               for block in entry["content"] if block.get("type") == "tool_use")
-                assert action["name"] == "route_input"
-                assert action["input"]["first_action"]["name"] == "read_file"
-                assert action["input"]["first_action"]["input"] == {"path": "/mnt/user-data/workspace/note.txt"}
+                assert action["name"] == "read_file"
+                assert action["input"] == {"path": "/mnt/user-data/workspace/note.txt"}
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -2120,221 +2058,6 @@ def test_first_action_can_search_history_in_two_model_calls(isolated):
             await wait_for(lambda: bool(model.reply_messages))
             assert model.calls == ["first", "reply"]
             assert task["id"] in json.dumps(model.reply_messages, ensure_ascii=False)
-        finally:
-            await runtime.close()
-    asyncio.run(run())
-
-
-def test_first_action_ids_are_scoped_to_the_user_message(isolated):
-    with db.new_session() as session:
-        store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("task_search", {"keyword": "A"}, intent="query"))
-        for seq, keyword in enumerate(("alpha", "beta"), 1):
-            task = runtime.create_task(session, keyword, seq)
-            task["status"] = "completed"
-            store.put(session, f"task:{task['id']}", task)
-            event = {"type": "user_event", "event_type": "message", "id": f"search-{seq}",
-                     "message_id": f"user:search-{seq}", "text": keyword, "user_seq": seq, "status": "pending"}
-            store.put(session, f"input:search-{seq}", event)
-            route = {"message_id": event["message_id"], "user_seq": seq,
-                     "intents": [{"type": "query", "instruction": keyword}], "needs_clarification": False,
-                     "first_action": {"intent_index": 0, "name": "task_search", "input": {"keyword": keyword}}}
-            runtime._validate_route(route, event)
-            runtime._apply_route(session, event, route, set(), "same-call")
-            action = store.get(session, f"action:main:search-{seq}:same-call")
-            assert task["id"] in action["output"]
-
-
-@pytest.mark.parametrize("action", [
-    {"intent_index": True, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}},
-    {"intent_index": 1, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}},
-    {"intent_index": 0, "name": "task_stop", "input": {"task_id": "x"}},
-    {"intent_index": 0, "name": "read_file", "input": {"path": 1}},
-    {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt", "extra": "x"}},
-    {"intent_index": 0, "name": "read_file", "input": {"path": "a.txt", "offset": 0}},
-    {"intent_index": 0, "name": "todo_write", "input": {"items": [{"content": "a", "status": "invalid"}]}},
-])
-def test_invalid_first_action_is_rejected(action):
-    event = {"message_id": "user:one", "user_seq": 1}
-    route = {"message_id": event["message_id"], "user_seq": 1,
-             "intents": [{"type": "chat", "instruction": "pwd"}],
-             "needs_clarification": False, "first_action": action}
-    with pytest.raises(ValueError):
-        Runtime._validate_route(route, event)
-
-
-def test_first_action_requires_a_nonempty_intent():
-    event = {"message_id": "user:one", "user_seq": 1}
-    route = {"message_id": event["message_id"], "user_seq": 1,
-             "intents": [{"type": "chat", "instruction": "  "}], "needs_clarification": False,
-             "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
-    with pytest.raises(ValueError):
-        Runtime._validate_route(route, event)
-
-
-@pytest.mark.parametrize("newer_approval", [False, True])
-def test_first_action_keeps_mixed_intents_and_approval_order(isolated, newer_approval):
-    with db.new_session() as session:
-        store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"}))
-        task = runtime.create_task(session, "删除 A", 1)
-        task["status"] = "waiting_user"
-        store.put(session, f"task:{task['id']}", task)
-        event = {"type": "user_event", "event_type": "message", "id": "mixed",
-                 "message_id": "user:mixed", "text": "不要删除 A，同时运行 pwd", "user_seq": 2, "status": "pending"}
-        store.put(session, "input:mixed", event)
-        approval = {"type": "approval", "request_id": "a", "task_id": task["id"],
-                    "status": "resolved" if newer_approval else "requested"}
-        if newer_approval:
-            approval.update(option_id="allowOnce", user_seq=3)
-            store.put(session, "decision:a", {"type": "user_event", "event_type": "approval", "id": "a",
-                      "task_id": task["id"], "user_seq": 3, "option_id": "allowOnce"})
-        store.put(session, "approval:a", approval)
-        route = {"message_id": event["message_id"], "user_seq": event["user_seq"],
-                 "intents": [{"type": "update", "task_id": task["id"], "instruction": "不要删除 A", "approval_ids": ["a"]},
-                             {"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": False,
-                 "first_action": {"intent_index": 1, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
-        runtime._validate_route(route, event)
-        runtime._apply_route(session, event, route, {"a"}, "first-call")
-        direct = [t for t in store.records(session, "task_state") if t.get("direct")]
-        assert len(direct) == 1 and direct[0]["direct_phase"] == "executing"
-        assert store.get(session, "reply:mixed")["status"] == "completed"
-        assert store.records(session, "tool_execution")[0]["input"] == {"path": "/mnt/user-data/workspace/note.txt"}
-        updates = store.records(session, "agent_message", context_id=task["context_id"])
-        assert bool(updates) != newer_approval
-        if newer_approval:
-            assert "随后已批准" in store.visible(session)[-1]["text"]
-        runtime._apply_route(session, event, route, {"a"}, "first-call")
-        assert len(store.records(session, "tool_execution")) == 1
-
-
-def test_first_action_is_not_started_after_newer_user_message(isolated):
-    with db.new_session() as session:
-        store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"}))
-        event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
-                 "text": "pwd", "user_seq": 1, "status": "pending"}
-        store.put(session, "input:old", event)
-        store.put(session, "input:new", {"type": "user_event", "event_type": "message", "id": "new",
-                  "message_id": "user:new", "text": "先不要执行", "user_seq": 2, "status": "pending"})
-        route = {"message_id": event["message_id"], "user_seq": 1,
-                 "intents": [{"type": "chat", "instruction": "pwd"}], "needs_clarification": False,
-                 "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
-        runtime._apply_route(session, event, route, set(), "first-call")
-        assert not store.records(session, "tool_execution")
-
-
-def test_first_action_waits_if_intent_needs_clarification(isolated):
-    with db.new_session() as session:
-        store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"}))
-        event = {"type": "user_event", "event_type": "message", "id": "unclear", "message_id": "user:unclear",
-                 "text": "先确认再运行", "user_seq": 1, "status": "pending"}
-        store.put(session, "input:unclear", event)
-        route = {"message_id": event["message_id"], "user_seq": 1,
-                 "intents": [{"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": True,
-                 "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
-        blocks = [{"type": "tool_use", "id": "first-call", "name": "route_input", "input": route}]
-        runtime._apply_route(session, event, route, set(), "first-call", blocks)
-        assert not store.records(session, "tool_execution")
-        assert store.get(session, "reply:unclear")["status"] == "pending"
-        assert not store.get(session, "reply:unclear")["allow_direct"]
-        assert "首个动作未执行" in str(store.history(session, "main")[-1]["content"])
-
-
-def test_first_action_keeps_a_clear_intent_when_another_needs_clarification(isolated):
-    with db.new_session() as session:
-        store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"}))
-        event = {"type": "user_event", "event_type": "message", "id": "mixed-unclear",
-                 "message_id": "user:mixed-unclear", "text": "处理之前的文件，同时运行 pwd", "user_seq": 1, "status": "pending"}
-        store.put(session, "input:mixed-unclear", event)
-        route = {"message_id": event["message_id"], "user_seq": 1,
-                 "intents": [{"type": "unclear", "instruction": "不确定要处理哪个文件"},
-                             {"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": True,
-                 "first_action": {"intent_index": 1, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
-        runtime._validate_route(route, event)
-        runtime._apply_route(session, event, route, set(), "first-call")
-        assert store.records(session, "tool_execution")[0]["input"] == {"path": "/mnt/user-data/workspace/note.txt"}
-        assert "需要向用户澄清" in str(store.history(session, "main")[-1]["content"])
-
-
-def test_invalid_first_action_does_not_change_tasks_or_approvals(isolated):
-    class InvalidFirstModel(FakeModel):
-        async def stream(self, *, system, messages, tools, tool_choice=None):
-            if tool_choice and tool_choice["name"] == "route_input":
-                request = json.loads(messages[-1]["content"])
-                yield {"type": "tool_use", "id": "invalid-first", "name": "route_input", "input": {
-                    "message_id": request["message_id"], "user_seq": request["user_seq"],
-                    "intents": [{"type": "stop", "task_id": task["id"], "instruction": "停止"},
-                                {"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": False,
-                    "first_action": {"intent_index": 1, "name": "bash", "input": {"command": 123}}}}
-                return
-            async for item in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
-                yield item
-
-    async def run():
-        nonlocal task
-        runtime = Runtime(client=InvalidFirstModel())
-        await runtime.start()
-        try:
-            def setup(session):
-                current = runtime.create_task(session, "等待审批", 1)
-                current["status"] = "waiting_user"
-                store.put(session, f"task:{current['id']}", current)
-                store.put(session, "approval:pending", {"type": "approval", "request_id": "pending",
-                          "status": "requested", "task_id": current["id"]})
-                return current
-            task = await runtime.change(setup)
-            await accept(runtime, "invalid-first", "停止任务并运行 pwd", None)
-            def failed():
-                with db.new_session() as session:
-                    return store.get(session, "input:invalid-first")["status"] == "failed"
-            await wait_for(failed)
-            with db.new_session() as session:
-                assert not store.get(session, f"task:{task['id']}")["stop_requested"]
-                assert store.get(session, "approval:pending")["status"] == "requested"
-                assert not store.records(session, "tool_execution")
-        finally:
-            await runtime.close()
-    task = None
-    asyncio.run(run())
-
-
-def test_first_action_started_before_restart_is_not_replayed(isolated, monkeypatch):
-    from app.agent import tools
-
-    calls = []
-    monkeypatch.setattr(tools, "execute_tool", lambda *args: calls.append(args) or "unexpected")
-
-    async def run():
-        model = FirstActionModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"})
-        runtime = Runtime(client=model)
-        with db.new_session() as session:
-            store.initialize(session, isolated)
-            event = {"type": "user_event", "event_type": "message", "id": "recover-first",
-                     "message_id": "user:recover-first", "text": "pwd", "user_seq": 1, "status": "pending"}
-            store.put(session, "input:recover-first", event)
-            route = {"message_id": event["message_id"], "user_seq": 1,
-                     "intents": [{"type": "chat", "instruction": "pwd"}], "needs_clarification": False,
-                     "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
-            blocks = [{"type": "tool_use", "id": "first-call", "name": "route_input", "input": route}]
-            runtime._apply_route(session, event, route, set(), "first-call", blocks)
-            execution = store.records(session, "tool_execution")[0]
-            execution["status"] = "started"
-            store.put(session, f"execution:{execution['id']}", execution)
-            session.commit()
-        await runtime.start()
-        try:
-            await wait_for(lambda: bool(model.reply_messages))
-            assert not calls and model.calls == ["reply"]
-            assert "结果未知" in json.dumps(model.reply_messages, ensure_ascii=False)
-            with db.new_session() as session:
-                task = next(t for t in store.records(session, "task_state") if t.get("direct"))
-                context = store.history(session, task["context_id"])
-                blocks = [block for entry in context if isinstance(entry["content"], list) for block in entry["content"]]
-                assert any(block.get("name") == "route_input" and block.get("id") == "first-call" for block in blocks)
-                assert any(block.get("tool_use_id") == "first-call" and "结果未知" in block["content"] for block in blocks)
         finally:
             await runtime.close()
     asyncio.run(run())

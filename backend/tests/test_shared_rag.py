@@ -534,21 +534,20 @@ def test_rag_answer_is_bounded_delivered_and_task_cleaned(isolated):
 def test_main_worker_and_rag_answer_end_to_end(isolated):
     class Model:
         model = "fake"
+        created = False
 
         async def stream(self, *, system, messages, tools, tool_choice=None):
-            if tool_choice and tool_choice["name"] == "route_input":
-                request = json.loads(messages[-1]["content"])
-                yield {"type": "tool_use", "id": "route", "name": "route_input", "input": {
-                    "message_id": request["message_id"], "user_seq": request["user_seq"],
-                    "intents": [{"type": "create", "instruction": "查询知识库", "knowledge_question": True}],
-                    "needs_clarification": False}}
-            elif system.startswith("你是后台工作助手"):
+            if system.startswith("你是后台工作助手"):
                 calls = [part for message in messages if isinstance(message["content"], list)
                          for part in message["content"] if part.get("name") == "rag_search"]
                 if not calls:
                     yield {"type": "tool_use", "id": "search", "name": "rag_search", "input": {"query": "问题"}}
                 else:
                     yield {"type": "text_delta", "text": "已完成查询"}
+            elif not self.created:
+                self.created = True
+                yield {"type": "tool_use", "id": "create", "name": "task_create", "input": {
+                    "title": "查询知识库", "goal": "查询知识库", "knowledge_question": True}}
             else:
                 yield {"type": "text_delta", "text": "已安排查询"}
             yield {"type": "stop_reason", "reason": "end_turn"}
@@ -572,9 +571,8 @@ def test_main_worker_and_rag_answer_end_to_end(isolated):
             async with asyncio.timeout(12):
                 while True:
                     with db.new_session() as session:
-                        marker = store.get(session, "task-key:route:message:0")
                         messages = store.visible(session)
-                    if marker and marker.get("processed"):
+                    if any(message["text"] == "知识库原答案" for message in messages):
                         break
                     await asyncio.sleep(0.05)
             assert any(message["text"] == "知识库原答案" for message in messages)

@@ -1,22 +1,28 @@
+import asyncio
 from types import SimpleNamespace
 
 from langchain_core.messages import AIMessage
 
 from app import db
-from app.agent import compact, hooks, skills
+from app.agent import compact, hooks, skills, todo
 from app.agent.model_call import record_model_step
 from app.agent.task_tools import WORKER_TOOLS
 from app.models import new_id
 from app.sessions import chat_store as store
 
 
-async def _tool_call(worker, call, context):
+def _execution(call, context):
     with db.new_session() as session:
         group = store.get(session, f"group:{context['group_id']}")
         executions = [store.get(session, f"execution:{identity}") for identity in group["calls"]]
     execution = next((item for item in executions if item["call_id"] == call["id"]), None)
     if not execution or execution["name"] != call["name"] or execution["input"] != call["args"]:
         raise ValueError("工具调用与执行记录不一致")
+    return execution
+
+
+async def _tool_call(worker, call, context):
+    execution = _execution(call, context)
     worker.sandbox = context.get("sandbox")
     worker.sandbox_scope = context["owner_id"]
     return await worker.process_execution(execution["id"])
@@ -37,10 +43,42 @@ async def _invoke(worker, before_model, model_call, after_model=None, *, group_i
                 context["retain_on_error"] = True
             raise
 
+    async def skip_tool_call(call, context, output):
+        execution = _execution(call, context)
+        def skip(session):
+            current = store.get(session, f"execution:{execution['id']}")
+            current.update(status="completed", output=output)
+            store.put(session, f"execution:{execution['id']}", current)
+        await runtime.change(skip)
+
     if worker.task().get("direct"):
         context = runtime.direct_sandboxes.setdefault(worker.task_id, {
             "user_id": runtime.user_id, "thread_id": f"{runtime.user_id}:{worker.context_id}:{worker.run_id}",
             "owner_id": f"direct:{worker.task_id}:{worker.run_id}", "retain_sandbox": True})
+
+        async def apply_todos(items, call):
+            execution = _execution(call, context)
+            async with runtime.graph.write_lock:
+                main_thread = runtime.graph.thread_id("main:loop", parent_context="main")
+            async with runtime.graph.locks.setdefault(main_thread, asyncio.Lock()):
+                async with runtime.lock:
+                    with db.new_session() as session:
+                        seq = execution.get("decision_seq")
+                        stale = seq is not None and any(
+                            item.get("event_type") == "message" and item["user_seq"] > seq
+                            for item in store.records(session, "user_event"))
+                    if not stale:
+                        await runtime.agent_loop.graph.aupdate_state({"configurable": {"thread_id": main_thread}},
+                                                                     {"todos": items})
+                if stale:
+                    error = "Error: 已有更新的用户消息，请重新判断 TODO。"
+                    def fail(session):
+                        current = store.get(session, f"execution:{execution['id']}")
+                        current["output"] = error
+                        store.put(session, f"execution:{execution['id']}", current)
+                    await runtime.change(fail)
+                    return error
+        context["apply_todos"] = apply_todos
     elif worker.keep_sandbox:
         key = f"{worker.context_id}:{worker.run_id}"
         context = runtime.worker_sandboxes.setdefault(key, {
@@ -52,7 +90,7 @@ async def _invoke(worker, before_model, model_call, after_model=None, *, group_i
     context.pop("injected", None)
     context.pop("retain_on_error", None)
     context.pop("_ordered_tool_groups", None)
-    context.update(before_model=before_model, model_call=model_call, tool_call=tool_call,
+    context.update(before_model=before_model, model_call=model_call, tool_call=tool_call, skip_tool_call=skip_tool_call,
                    after_model=after_model, group_id=group_id)
     await runtime.graph.invoke_loop(runtime.agent_loop, thread_id, context)
 
@@ -130,9 +168,9 @@ async def run(worker):
         context["step_number"] = await runtime.change(step)
 
     async def model_call(state, context):
-        history = await compact.context_history(runtime, worker.context_id)
+        history = todo.remind(await compact.context_history(runtime, worker.context_id), state)
         deps = SimpleNamespace(client=runtime.client, recorder=SimpleNamespace(session_id="main", turn_id=worker.run_id))
-        system = _PROMPT + skills.skill_prompt()
+        system = _PROMPT + skills.skill_prompt() + "\n" + todo.PROMPT
         with record_model_step(deps, system, history, WORKER_TOOLS, subtask_id=worker.task_id) as reply:
             async for event in runtime.client.stream(system=system, messages=history, tools=WORKER_TOOLS):
                 reply.accept(event)

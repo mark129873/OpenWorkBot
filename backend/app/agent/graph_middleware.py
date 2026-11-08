@@ -1,6 +1,7 @@
 import asyncio
 
 from langchain.agents.middleware import AgentMiddleware
+from langchain_core.messages import ToolMessage
 
 
 class OrderedToolMiddleware(AgentMiddleware):
@@ -22,7 +23,7 @@ class OrderedToolMiddleware(AgentMiddleware):
             raise ValueError("工具调用不属于当前消息")
         groups = context.setdefault("_ordered_tool_groups", {})
         group = groups.setdefault((message.id or id(message), identities),
-                                  {"condition": asyncio.Condition(), "done": set(), "next": 0})
+                                  {"condition": asyncio.Condition(), "done": set(), "next": 0, "failed": False})
         condition = group["condition"]
 
         def finish():
@@ -38,7 +39,32 @@ class OrderedToolMiddleware(AgentMiddleware):
                 if call_id in group["done"] or group["next"] >= len(identities):
                     raise ValueError("工具调用已处理")
                 try:
-                    return await handler(request)
+                    if group.get("waiting"):
+                        from app.agent.worker import AgentWaiting
+                        raise AgentWaiting
+                    duplicate = (request.tool_call.get("name") == "write_todos"
+                                 and sum(call.get("name") == "write_todos" for call in calls) > 1)
+                    if group["failed"] or duplicate:
+                        output = "Error: 同一轮不能多次调用 write_todos。" if duplicate else "Error: 前一项工具失败，本项未执行。"
+                        skip = context.get("skip_tool_call")
+                        if skip:
+                            await skip(request.tool_call, context, output)
+                        group["failed"] = True
+                        return ToolMessage(content=output, tool_call_id=call_id, name=request.tool_call["name"], status="error")
+                    result = await handler(request)
+                    if isinstance(result, ToolMessage) and (result.status == "error" or str(result.content).startswith("Error:")):
+                        group["failed"] = True
+                    return result
+                except asyncio.CancelledError:
+                    group["waiting"] = True
+                    raise
+                except Exception as exc:
+                    from app.agent.worker import AgentWaiting
+                    if isinstance(exc, AgentWaiting):
+                        group["waiting"] = True
+                    else:
+                        group["failed"] = True
+                    raise
                 finally:
                     finish()
         except asyncio.CancelledError:

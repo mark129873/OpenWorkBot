@@ -340,6 +340,10 @@ def test_reset_deletes_only_current_users_data(tmp_path, monkeypatch):
                         session.commit()
                     _store(user_id, empty_memory(), [{"id": "fact", "content": user_id[0], "confidence": 0.9}])
                     await runtime.graph.invoke("main", incoming={"id": "delivery", "content": user_id[0]})
+                    loop_thread = runtime.graph.thread_id("main:loop", parent_context="main")
+                    await runtime.agent_loop.graph.aupdate_state(
+                        {"configurable": {"thread_id": loop_thread}},
+                        {"todos": [{"content": user_id[0], "status": "pending"}]})
                     (settings.workspaces_dir / user_id / "keep.txt").write_text("keep", encoding="utf-8")
                     log_dir = settings.modelio_dir / user_id
                     log_dir.mkdir(parents=True)
@@ -348,6 +352,7 @@ def test_reset_deletes_only_current_users_data(tmp_path, monkeypatch):
             with bind_user("a" * 32):
                 old = await runtimes[0].snapshot()
                 old_thread = runtimes[0].graph.thread_id("main")
+                old_loop = runtimes[0].graph.thread_id("main:loop", parent_context="main")
                 await runtimes[0].reset(old["assistant_id"], "reset-1")
                 await asyncio.wait_for(runtimes[0].reset_task, 10)
                 new = await runtimes[0].snapshot()
@@ -356,10 +361,14 @@ def test_reset_deletes_only_current_users_data(tmp_path, monkeypatch):
                 assert not (settings.modelio_dir / ("a" * 32) / "model-io-main.jsonl").exists()
                 assert (settings.workspaces_dir / ("a" * 32) / "keep.txt").exists()
                 assert await saver.aget_tuple({"configurable": {"thread_id": old_thread}}) is None
+                assert await saver.aget_tuple({"configurable": {"thread_id": old_loop}}) is None
             with bind_user("b" * 32):
                 assert (await runtimes[1].snapshot())["messages"][0]["text"] == "b"
                 assert _read_files("b" * 32)[1][0]["content"] == "b"
                 assert (settings.modelio_dir / ("b" * 32) / "model-io-main.jsonl").exists()
+                loop_thread = runtimes[1].graph.thread_id("main:loop", parent_context="main")
+                state = await runtimes[1].agent_loop.graph.aget_state({"configurable": {"thread_id": loop_thread}})
+                assert state.values["todos"] == [{"content": "b", "status": "pending"}]
             assert (settings.modelio_dir / "model-io-legacy.jsonl").exists()
             for user_id, runtime in zip(("a" * 32, "b" * 32), runtimes):
                 with bind_user(user_id):
@@ -557,20 +566,20 @@ def test_main_and_worker_execute_through_graph_and_cleanup(tmp_path, monkeypatch
 
     class Model:
         model = "fake"
+        created = False
 
         async def stream(self, *, system, messages, tools, tool_choice=None):
-            if tool_choice and tool_choice["name"] == "route_input":
-                request = json.loads(messages[-1]["content"])
-                yield {"type": "tool_use", "id": "route", "name": "route_input", "input": {
-                    "message_id": request["message_id"], "user_seq": request["user_seq"],
-                    "intents": [{"type": "create", "instruction": "完成测试任务"}], "needs_clarification": False}}
-            elif system.startswith("你是后台工作助手"):
+            if system.startswith("你是后台工作助手"):
                 yield {"type": "text_delta", "text": "工作完成"}
             elif tool_choice and tool_choice["name"] == "task_review":
                 tasks = json.loads(messages[-1]["content"].split("当前任务：", 1)[1])
                 task = next(item for item in tasks if item["status"] == "reviewing")
                 yield {"type": "tool_use", "id": "review", "name": "task_review",
                        "input": {"task_id": task["id"], "decision": "complete"}}
+            elif not self.created:
+                self.created = True
+                yield {"type": "tool_use", "id": "create", "name": "task_create",
+                       "input": {"title": "测试任务", "goal": "完成测试任务"}}
             else:
                 yield {"type": "text_delta", "text": "任务已完成"}
             yield {"type": "stop_reason", "reason": "end_turn"}
@@ -588,9 +597,8 @@ def test_main_and_worker_execute_through_graph_and_cleanup(tmp_path, monkeypatch
                         while True:
                             with db.new_session() as session:
                                 tasks = chat_store.records(session, "task_state")
-                                marker = chat_store.get(session, "task-key:route:message:0")
                                 messages = chat_store.visible(session)
-                            if marker and marker.get("processed") and not tasks:
+                            if any(item["text"] == "任务已完成" for item in messages) and not tasks:
                                 break
                             await asyncio.sleep(0.05)
                     assert any(item["text"] == "任务已完成" for item in messages)

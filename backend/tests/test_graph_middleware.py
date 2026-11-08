@@ -1,5 +1,6 @@
 import asyncio
 
+import pytest
 from langchain.agents import create_agent
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
@@ -44,4 +45,27 @@ def test_multiple_langgraph_tool_calls_keep_model_order():
         result = await graph.ainvoke({"messages": [("user", "run")]}, context={"run": "test"})
         assert result["messages"][-1].content == "完成"
         assert events == [("first", "start"), ("first", "end"), ("second", "start"), ("second", "end")]
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize("waiting", [False, True])
+def test_exception_or_wait_does_not_start_later_tools(waiting):
+    from app.agent.worker import AgentWaiting
+
+    async def run():
+        events = []
+
+        @tool
+        async def operation(name: str) -> str:
+            """Record a tool call."""
+            events.append(name)
+            if name == "first":
+                raise AgentWaiting() if waiting else RuntimeError("failed")
+            return name
+
+        graph = create_agent(Model(), [operation], middleware=[OrderedToolMiddleware()])
+        with pytest.raises(AgentWaiting if waiting else RuntimeError):
+            await graph.ainvoke({"messages": [("user", "run")]}, context={"run": "test"})
+        await asyncio.sleep(0.05)
+        assert events == ["first"]
     asyncio.run(run())

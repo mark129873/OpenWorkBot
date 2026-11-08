@@ -206,6 +206,13 @@ class Worker:
             except ValidationError:
                 return "Error: 文件工具参数无效。"
         from app.agent import coordination
+        from app.agent.task_tools import MAIN_TOOLS, SHARED_TOOLS
+
+        if self.task().get("direct") and name in {tool["name"] for tool in MAIN_TOOLS + SHARED_TOOLS}:
+            source_seq = (execution.get("decision_seq") if name in {"task_update", "task_stop", "write_todos"}
+                          else execution.get("user_seq"))
+            return await self.runtime.change(lambda session: self.runtime._main_tool(
+                session, {"id": execution["id"], "name": name, "input": args}, source_seq))
 
         if name in coordination.NAMES:
             try:
@@ -223,7 +230,14 @@ class Worker:
             return await self.file_tool(execution)
         if name in {"ls", "glob", "grep"}:
             return await self.search_tool(execution)
-        if name not in tools.TOOL_HANDLERS and name != "todo_write":
+        if name == "write_todos":
+            schema = next(spec["input_schema"] for spec in tools.TOOLS if spec["name"] == name)
+            try:
+                validate(args, {**schema, "additionalProperties": False})
+            except ValidationError:
+                return "Error: TODO 参数无效。"
+            return "已更新 TODO。"
+        if name not in tools.TOOL_HANDLERS:
             return f"Error: 未知工具 {name}"
         error = await self.authorize(execution)
         if error:
@@ -231,13 +245,6 @@ class Worker:
         error = await self.started(execution)
         if error:
             return error
-        if name == "todo_write":
-            from app.agent.todo import parse_items, render_panel
-            items, error = parse_items(args.get("items"))
-            if error:
-                return error
-            await self.runtime.change(lambda session: store.replace_todos(session, scoped("main"), items, commit=False))
-            return render_panel(items)
         return await self.runtime.run_tool(tools.execute_tool, name, args)
 
     async def bash_tool(self, execution: dict) -> str:

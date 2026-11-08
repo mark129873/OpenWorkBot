@@ -83,9 +83,9 @@ TOOLS: list[dict] = [
          "max_results": {"type": "integer", "minimum": 1, "maximum": 500}}, ["pattern", "path"],
     ),
     _schema(
-        "todo_write", "全量更新任务板（≤20 条；进行中最多 1 条）。",
+        "write_todos", "全量更新当前助手的 TODO 清单。",
         {
-            "items": {
+            "todos": {
                 "type": "array",
                 "description": "任务数组，每项 {content: str, status: pending|in_progress|completed}",
                 "items": {
@@ -98,7 +98,7 @@ TOOLS: list[dict] = [
                 },
             }
         },
-        ["items"],
+        ["todos"],
     ),
     _schema(
         "load_skill", "按名称加载完整技能说明；指定相对路径可按需读取技能目录内的文本资源。",

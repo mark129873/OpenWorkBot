@@ -9,6 +9,7 @@ from langchain_core.tools import StructuredTool
 from langgraph.graph.message import REMOVE_ALL_MESSAGES
 
 from app.agent.graph_middleware import OrderedToolMiddleware
+from app.agent.todo import TodoMiddleware
 from app.sandbox.middleware import SandboxMiddleware
 
 
@@ -53,6 +54,16 @@ class _LoopMiddleware(AgentMiddleware):
 
     async def awrap_tool_call(self, request, handler):
         output = await request.runtime.context["tool_call"](request.tool_call, request.runtime.context)
+        if request.tool_call["name"] == "write_todos" and not output.startswith("Error:"):
+            result = await handler(request)
+            apply_todos = request.runtime.context.get("apply_todos")
+            if apply_todos:
+                error = await apply_todos(result.update["todos"], request.tool_call)
+                if error:
+                    return ToolMessage(content=error, tool_call_id=request.tool_call["id"],
+                                       name=request.tool_call["name"], status="error")
+                return result.update["messages"][0]
+            return result
         return ToolMessage(content=output, tool_call_id=request.tool_call["id"], name=request.tool_call["name"],
                            status="error" if output.startswith("Error:") else "success")
 
@@ -66,11 +77,13 @@ class LangGraphLoop:
         unique = {spec["name"]: spec for spec in specs}
         tools = [StructuredTool(name=spec["name"], description=spec["description"],
                                 args_schema=spec["input_schema"], coroutine=_placeholder)
-                 for spec in unique.values()]
+                 for spec in unique.values() if spec["name"] != "write_todos"]
         middleware = [OrderedToolMiddleware()]
         self.sandbox_middleware = SandboxMiddleware(leases=leases) if leases else None
         if self.sandbox_middleware:
             middleware.append(self.sandbox_middleware)
+        if "write_todos" in unique:
+            middleware.append(TodoMiddleware())
         middleware.append(_LoopMiddleware())
         self.graph = create_agent(_Model(), tools, middleware=middleware, checkpointer=checkpointer)
 

@@ -4,7 +4,7 @@ import json
 
 from sqlalchemy import delete, func, select
 
-from app.models import Message, Part, Session, Todo, TurnUsage, new_id, now_ms
+from app.models import Message, Part, Session, TurnUsage, new_id, now_ms
 from app.sessions.execution_state import project_directory, project_id
 from app.user_context import scoped, unscoped
 
@@ -54,11 +54,10 @@ def archive(db) -> str:
                     message_id=scoped(f"{archive_id}:{unscoped(part.message_id)}"),
                     session_id=archived_id, sequence=part.sequence, time_created=part.time_created,
                     time_updated=part.time_updated, data=part.data))
-    for model in (Todo, TurnUsage):
-        for row in db.scalars(select(model).where(model.session_id == session_id)):
-            values = {column.name: getattr(row, column.name) for column in model.__table__.columns}
-            values["session_id"] = archived_id
-            db.add(model(**values))
+    for row in db.scalars(select(TurnUsage).where(TurnUsage.session_id == session_id)):
+        values = {column.name: getattr(row, column.name) for column in TurnUsage.__table__.columns}
+        values["session_id"] = archived_id
+        db.add(TurnUsage(**values))
     db.flush()
     clear(db)
     return archive_id
@@ -68,24 +67,7 @@ def clear(db) -> None:
     session_id, control_id = scoped("main"), scoped("main:control")
     db.execute(delete(Part).where(Part.session_id == session_id, Part.id != scoped("meta")))
     db.execute(delete(Message).where(Message.session_id == session_id, Message.id != control_id))
-    db.execute(delete(Todo).where(Todo.session_id == session_id))
     db.execute(delete(TurnUsage).where(TurnUsage.session_id == session_id))
-
-
-def replace_todos(db, session_id: str, items: list[dict], *, commit: bool = True) -> None:
-    try:
-        db.execute(delete(Todo).where(Todo.session_id == session_id))
-        now = now_ms()
-        db.add_all([Todo(session_id=session_id, position=i, content=item["content"], status=item["status"],
-                         time_created=now, time_updated=now) for i, item in enumerate(items)])
-        row = db.get(Session, session_id)
-        if row is not None:
-            row.time_updated = now
-        if commit:
-            db.commit()
-    except Exception:
-        db.rollback()
-        raise
 
 
 def get(db, key: str) -> dict | None:

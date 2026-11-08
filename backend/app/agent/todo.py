@@ -1,55 +1,39 @@
-VALID_STATUS = ("pending", "in_progress", "completed")
-MAX_ITEMS = 20
+import json
+from typing import Annotated
 
-_STATUS_MARK = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]"}
-
-
-def parse_items(raw) -> tuple[list[dict] | None, str]:
-    if isinstance(raw, str):
-        import json
-
-        try:
-            raw = json.loads(raw)
-        except ValueError:
-            return None, "Error: items 不是合法 JSON"
-
-    if not isinstance(raw, list):
-        return None, "Error: items 必须是数组"
-    if len(raw) > MAX_ITEMS:
-        return None, f"Error: 任务数超过上限 {MAX_ITEMS}"
-
-    items: list[dict] = []
-    in_progress = 0
-    for i, entry in enumerate(raw):
-        if isinstance(entry, str):
-            entry = {"content": entry}
-        if not isinstance(entry, dict):
-            return None, f"Error: 第 {i + 1} 条任务格式不正确"
-        content = str(entry.get("content", "")).strip()
-        status = entry.get("status", "pending")
-        if not content:
-            return None, f"Error: 第 {i + 1} 条任务内容为空"
-        if status not in VALID_STATUS:
-            return None, f"Error: 第 {i + 1} 条任务状态非法：{status}"
-        if status == "in_progress":
-            in_progress += 1
-        items.append({"content": content, "status": status})
-    if in_progress > 1:
-        return None, "Error: 进行中的任务最多 1 条"
-    return items, ""
+from langchain.agents.middleware import AgentState, TodoListMiddleware
 
 
-def render_panel(items: list[dict]) -> str:
-    if not items:
-        return "(任务板为空)"
-    lines = [f"{_STATUS_MARK[it['status']]} {it['content']}" for it in items]
-    return "\n".join(lines)
+PROMPT = """复杂多步骤任务或用户要求时，可用 write_todos 跟踪工作；简单任务直接处理。
+开始步骤时标记 in_progress，完成后及时标记 completed；根据新要求调整清单，不得把未完成的事项标为完成。"""
 
 
-async def handle_todo_write(deps, message_id: str, tool_input: dict) -> tuple[str, list[dict]]:
-    items, error = parse_items(tool_input.get("items"))
-    if items is None:
-        return error, []
+def merge_todos(existing, new):
+    return existing if new is None else new
 
-    deps.recorder.write_todos(items)
-    return render_panel(items), [{"type": "todo_updated", "items": items}]
+
+class TodoState(AgentState):
+    todos: Annotated[list | None, merge_todos]
+
+
+class TodoMiddleware(TodoListMiddleware):
+    state_schema = TodoState
+
+    def __init__(self):
+        super().__init__(system_prompt=PROMPT, tool_description="全量更新当前助手的 TODO 清单。")
+
+    async def aafter_model(self, state, runtime):
+        return None
+
+
+def remind(messages: list, state: dict) -> list:
+    todos = state.get("todos")
+    if not todos or any(
+        block.get("type") == "tool_use" and block.get("name") == "write_todos"
+        for message in messages if isinstance(message.get("content"), list)
+        for block in message["content"] if isinstance(block, dict)
+    ):
+        return messages
+    return [*messages, {"role": "user", "content":
+            "<system_reminder>此前的 TODO 已离开上下文，当前清单：\n"
+            + json.dumps(todos, ensure_ascii=False) + "\n请根据工作进展继续更新。</system_reminder>"}]

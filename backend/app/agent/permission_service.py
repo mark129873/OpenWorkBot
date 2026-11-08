@@ -35,7 +35,7 @@ TOOL_SPECS: dict[str, dict] = {
     "grep":        {"permission": "read",    "riskLevel": "low",    "sideEffectScope": "none",      "needsApproval": False, "destructive": False, "readOnly": True},
     "write_file":  {"permission": "edit",    "riskLevel": "medium", "sideEffectScope": "workspace", "needsApproval": True,  "destructive": False, "readOnly": False},
     "str_replace": {"permission": "edit",    "riskLevel": "medium", "sideEffectScope": "workspace", "needsApproval": True,  "destructive": False, "readOnly": False},
-    "todo_write":  {"permission": "todo",    "riskLevel": "low",    "sideEffectScope": "session",   "needsApproval": False, "destructive": False, "readOnly": True},
+    "write_todos": {"permission": "todo",    "riskLevel": "low",    "sideEffectScope": "session",   "needsApproval": False, "destructive": False, "readOnly": True},
     "load_skill":  {"permission": "read",    "riskLevel": "low",    "sideEffectScope": "none",      "needsApproval": False, "destructive": False, "readOnly": True},
 }
 
