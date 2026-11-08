@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Callable
 
 from app.agent.skills import tool_load_skill
+from app.agent.todo import TOOL_DESCRIPTION
 from app.config import settings
 from app.user_context import require_user
 
@@ -83,7 +84,7 @@ TOOLS: list[dict] = [
          "max_results": {"type": "integer", "minimum": 1, "maximum": 500}}, ["pattern", "path"],
     ),
     _schema(
-        "write_todos", "全量更新当前助手的 TODO 清单。",
+        "write_todos", TOOL_DESCRIPTION,
         {
             "todos": {
                 "type": "array",

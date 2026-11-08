@@ -255,6 +255,14 @@ def test_rag_process_receives_selected_provider(tmp_path, monkeypatch, provider,
     assert captured[0]["RAG_TEMPERATURE"] == "none"
 
 
+def assert_todo_request(body):
+    system = next(item["content"] for item in body["messages"] if item["role"] == "system")
+    assert system.count("<todo_list_system>") == system.count("</todo_list_system>") == 1
+    assert system.index("<todo_list_system>") < system.index("</todo_list_system>")
+    todo = next(item["function"] for item in body["tools"] if item["function"]["name"] == "write_todos")
+    assert "任务完成要求" in todo["description"] and "如果遇到阻塞" in todo["description"]
+
+
 def test_main_direct_action_with_mock_openai(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "modelio_dir", tmp_path / "modelio")
@@ -284,6 +292,7 @@ def test_main_direct_action_with_mock_openai(tmp_path, monkeypatch):
             async with asyncio.timeout(5):
                 while len(requests) < 2:
                     await asyncio.sleep(0.02)
+            assert_todo_request(requests[0])
             assert "隔离测试内容" in json.dumps(requests[1]["messages"], ensure_ascii=False)
             assert any(item["role"] == "tool" for item in requests[1]["messages"])
         finally:
@@ -324,6 +333,7 @@ def test_worker_tool_round_trip_with_mock_openai(tmp_path, monkeypatch):
         try:
             await run_worker(runtime, task["id"])
             assert len(requests) == 2
+            assert_todo_request(requests[0])
             assert "后台测试内容" in json.dumps(requests[1]["messages"], ensure_ascii=False)
             assert any(item["role"] == "tool" for item in requests[1]["messages"])
             with db.new_session() as session:
