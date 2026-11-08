@@ -19,6 +19,39 @@ OpenWorkBot 旨在打造类 OpenAI Dots 的自主智能员工,面向个人与企
 
 ### 2.3 sandbox 沙箱隔离
 
+Gateway 按用户管理 Runtime。主 Agent 和后台 Worker 共用该 Runtime 的 LangGraph `create_agent` 图，运行上下文和命令会话分别管理。
+
+```text
+Gateway
+├─ Runtime（每用户一个）：主 Agent、后台 Worker 与任务调度
+│  └─ LangGraph create_agent 图
+│     └─ SandboxMiddleware
+│        ├─ 获取租约 → SandboxLeaseManager → SandboxProvider
+│        └─ 沙箱工具：bash、read_file、write_file、edit_file、glob、delete_file
+│           ├─ 权限检查与审批
+│           └─ AioSandbox → agent-sandbox SDK / HTTP
+│              └─ 代理认证中继 → AIO 沙箱容器
+├─ SandboxLeaseManager：按 Agent / Run 管理租约
+└─ AioSandboxProvider：实现 SandboxProvider
+   └─ LocalContainerBackend：创建、检查和回收 Docker 容器与网络
+```
+
+**运行与隔离**
+
+- 每个用户共用一个 DeerFlow AIO 沙箱容器和一个网络代理容器；不同用户隔离。同一用户的各 Run 使用独立 shell，容器内进程并非相互强隔离。
+- 用户工作区挂载到 `/mnt/user-data/workspace`，项目 Skills 只读挂载到 `/mnt/skills`；不挂载其他用户工作区、宿主密钥或 Docker socket。
+- 文件工具通过 AIO 调用容器内受控程序，校验路径，并保留文件占用和版本检查。`bash` 可以直接修改工作区，由 Worker 协调并发操作。
+- 等待同伴或依赖时保留租约和 shell；无租约的沙箱空闲 600 秒后可被回收，也可能因容量限制提前回收。工作区文件保留，容器内其他改动不保证保留。
+- AIO 容器限制为 1 GiB / 1 CPU / 512 PIDs，代理容器为 256 MiB / 1 CPU / 128 PIDs。沿用 DeerFlow 的 `seccomp=unconfined`。命令返回最多 2 万字符。
+- 无法确认命令进程已停止时，暂停复用该用户沙箱，待其他运行任务安全结束后回收。结果未知的操作不自动重跑；Docker 不可用时不回退到宿主执行。
+
+**审批与网络**
+
+- build / edit 模式下，每次 `bash` 调用单独审批；yolo 模式自动放行容器命令。文件工具沿用各自的权限规则。
+- 出网通过代理的 HTTP / HTTPS 域名允许列表，代理拒绝内网和回环目标。静态列表在 `backend/.env` 的 `SANDBOX_ALLOW_DOMAINS` 配置，修改后重启；默认放行 `pypi.org`、`files.pythonhosted.org`、`registry.npmjs.org`、`github.com`。
+- 未放行的公网域名在所有模式下都需网络审批，可拒绝、允许 5 分钟或本会话允许；审批显示为“当前用户的共享沙箱”，原命令不自动重跑。本会话授权跨容器重建有效，后端重启或重置助手后失效。
+- Docker Desktop 的代理仅解析 IPv4，因此无法访问纯 IPv6 网站。
+
 ### 2.4 memory 长期记忆
 - memory.json：
   - 快速了解用户的整体背景，保存用户的工作背景、个人情况、当前关注、思考方式、近期背景、更早背景和长期背景七类摘要。
