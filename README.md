@@ -17,24 +17,30 @@ OpenWorkBot 旨在打造类 OpenAI Dots 的自主智能员工,面向个人与企
 - Shared State + Message Bus
 ![Multi-Agent 协作架构](./readme_docs/message_bus.png)
 
-### 2.3 sandbox 沙箱隔离
-
-Gateway 按用户管理 Runtime。主 Agent 和后台 Worker 共用该 Runtime 的 LangGraph `create_agent` 图，运行上下文和命令会话分别管理。
+### 2.3 Sandbox 沙箱隔离
 
 ```text
-Gateway
-├─ Runtime（每用户一个）：主 Agent、后台 Worker 与任务调度
-│  └─ LangGraph create_agent 图
-│     └─ SandboxMiddleware
-│        ├─ 获取租约 → SandboxLeaseManager → SandboxProvider
-│        └─ 沙箱工具：bash、read_file、write_file、edit_file、glob、delete_file
-│           ├─ 权限检查与审批
-│           └─ AioSandbox → agent-sandbox SDK / HTTP
-│              └─ 代理认证中继 → AIO 沙箱容器
-├─ SandboxLeaseManager：按 Agent / Run 管理租约
-└─ AioSandboxProvider：实现 SandboxProvider
-   └─ LocalContainerBackend：创建、检查和回收 Docker 容器与网络
+Agent Runtime：管理用户运行时和后台任务调度
+  │
+  ├─ 主 Agent：LangGraph create_agent
+  └─ 后台 SubAgent Worker：LangGraph create_agent
+       ├─ 权限与审批: 工具调用
+       └─ SandboxMiddleware: 取得正确的沙箱并绑定到当前 Run
+            │
+            └─ 沙箱工具：bash、read_file、write_file、str_replace、ls、glob、grep
+                 │
+                 ├─ SandboxProvider (抽象类)
+                 │    └─ AioSandboxProvider
+                 │         ├─ 沙箱租约与生命周期
+                 │         └─ LocalContainerBackend
+                 │              └─ 创建、检查、回收 Docker 资源
+                 │
+                 └─ AioSandbox
+                      └─ agent-sandbox SDK / HTTP
+                           └─ 代理认证中继 → AIO 沙箱容器
 ```
+
+
 
 **运行与隔离**
 
@@ -52,29 +58,18 @@ Gateway
 - 未放行的公网域名在所有模式下都需网络审批，可拒绝、允许 5 分钟或本会话允许；审批显示为“当前用户的共享沙箱”，原命令不自动重跑。本会话授权跨容器重建有效，后端重启或重置助手后失效。
 - Docker Desktop 的代理仅解析 IPv4，因此无法访问纯 IPv6 网站。
 
-### 2.4 memory 长期记忆
+
+
+### 2.3 短期记忆
+
+
+### 2.4 Memory 长期记忆
 - memory.json：
   - 快速了解用户的整体背景，保存用户的工作背景、个人情况、当前关注、思考方式、近期背景、更早背景和长期背景七类摘要。
 - <事实ID>.md：(最多100条)
   - 针对当前问题选择细节，记录纠错, 每个文件保存一条具体事实，包含正文、类别、置信度、来源和时间等信息。
 
-- **读取并召回长期记忆:  主 Agent 处理用户消息前**
-```
-确定本次查询内容
-├─ 用户消息 → 使用对应的用户原文
-└─ 后台报告 → 使用报告所属的任务目标
-              │
-              ▼
-读取当前用户的记忆文件
-├─ memory.json           分类摘要
-└─ <事实ID>.md            逐条事实
-              │
-              ▼
-给记忆文件排序+筛选+组装
-├─ 相关性：分词、词语匹配、稀有词权重
-└─ 置信度：提取时由模型给出的分数
-```
-- **长期记忆提取:  主 Agent 静默30s(最长防抖300s)之后**
+**长期记忆提取:  主 Agent 静默30s(最长防抖300s)之后**
 ```
 历史对话筛选：上次提取之后的内容
 ├─ 保留：用户原文、可见的助手最终回复（超长则截取首尾）
@@ -96,7 +91,22 @@ Gateway
 备份回滚更新：中断后恢复
 └─ 备份旧文件 → 写恢复日志 → 更新摘要和事实文件
 ```
-
+**读取并召回长期记忆:  主 Agent 处理用户消息前**
+```
+确定本次查询内容
+├─ 用户消息 → 使用对应的用户原文
+└─ 后台报告 → 使用报告所属的任务目标
+              │
+              ▼
+读取当前用户的记忆文件
+├─ memory.json           分类摘要
+└─ <事实ID>.md            逐条事实
+              │
+              ▼
+给记忆文件排序+筛选+组装
+├─ 相关性：分词、词语匹配、稀有词权重
+└─ 置信度：提取时由模型给出的分数
+```
 
 **记忆纠错：规则识别 + 提示词 + 程序校验**
 1. **规则识别：** 检查用户消息是否包含“不对”“你理解错了”“改用”等纠错表达。
