@@ -363,7 +363,7 @@ function ApprovalCard({ approval, decide, disabled }: {
   const [feedback, setFeedback] = useState('')
   const [error, setError] = useState<string | null>(null)
   const busyRef = useRef(false)
-  const owner = approval.kind === 'sandbox_network' ? '当前用户的共享沙箱' : `任务「${approval.task_title}」`
+  const owner = `任务「${approval.task_title}」`
   const options = approval.options.filter((option) => ['allowOnce', 'allowSession', 'deny'].includes(option.option_id))
   const select = (option: ApprovalOptionId) => {
     if (busyRef.current || disabled) return

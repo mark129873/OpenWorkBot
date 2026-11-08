@@ -3,26 +3,35 @@ import logging
 import re
 import threading
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from app.community.aio_sandbox.local_backend import SandboxCleanupError
 from app.community.aio_sandbox.quarantine import SandboxQuarantine
 from app.community.aio_sandbox.sandbox_info import SandboxInfo
 from app.sandbox.sandbox_provider import SandboxProvider
-from app.user_context import require_user
+from app.user_context import current_user
 
 logger = logging.getLogger(__name__)
+
+
+def _owner(user_id: str | None = None) -> str:
+    bound = current_user()
+    user = user_id or bound or "default"
+    if not isinstance(user, str) or not re.fullmatch(r"(?:[0-9a-f]{32}|default)", user):
+        raise PermissionError("沙箱用户身份无效")
+    if (bound and user != bound) or (not bound and user != "default"):
+        raise PermissionError("沙箱不属于当前用户")
+    return user
 
 
 @dataclass
 class _Entry:
     info: SandboxInfo
-    sandbox: object
-    threads: set[str] = field(default_factory=set)
+    handles: set[str] = field(default_factory=set)
     state: str = "active"
     released_at: float = 0
-    network_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 class AioSandboxProvider(SandboxProvider):
@@ -32,10 +41,12 @@ class AioSandboxProvider(SandboxProvider):
         self.idle_timeout = idle_timeout
         self.replicas = replicas
         self._lock = threading.RLock()
+        self._changed = threading.Condition(self._lock)
+        self._creating = 0
         self._reconcile_lock = threading.Lock()
         self._user_locks: dict[str, threading.Lock] = {}
         self._entries: dict[str, _Entry] = {}
-        self._network_grants: dict[str, dict[tuple[str, int], float | None]] = {}
+        self._handles: dict[str, tuple[str, str | None, object]] = {}
         self._reconciled = False
         self._closed = False
         self._stop = threading.Event()
@@ -43,7 +54,12 @@ class AioSandboxProvider(SandboxProvider):
         self._reaper.start()
 
     def _sandbox_id(self, user_id: str) -> str:
-        return hashlib.sha256(f"{self.backend.instance}:{user_id}".encode("utf-8")).hexdigest()[:32]
+        return hashlib.sha256(f"{self.backend.instance}:{user_id}".encode()).hexdigest()[:32]
+
+    def _handle_id(self, physical_id: str, thread_id: str | None) -> str:
+        if thread_id is None:
+            return uuid.uuid4().hex
+        return hashlib.sha256(f"{physical_id}\0{thread_id}".encode()).hexdigest()[:32]
 
     def _reconcile(self) -> None:
         with self._reconcile_lock:
@@ -51,10 +67,11 @@ class AioSandboxProvider(SandboxProvider):
                 self.backend.reconcile()
                 self._reconciled = True
 
-    def _make_sandbox(self, info: SandboxInfo):
+    def _make_sandbox(self, info: SandboxInfo, handle_id: str):
         from app.community.aio_sandbox.aio_sandbox import AioSandbox
 
-        return AioSandbox(info, on_uncertain=lambda reason: self.quarantine_sandbox(info.sandbox_id, reason))
+        return AioSandbox(replace(info, sandbox_id=handle_id),
+                          on_uncertain=lambda reason: self._quarantine_entry(info.sandbox_id, reason))
 
     def _evict_warm(self) -> None:
         with self._lock:
@@ -68,199 +85,173 @@ class AioSandboxProvider(SandboxProvider):
         self._destroy(entry)
 
     def acquire(self, thread_id: str | None = None, *, user_id: str | None = None) -> str:
-        if user_id != require_user() or not re.fullmatch(r"[0-9a-f]{32}", user_id or "") or not thread_id:
-            raise PermissionError("沙箱用户或线程身份无效")
+        user_id = _owner(user_id)
+        if thread_id is not None and (not isinstance(thread_id, str) or not thread_id):
+            raise ValueError("沙箱线程身份无效")
         with self._lock:
-            lock = self._user_locks.setdefault(user_id, threading.Lock())
-        with lock:
+            user_lock = self._user_locks.setdefault(user_id, threading.Lock())
+        with user_lock:
             self._reconcile()
-            sandbox_id = self._sandbox_id(user_id)
+            physical_id = self._sandbox_id(user_id)
+            handle_id = self._handle_id(physical_id, thread_id)
             with self._lock:
                 if self._closed:
                     raise RuntimeError("沙箱服务正在关闭")
-                if self.quarantine.get(sandbox_id):
+                if self.quarantine.get(physical_id):
                     raise RuntimeError("沙箱已隔离，等待资源清理")
-                entry = self._entries.get(sandbox_id)
+                entry = self._entries.get(physical_id)
                 if entry and entry.state not in {"active", "warm"}:
                     raise RuntimeError("沙箱正在回收或已隔离")
             if entry:
                 try:
                     alive = self.backend.is_alive(entry.info)
                 except Exception:
-                    self.quarantine_sandbox(sandbox_id, "资源状态无法确认")
+                    self._quarantine_entry(physical_id, "资源状态无法确认")
                     raise
                 if not alive:
-                    self.quarantine_sandbox(sandbox_id, "资源状态异常")
+                    self._quarantine_entry(physical_id, "资源状态异常")
                     raise RuntimeError("沙箱资源状态异常，已暂停复用")
-                with self._lock:
-                    if entry.state not in {"active", "warm"}:
-                        raise RuntimeError("沙箱已不可复用")
-                    entry.state = "active"
-                    entry.threads.add(thread_id)
-                return sandbox_id
-            self._evict_warm()
-            try:
-                info = self.backend.create(thread_id, sandbox_id, user_id=user_id)
-                with self._lock:
-                    grants = [(host, port, expiry) for (host, port), expiry in
-                              self._network_grants.get(user_id, {}).items()]
-                if grants:
-                    self.backend.seed_network_grants(info, grants)
-                sandbox = self._make_sandbox(info)
-            except SandboxCleanupError as exc:
-                self.quarantine.block(sandbox_id, user_id, exc.generation, "资源清理结果未知")
-                raise
-            except Exception:
-                if "info" in locals():
+            else:
+                self._evict_warm()
+                with self._changed:
+                    if self._closed:
+                        raise RuntimeError("沙箱服务正在关闭")
+                    self._creating += 1
+                try:
                     try:
-                        self.backend.destroy(info)
-                    except Exception as cleanup_error:
-                        self.quarantine.block(sandbox_id, user_id, info.generation, "资源清理结果未知")
-                        raise RuntimeError("沙箱初始化失败且资源清理结果未知") from cleanup_error
-                raise
+                        info = self.backend.create(thread_id or handle_id, physical_id, user_id=user_id)
+                    except SandboxCleanupError as exc:
+                        self.quarantine.block(physical_id, user_id, exc.generation, "资源清理结果未知")
+                        raise
+                    entry = _Entry(info)
+                    with self._lock:
+                        closing = self._closed
+                        if not closing:
+                            self._entries[physical_id] = entry
+                    if closing:
+                        try:
+                            self.backend.destroy(info)
+                        except Exception as exc:
+                            self.quarantine.block(physical_id, user_id, info.generation, "服务关闭时清理失败")
+                            raise RuntimeError("沙箱服务关闭时清理失败") from exc
+                        raise RuntimeError("沙箱服务正在关闭")
+                finally:
+                    with self._changed:
+                        self._creating -= 1
+                        self._changed.notify_all()
             with self._lock:
-                if self._closed:
+                if self._closed or entry.state not in {"active", "warm"}:
+                    raise RuntimeError("沙箱已不可复用")
+                if handle_id not in self._handles:
                     try:
-                        sandbox.close()
-                        self.backend.destroy(info)
-                    except Exception as exc:
-                        self.quarantine.block(sandbox_id, user_id, info.generation, "服务关闭时清理失败")
-                        raise RuntimeError("沙箱服务关闭时清理失败") from exc
-                    raise RuntimeError("沙箱服务正在关闭")
-                self._entries[sandbox_id] = _Entry(info, sandbox, {thread_id})
-            return sandbox_id
+                        sandbox = self._make_sandbox(entry.info, handle_id)
+                    except Exception:
+                        if not entry.handles:
+                            entry.state = "warm"
+                            entry.released_at = time.monotonic()
+                        raise
+                    self._handles[handle_id] = (physical_id, thread_id, sandbox)
+                    entry.handles.add(handle_id)
+                entry.state = "active"
+            return handle_id
 
     def get(self, sandbox_id: str):
+        user = _owner()
         with self._lock:
-            entry = self._entries.get(sandbox_id)
-            if not entry or entry.info.user_id != require_user() or entry.state != "active":
+            handle = self._handles.get(sandbox_id)
+            entry = self._entries.get(handle[0]) if handle else None
+            if not entry or entry.info.user_id != user or entry.state != "active":
                 return None
-            return entry.sandbox
+            return handle[2]
 
     def get_scoped(self, sandbox_id: str, *, thread_id: str, user_id: str):
-        if user_id != require_user():
+        try:
+            user = _owner(user_id)
+        except PermissionError:
             return None
         with self._lock:
-            entry = self._entries.get(sandbox_id)
-            if (not entry or entry.info.user_id != user_id or entry.state != "active"
-                    or thread_id not in entry.threads or self.quarantine.get(sandbox_id)):
+            handle = self._handles.get(sandbox_id)
+            entry = self._entries.get(handle[0]) if handle else None
+            if (not entry or entry.info.user_id != user or entry.state != "active"
+                    or handle[1] != thread_id or self.quarantine.get(handle[0])):
                 return None
-            return entry.sandbox
+            return handle[2]
 
     def release(self, sandbox_id: str) -> None:
+        user = _owner()
         with self._lock:
-            entry = self._entries.get(sandbox_id)
-            if not entry or entry.info.user_id != require_user():
+            handle = self._handles.get(sandbox_id)
+            entry = self._entries.get(handle[0]) if handle else None
+            if not entry or entry.info.user_id != user:
                 raise PermissionError("沙箱不属于当前用户")
-            if entry.state == "quarantined":
-                entry.state = "destroying"
-            elif entry.state == "active":
-                entry.state = "warm"
-                entry.released_at = time.monotonic()
-                return
-            else:
-                return
-        self._destroy(entry)
+            user_lock = self._user_locks.setdefault(user, threading.Lock())
+        with user_lock:
+            with self._lock:
+                handle = self._handles.pop(sandbox_id, None)
+                if handle is None:
+                    return
+                entry.handles.remove(sandbox_id)
+            close_error = None
+            try:
+                handle[2].close()
+            except Exception as exc:
+                close_error = exc
+                self._quarantine_entry(entry.info.sandbox_id, "沙箱会话清理失败")
+            with self._lock:
+                if entry.handles:
+                    if close_error:
+                        raise RuntimeError("沙箱会话清理失败，已暂停复用") from close_error
+                    return
+                if entry.state == "quarantined":
+                    entry.state = "destroying"
+                else:
+                    entry.state = "warm"
+                    entry.released_at = time.monotonic()
+                    return
+            self._destroy(entry)
+
+    def _quarantine_entry(self, physical_id: str, reason: str) -> None:
+        with self._lock:
+            entry = self._entries.get(physical_id)
+            if not entry:
+                raise RuntimeError("沙箱资源不存在")
+            entry.state = "quarantined"
+            self.quarantine.block(physical_id, entry.info.user_id, entry.info.generation, reason)
 
     def quarantine_sandbox(self, sandbox_id: str, reason: str) -> None:
+        user = _owner()
         with self._lock:
-            entry = self._entries.get(sandbox_id)
-            if not entry or entry.info.user_id != require_user():
+            handle = self._handles.get(sandbox_id)
+            entry = self._entries.get(handle[0]) if handle else None
+            if not entry or entry.info.user_id != user:
                 raise PermissionError("沙箱不属于当前用户")
-            entry.state = "quarantined"
-            self.quarantine.block(sandbox_id, entry.info.user_id, entry.info.generation, reason)
+        self._quarantine_entry(entry.info.sandbox_id, reason)
 
     def _destroy(self, entry: _Entry) -> None:
-        close_error = None
         try:
-            entry.sandbox.close()
-        except Exception as exc:
-            close_error = exc
-        try:
-            with entry.network_lock:
-                self.backend.destroy(entry.info)
+            self.backend.destroy(entry.info)
         except Exception:
             with self._lock:
                 entry.state = "quarantined"
                 self.quarantine.block(entry.info.sandbox_id, entry.info.user_id, entry.info.generation, "资源清理失败")
             raise
-        if close_error:
-            logger.warning("沙箱客户端关闭失败，但容器已确认清理：%s", type(close_error).__name__)
         with self._lock:
             if self._entries.get(entry.info.sandbox_id) is entry:
                 self._entries.pop(entry.info.sandbox_id)
             self.quarantine.clear(entry.info.sandbox_id, entry.info.generation)
 
-    def network_events(self, user_id: str) -> tuple[SandboxInfo, list[dict]] | None:
-        if user_id != require_user():
-            raise PermissionError("沙箱不属于当前用户")
+    def reset_user(self, user_id: str) -> None:
+        user_id = _owner(user_id)
         with self._lock:
-            entry = self._entries.get(self._sandbox_id(user_id))
-        if not entry:
-            return None
-        with entry.network_lock:
-            with self._lock:
-                if entry.state not in {"active", "warm"}:
-                    return None
-            return entry.info, self.backend.network_events(entry.info)
-
-    def acknowledge_network_event(self, info: SandboxInfo, request_id: str) -> None:
-        if info.user_id != require_user():
-            raise PermissionError("沙箱不属于当前用户")
-        with self._lock:
-            entry = self._entries.get(info.sandbox_id)
-        if not entry or entry.info != info:
-            return
-        with entry.network_lock:
-            with self._lock:
-                if entry.state not in {"active", "warm"}:
-                    return
-            self.backend.acknowledge_network_event(info, request_id)
-
-    def decide_network(self, user_id: str, generation: str, events: list[str], host: str,
-                       port: int, option_id: str) -> None:
-        if user_id != require_user():
-            raise PermissionError("沙箱不属于当前用户")
-        if option_id not in {"allowOnce", "allowSession", "deny"}:
-            raise ValueError("网络审批选项无效")
-        host, port = self.backend._network_target(host, port)
-        with self._lock:
-            lock = self._user_locks.setdefault(user_id, threading.Lock())
-        with lock:
-            with self._lock:
-                entry = self._entries.get(self._sandbox_id(user_id))
-                previous = self._network_grants.get(user_id, {}).get((host, port), "missing")
-            expiry = time.time() + 300 if option_id == "allowOnce" else None
-            if option_id != "deny" and previous != "missing":
-                expiry = None if previous is None or expiry is None else max(previous, expiry)
-            if entry:
-                with entry.network_lock:
-                    with self._lock:
-                        usable = entry.state in {"active", "warm"}
-                    if usable and entry.info.generation == generation:
-                        decision = {"allowOnce": "allow_temporary", "allowSession": "allow_sandbox", "deny": "deny"}[option_id]
-                        for request_id in events:
-                            self.backend.decide_network_event(entry.info, request_id, decision)
-                    if usable and option_id != "deny":
-                        self.backend.seed_network_grants(entry.info, [(host, port, expiry)])
-            if option_id != "deny":
-                with self._lock:
-                    grants = self._network_grants.setdefault(user_id, {})
-                    grants[(host, port)] = expiry
-
-    def reset_user(self, user_id: str, *, clear_grants: bool = True) -> None:
-        if user_id != require_user():
-            raise PermissionError("沙箱不属于当前用户")
-        with self._lock:
-            lock = self._user_locks.setdefault(user_id, threading.Lock())
-        with lock:
+            user_lock = self._user_locks.setdefault(user_id, threading.Lock())
+        with user_lock:
             self._reconcile()
             with self._lock:
-                sandbox_id = self._sandbox_id(user_id)
-                entry = self._entries.get(sandbox_id)
-                if self.quarantine.get(sandbox_id) and not entry:
+                physical_id = self._sandbox_id(user_id)
+                entry = self._entries.get(physical_id)
+                if self.quarantine.get(physical_id) and not entry:
                     raise RuntimeError("沙箱资源状态未知，无法重置")
-                if entry and entry.state == "active":
+                if entry and entry.handles:
                     raise RuntimeError("仍有运行中的沙箱操作")
                 if entry and entry.state != "warm":
                     raise RuntimeError("沙箱尚未完成清理")
@@ -268,14 +259,6 @@ class AioSandboxProvider(SandboxProvider):
                     entry.state = "destroying"
             if entry:
                 self._destroy(entry)
-            if clear_grants:
-                self.forget_network_grants(user_id)
-
-    def forget_network_grants(self, user_id: str) -> None:
-        if user_id != require_user():
-            raise PermissionError("沙箱不属于当前用户")
-        with self._lock:
-            self._network_grants.pop(user_id, None)
 
     def cleanup_idle(self) -> None:
         with self._lock:
@@ -294,9 +277,11 @@ class AioSandboxProvider(SandboxProvider):
                 logger.exception("空闲沙箱清理失败")
 
     def close(self) -> None:
-        with self._lock:
+        with self._changed:
             self._closed = True
-            if any(entry.state == "active" for entry in self._entries.values()):
+            while self._creating:
+                self._changed.wait()
+            if any(entry.handles for entry in self._entries.values()):
                 raise RuntimeError("仍有运行中的沙箱操作")
         self._stop.set()
         self._reaper.join(timeout=5)
@@ -310,3 +295,6 @@ class AioSandboxProvider(SandboxProvider):
                 entry.state = "destroying"
         for entry in entries:
             self._destroy(entry)
+
+    def reset(self) -> None:
+        self.close()

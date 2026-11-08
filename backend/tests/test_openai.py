@@ -272,7 +272,7 @@ def test_main_direct_action_with_mock_openai(tmp_path, monkeypatch):
             args = {"message_id": incoming["message_id"], "user_seq": incoming["user_seq"],
                     "intents": [{"type": "chat", "instruction": incoming["text"]}],
                     "needs_clarification": False,
-                    "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "note.txt"}}}
+                    "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
             return response([chunk({"tool_calls": [{"index": 0, "id": "call-route", "type": "function",
                             "function": {"name": "route_input", "arguments": json.dumps(args)}}]}),
                             chunk(finish="tool_calls")])
@@ -312,7 +312,7 @@ def test_worker_tool_round_trip_with_mock_openai(tmp_path, monkeypatch):
         requests.append(json.loads(request.content))
         if len(requests) == 1:
             return response([chunk({"tool_calls": [{"index": 0, "id": "call-read", "type": "function",
-                            "function": {"name": "read_file", "arguments": '{"path":"note.txt"}'}}]}),
+                            "function": {"name": "read_file", "arguments": '{"path":"/mnt/user-data/workspace/note.txt"}'}}]}),
                             chunk(finish="tool_calls")])
         return response([chunk({"content": "处理完成。"}), chunk(finish="stop")])
 

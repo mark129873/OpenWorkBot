@@ -584,6 +584,7 @@ def test_approval_rejects_option_not_offered(isolated):
 def test_approval_stays_available_and_session_grant_is_shared(isolated):
     from app.agent.worker import Worker
     from app.sessions import session_permissions
+    from fake_sandbox import FakeSandbox
 
     async def run():
         runtime = Runtime(client=FakeModel())
@@ -595,8 +596,10 @@ def test_approval_stays_available_and_session_grant_is_shared(isolated):
             session.commit()
         worker = Worker(runtime, task["id"])
         worker.context_id, worker.run_id = task["context_id"], "run1"
-        execution = {"id": "call1", "call_id": "c1", "name": "write_file", "input": {"path": "x", "content": "a"}}
-        waiting = asyncio.create_task(worker.approve(execution, "需要确认"))
+        worker.sandbox = FakeSandbox()
+        path = "/mnt/user-data/workspace/x"
+        execution = {"id": "call1", "call_id": "c1", "name": "write_file", "input": {"path": path, "content": "a"}}
+        waiting = asyncio.create_task(worker.approve(execution, "需要确认", sandboxed=True, canonical_path=path))
         try:
             await wait_for(lambda: bool(runtime.approval_events))
             request_id = next(iter(runtime.approval_events))
@@ -604,7 +607,7 @@ def test_approval_stays_available_and_session_grant_is_shared(isolated):
             assert (await runtime.snapshot())["approvals"][0]["request_id"] == request_id
             assert (await decide(runtime, request_id, "allowSession"))["ok"]
             assert (await waiting)["approved"]
-            assert session_permissions.allows(scoped("main"), "write_file", {"path": "x", "content": "b"})
+            assert session_permissions.allows(scoped("main"), "write_file", {"path": path, "content": "b"}, canonical_path=path)
             with db.new_session() as session:
                 approval = store.get(session, f"approval:{request_id}")
                 assert approval["user_seq"] > message["user_seq"]
@@ -644,9 +647,9 @@ def test_file_owner_requires_reread_before_other_task_writes(isolated):
                 **execution, "type": "tool_execution"}))
             return await worker.file_tool(execution)
 
-        assert "已写入" in await call(workers[0], "write_file", {"path": "x.txt", "content": "原始"})
-        assert "原始" in await call(workers[1], "read_file", {"path": "x.txt"})
-        pending = asyncio.create_task(call(workers[1], "write_file", {"path": "x.txt", "content": "覆盖"}))
+        assert "OK" in await call(workers[0], "write_file", {"path": "/mnt/user-data/workspace/x.txt", "content": "原始"})
+        assert "原始" in await call(workers[1], "read_file", {"path": "/mnt/user-data/workspace/x.txt"})
+        pending = asyncio.create_task(call(workers[1], "write_file", {"path": "/mnt/user-data/workspace/x.txt", "content": "覆盖"}))
         def is_waiting():
             with db.new_session() as session:
                 return any(w["status"] == "waiting" for w in store.records(session, "file_wait"))
@@ -657,8 +660,8 @@ def test_file_owner_requires_reread_before_other_task_writes(isolated):
             store.put(session, f"task:{task['id']}", task)
         await runtime.change(close_owner)
         assert "重新读取" in await asyncio.wait_for(pending, 3)
-        assert "原始" in await call(workers[1], "read_file", {"path": "x.txt"})
-        assert "已写入" in await call(workers[1], "write_file", {"path": "x.txt", "content": "覆盖"})
+        assert "原始" in await call(workers[1], "read_file", {"path": "/mnt/user-data/workspace/x.txt"})
+        assert "OK" in await call(workers[1], "write_file", {"path": "/mnt/user-data/workspace/x.txt", "content": "覆盖"})
         assert (isolated / ("a" * 32) / "x.txt").read_text(encoding="utf-8") == "覆盖"
     asyncio.run(run())
 
@@ -670,7 +673,7 @@ def test_thirtieth_tool_step_requires_review(isolated, monkeypatch):
     class ToolModel:
         model = "fake"
         async def stream(self, **_kwargs):
-            yield {"type": "tool_use", "id": "last", "name": "glob", "input": {"pattern": "*.txt"}}
+            yield {"type": "tool_use", "id": "last", "name": "glob", "input": {"pattern": "*.txt", "path": "/mnt/user-data/workspace"}}
             yield {"type": "stop_reason", "reason": "tool_use"}
 
     async def run():
@@ -810,10 +813,10 @@ def test_restart_reissues_pending_approval(isolated):
             store.put(session, f"task:{task['id']}", task)
             execution_id = f"{task['id']}:run:c1"
             store.append_history(session, task["context_id"], "assistant", [{
-                "type": "tool_use", "id": "c1", "name": "write_file", "input": {"path": "x", "content": "x"}}])
+                "type": "tool_use", "id": "c1", "name": "write_file", "input": {"path": "/mnt/user-data/workspace/x", "content": "x"}}])
             store.put(session, f"execution:{execution_id}", {"type": "tool_execution", "id": execution_id,
                       "task_id": task["id"], "context_id": task["context_id"], "run_id": "run", "call_id": "c1",
-                      "name": "write_file", "input": {"path": "x", "content": "x"}, "status": "pending"})
+                      "name": "write_file", "input": {"path": "/mnt/user-data/workspace/x", "content": "x"}, "status": "pending"})
             group_id = f"{task['id']}:run:1"
             store.put(session, f"group:{group_id}", {"type": "tool_group", "id": group_id,
                       "context_id": task["context_id"], "calls": [execution_id], "status": "pending"})
@@ -849,10 +852,10 @@ def test_started_external_tool_is_not_replayed_on_restart(isolated):
             store.put(session, f"task:{task['id']}", task)
             identity = f"{task['id']}:run:c1"
             store.append_history(session, task["context_id"], "assistant", [{
-                "type": "tool_use", "id": "c1", "name": "write_file", "input": {"path": "x", "content": "x"}}])
+                "type": "tool_use", "id": "c1", "name": "write_file", "input": {"path": "/mnt/user-data/workspace/x", "content": "x"}}])
             store.put(session, f"execution:{identity}", {"type": "tool_execution", "id": identity,
                       "task_id": task["id"], "context_id": task["context_id"], "run_id": "run", "call_id": "c1",
-                      "name": "write_file", "input": {"path": "x", "content": "x"}, "status": "started"})
+                      "name": "write_file", "input": {"path": "/mnt/user-data/workspace/x", "content": "x"}, "status": "started"})
             group_id = f"{task['id']}:run:1"
             store.put(session, f"group:{group_id}", {"type": "tool_group", "id": group_id,
                       "context_id": task["context_id"], "calls": [identity], "status": "pending"})
@@ -1670,11 +1673,12 @@ def test_omitted_active_task_can_be_found_and_stopped(isolated):
 
 
 def test_worker_rejects_host_commands(isolated, monkeypatch):
-    from app.agent import hooks, tools
+    import subprocess
+    from app.agent import hooks
     from app.agent.worker import Worker
 
     calls = []
-    monkeypatch.setattr(tools.subprocess, "Popen", lambda *_args, **_kwargs: calls.append(True))
+    monkeypatch.setattr(subprocess, "Popen", lambda *_args, **_kwargs: calls.append(True))
     states = []
     monkeypatch.setattr(hooks, "trigger", lambda event, data: states.append(data["status"]) if event == "PostToolUse" else None)
 
@@ -1746,7 +1750,7 @@ def test_quick_file_read_runs_without_worker_model(isolated):
     (isolated / ("a" * 32) / "note.txt").write_text("workspace", encoding="utf-8")
 
     async def run():
-        model = DirectModel("read_file", {"path": "note.txt"})
+        model = DirectModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"})
         runtime = Runtime(client=model)
         await runtime.start()
         try:
@@ -1775,7 +1779,7 @@ def test_direct_read_runs_while_worker_slots_are_full(isolated):
             for index in range(6):
                 await accept(runtime, f"task-{index}", f"任务 {index}", "build")
                 await wait_for(lambda: background.workers == index + 1)
-            model = DirectModel("read_file", {"path": "note.txt"})
+            model = DirectModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"})
             runtime.client = model
             await accept(runtime, "read", "读取 note.txt", "build")
             await wait_for(lambda: bool(model.reports))
@@ -1789,7 +1793,7 @@ def test_direct_read_runs_while_worker_slots_are_full(isolated):
 def test_direct_steps_preserve_file_version_check(isolated):
     class MultiStepModel(DirectModel):
         def __init__(self):
-            super().__init__("read_file", {"path": "note.txt"})
+            super().__init__("read_file", {"path": "/mnt/user-data/workspace/note.txt"})
             self.read_done, self.continue_edit = asyncio.Event(), asyncio.Event()
 
         async def stream(self, *, system, messages, tools, tool_choice=None):
@@ -1797,8 +1801,8 @@ def test_direct_steps_preserve_file_version_check(isolated):
                 self.reports.append("已读取")
                 self.read_done.set()
                 await self.continue_edit.wait()
-                yield {"type": "tool_use", "id": "edit-call", "name": "edit_file",
-                       "input": {"path": "note.txt", "old_text": "old", "new_text": "edited"}}
+                yield {"type": "tool_use", "id": "edit-call", "name": "str_replace",
+                       "input": {"path": "/mnt/user-data/workspace/note.txt", "old_str": "old", "new_str": "edited"}}
                 yield {"type": "stop_reason", "reason": "tool_use"}
                 return
             async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
@@ -1815,8 +1819,10 @@ def test_direct_steps_preserve_file_version_check(isolated):
             await asyncio.wait_for(model.read_done.wait(), 3)
             path.write_text("old changed", encoding="utf-8")
             model.continue_edit.set()
+            await wait_for(lambda: bool(runtime.approval_events))
+            await decide(runtime, next(iter(runtime.approval_events)), "allowOnce")
             await wait_for(lambda: len(model.reports) == 2)
-            assert "文件读取后已被修改" in model.reports[-1]
+            assert "请先读取文件的当前版本" in model.reports[-1]
             assert path.read_text(encoding="utf-8") == "old changed"
             with db.new_session() as session:
                 assert len(store.records(session, "task_state")) == 1
@@ -1830,7 +1836,7 @@ def test_direct_steps_preserve_file_version_check(isolated):
 @pytest.mark.parametrize("option", ["allowOnce", "deny"])
 def test_direct_approval_does_not_block_chat(isolated, option):
     async def run():
-        model = DirectModel("write_file", {"path": "quick.txt", "content": "内容"})
+        model = DirectModel("write_file", {"path": "/mnt/user-data/workspace/quick.txt", "content": "内容"})
         runtime = Runtime(client=model)
         await runtime.start()
         try:
@@ -1858,7 +1864,7 @@ def test_direct_operation_respects_update_and_approval_order(isolated, monkeypat
     from app.agent.worker import Worker
 
     async def run():
-        model = DirectModel("write_file", {"path": "ordered.txt", "content": "内容"})
+        model = DirectModel("write_file", {"path": "/mnt/user-data/workspace/ordered.txt", "content": "内容"})
         runtime = Runtime(client=model)
         reached_start, release_start = asyncio.Event(), asyncio.Event()
         original_started = Worker.started
@@ -1905,7 +1911,7 @@ def test_direct_started_tool_is_not_replayed_after_restart(isolated, monkeypatch
     monkeypatch.setattr(tools, "execute_tool", lambda *args: calls.append(args) or "unexpected")
 
     async def run():
-        model = DirectModel("read_file", {"path": "note.txt"})
+        model = DirectModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"})
         model.issued = True
         runtime = Runtime(client=model)
         with db.new_session() as session:
@@ -1916,10 +1922,10 @@ def test_direct_started_tool_is_not_replayed_after_restart(isolated, monkeypatch
             task.update(status="running", run_id="run", direct=True, direct_phase="executing", direct_group=group)
             store.put(session, f"task:{task['id']}", task)
             store.append_history(session, task["context_id"], "assistant", [{
-                "type": "tool_use", "id": "call", "name": "read_file", "input": {"path": "note.txt"}}])
+                "type": "tool_use", "id": "call", "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}])
             store.put(session, f"execution:{identity}", {"type": "tool_execution", "id": identity,
                       "task_id": task["id"], "context_id": task["context_id"], "run_id": "run", "call_id": "call",
-                      "name": "read_file", "input": {"path": "note.txt"}, "status": "started"})
+                      "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}, "status": "started"})
             store.put(session, f"group:{group}", {"type": "tool_group", "id": group,
                       "context_id": task["context_id"], "calls": [identity], "status": "pending"})
             session.commit()
@@ -1935,7 +1941,7 @@ def test_direct_started_tool_is_not_replayed_after_restart(isolated, monkeypatch
 
 def test_direct_pending_approval_is_reissued_after_restart(isolated):
     async def run():
-        model = DirectModel("write_file", {"path": "recovered.txt", "content": "ok"})
+        model = DirectModel("write_file", {"path": "/mnt/user-data/workspace/recovered.txt", "content": "ok"})
         model.issued = True
         runtime = Runtime(client=model)
         with db.new_session() as session:
@@ -1945,7 +1951,7 @@ def test_direct_pending_approval_is_reissued_after_restart(isolated):
             task.update(status="waiting_user", run_id="run", direct=True, direct_phase="executing", direct_group=group)
             store.put(session, f"task:{task['id']}", task)
             call = {"type": "tool_use", "id": "call", "name": "write_file",
-                    "input": {"path": "recovered.txt", "content": "ok"}}
+                    "input": {"path": "/mnt/user-data/workspace/recovered.txt", "content": "ok"}}
             store.append_history(session, task["context_id"], "assistant", [call])
             store.put(session, f"execution:{identity}", {"type": "tool_execution", "id": identity,
                       "task_id": task["id"], "context_id": task["context_id"], "run_id": "run", "call_id": "call",
@@ -1971,10 +1977,14 @@ def test_direct_pending_approval_is_reissued_after_restart(isolated):
 
 
 def test_direct_step_limit_does_not_execute_unavailable_tool(isolated, monkeypatch):
-    from app.agent import agent_bus, tools
+    from app.agent import agent_bus
+    from app.agent.worker import Worker
 
     calls = []
-    monkeypatch.setattr(tools, "capture_bash", lambda command: (calls.append(command) or "unexpected", False))
+    async def unexpected(_worker, execution):
+        calls.append(execution)
+        return "unexpected"
+    monkeypatch.setattr(Worker, "bash_tool", unexpected)
 
     class LimitModel:
         model = "fake"
@@ -2074,7 +2084,7 @@ def test_first_action_reads_file_in_two_model_calls(isolated):
     (isolated / ("a" * 32) / "note.txt").write_text("workspace", encoding="utf-8")
 
     async def run():
-        model = FirstActionModel("read_file", {"path": "note.txt"})
+        model = FirstActionModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"})
         runtime = Runtime(client=model)
         await runtime.start()
         try:
@@ -2088,7 +2098,7 @@ def test_first_action_reads_file_in_two_model_calls(isolated):
                               for block in entry["content"] if block.get("type") == "tool_use")
                 assert action["name"] == "route_input"
                 assert action["input"]["first_action"]["name"] == "read_file"
-                assert action["input"]["first_action"]["input"] == {"path": "note.txt"}
+                assert action["input"]["first_action"]["input"] == {"path": "/mnt/user-data/workspace/note.txt"}
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -2136,11 +2146,11 @@ def test_first_action_ids_are_scoped_to_the_user_message(isolated):
 
 
 @pytest.mark.parametrize("action", [
-    {"intent_index": True, "name": "read_file", "input": {"path": "note.txt"}},
-    {"intent_index": 1, "name": "read_file", "input": {"path": "note.txt"}},
+    {"intent_index": True, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}},
+    {"intent_index": 1, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}},
     {"intent_index": 0, "name": "task_stop", "input": {"task_id": "x"}},
     {"intent_index": 0, "name": "read_file", "input": {"path": 1}},
-    {"intent_index": 0, "name": "read_file", "input": {"path": "note.txt", "extra": "x"}},
+    {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt", "extra": "x"}},
     {"intent_index": 0, "name": "read_file", "input": {"path": "a.txt", "offset": 0}},
     {"intent_index": 0, "name": "todo_write", "input": {"items": [{"content": "a", "status": "invalid"}]}},
 ])
@@ -2157,7 +2167,7 @@ def test_first_action_requires_a_nonempty_intent():
     event = {"message_id": "user:one", "user_seq": 1}
     route = {"message_id": event["message_id"], "user_seq": 1,
              "intents": [{"type": "chat", "instruction": "  "}], "needs_clarification": False,
-             "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "note.txt"}}}
+             "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
     with pytest.raises(ValueError):
         Runtime._validate_route(route, event)
 
@@ -2166,7 +2176,7 @@ def test_first_action_requires_a_nonempty_intent():
 def test_first_action_keeps_mixed_intents_and_approval_order(isolated, newer_approval):
     with db.new_session() as session:
         store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("read_file", {"path": "note.txt"}))
+        runtime = Runtime(client=FirstActionModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"}))
         task = runtime.create_task(session, "删除 A", 1)
         task["status"] = "waiting_user"
         store.put(session, f"task:{task['id']}", task)
@@ -2183,13 +2193,13 @@ def test_first_action_keeps_mixed_intents_and_approval_order(isolated, newer_app
         route = {"message_id": event["message_id"], "user_seq": event["user_seq"],
                  "intents": [{"type": "update", "task_id": task["id"], "instruction": "不要删除 A", "approval_ids": ["a"]},
                              {"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": False,
-                 "first_action": {"intent_index": 1, "name": "read_file", "input": {"path": "note.txt"}}}
+                 "first_action": {"intent_index": 1, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
         runtime._validate_route(route, event)
         runtime._apply_route(session, event, route, {"a"}, "first-call")
         direct = [t for t in store.records(session, "task_state") if t.get("direct")]
         assert len(direct) == 1 and direct[0]["direct_phase"] == "executing"
         assert store.get(session, "reply:mixed")["status"] == "completed"
-        assert store.records(session, "tool_execution")[0]["input"] == {"path": "note.txt"}
+        assert store.records(session, "tool_execution")[0]["input"] == {"path": "/mnt/user-data/workspace/note.txt"}
         updates = store.records(session, "agent_message", context_id=task["context_id"])
         assert bool(updates) != newer_approval
         if newer_approval:
@@ -2201,7 +2211,7 @@ def test_first_action_keeps_mixed_intents_and_approval_order(isolated, newer_app
 def test_first_action_is_not_started_after_newer_user_message(isolated):
     with db.new_session() as session:
         store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("read_file", {"path": "note.txt"}))
+        runtime = Runtime(client=FirstActionModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"}))
         event = {"type": "user_event", "event_type": "message", "id": "old", "message_id": "user:old",
                  "text": "pwd", "user_seq": 1, "status": "pending"}
         store.put(session, "input:old", event)
@@ -2209,7 +2219,7 @@ def test_first_action_is_not_started_after_newer_user_message(isolated):
                   "message_id": "user:new", "text": "先不要执行", "user_seq": 2, "status": "pending"})
         route = {"message_id": event["message_id"], "user_seq": 1,
                  "intents": [{"type": "chat", "instruction": "pwd"}], "needs_clarification": False,
-                 "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "note.txt"}}}
+                 "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
         runtime._apply_route(session, event, route, set(), "first-call")
         assert not store.records(session, "tool_execution")
 
@@ -2217,13 +2227,13 @@ def test_first_action_is_not_started_after_newer_user_message(isolated):
 def test_first_action_waits_if_intent_needs_clarification(isolated):
     with db.new_session() as session:
         store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("read_file", {"path": "note.txt"}))
+        runtime = Runtime(client=FirstActionModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"}))
         event = {"type": "user_event", "event_type": "message", "id": "unclear", "message_id": "user:unclear",
                  "text": "先确认再运行", "user_seq": 1, "status": "pending"}
         store.put(session, "input:unclear", event)
         route = {"message_id": event["message_id"], "user_seq": 1,
                  "intents": [{"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": True,
-                 "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "note.txt"}}}
+                 "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
         blocks = [{"type": "tool_use", "id": "first-call", "name": "route_input", "input": route}]
         runtime._apply_route(session, event, route, set(), "first-call", blocks)
         assert not store.records(session, "tool_execution")
@@ -2235,17 +2245,17 @@ def test_first_action_waits_if_intent_needs_clarification(isolated):
 def test_first_action_keeps_a_clear_intent_when_another_needs_clarification(isolated):
     with db.new_session() as session:
         store.initialize(session, isolated)
-        runtime = Runtime(client=FirstActionModel("read_file", {"path": "note.txt"}))
+        runtime = Runtime(client=FirstActionModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"}))
         event = {"type": "user_event", "event_type": "message", "id": "mixed-unclear",
                  "message_id": "user:mixed-unclear", "text": "处理之前的文件，同时运行 pwd", "user_seq": 1, "status": "pending"}
         store.put(session, "input:mixed-unclear", event)
         route = {"message_id": event["message_id"], "user_seq": 1,
                  "intents": [{"type": "unclear", "instruction": "不确定要处理哪个文件"},
                              {"type": "chat", "instruction": "运行 pwd"}], "needs_clarification": True,
-                 "first_action": {"intent_index": 1, "name": "read_file", "input": {"path": "note.txt"}}}
+                 "first_action": {"intent_index": 1, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
         runtime._validate_route(route, event)
         runtime._apply_route(session, event, route, set(), "first-call")
-        assert store.records(session, "tool_execution")[0]["input"] == {"path": "note.txt"}
+        assert store.records(session, "tool_execution")[0]["input"] == {"path": "/mnt/user-data/workspace/note.txt"}
         assert "需要向用户澄清" in str(store.history(session, "main")[-1]["content"])
 
 
@@ -2298,7 +2308,7 @@ def test_first_action_started_before_restart_is_not_replayed(isolated, monkeypat
     monkeypatch.setattr(tools, "execute_tool", lambda *args: calls.append(args) or "unexpected")
 
     async def run():
-        model = FirstActionModel("read_file", {"path": "note.txt"})
+        model = FirstActionModel("read_file", {"path": "/mnt/user-data/workspace/note.txt"})
         runtime = Runtime(client=model)
         with db.new_session() as session:
             store.initialize(session, isolated)
@@ -2307,7 +2317,7 @@ def test_first_action_started_before_restart_is_not_replayed(isolated, monkeypat
             store.put(session, "input:recover-first", event)
             route = {"message_id": event["message_id"], "user_seq": 1,
                      "intents": [{"type": "chat", "instruction": "pwd"}], "needs_clarification": False,
-                     "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "note.txt"}}}
+                     "first_action": {"intent_index": 0, "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}}
             blocks = [{"type": "tool_use", "id": "first-call", "name": "route_input", "input": route}]
             runtime._apply_route(session, event, route, set(), "first-call", blocks)
             execution = store.records(session, "tool_execution")[0]

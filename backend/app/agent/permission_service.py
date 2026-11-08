@@ -1,6 +1,6 @@
 import re
 
-from app.agent.tools import safe_glob_pattern, safe_path
+from app.agent.tools import safe_path
 from app.config import settings
 
 
@@ -31,13 +31,12 @@ TOOL_SPECS: dict[str, dict] = {
     "bash":        {"permission": "bash",    "riskLevel": "high",   "sideEffectScope": "system",    "needsApproval": True,  "destructive": True,  "readOnly": False},
     "read_file":   {"permission": "read",    "riskLevel": "low",    "sideEffectScope": "none",      "needsApproval": False, "destructive": False, "readOnly": True},
     "glob":        {"permission": "read",    "riskLevel": "low",    "sideEffectScope": "none",      "needsApproval": False, "destructive": False, "readOnly": True},
+    "ls":          {"permission": "read",    "riskLevel": "low",    "sideEffectScope": "none",      "needsApproval": False, "destructive": False, "readOnly": True},
+    "grep":        {"permission": "read",    "riskLevel": "low",    "sideEffectScope": "none",      "needsApproval": False, "destructive": False, "readOnly": True},
     "write_file":  {"permission": "edit",    "riskLevel": "medium", "sideEffectScope": "workspace", "needsApproval": True,  "destructive": False, "readOnly": False},
-    "edit_file":   {"permission": "edit",    "riskLevel": "medium", "sideEffectScope": "workspace", "needsApproval": True,  "destructive": False, "readOnly": False},
-    # 移入回收站仍属删除，build/edit 均须确认。
-    "delete_file": {"permission": "delete",  "riskLevel": "high",   "sideEffectScope": "workspace", "needsApproval": True,  "destructive": True,  "readOnly": False},
+    "str_replace": {"permission": "edit",    "riskLevel": "medium", "sideEffectScope": "workspace", "needsApproval": True,  "destructive": False, "readOnly": False},
     "todo_write":  {"permission": "todo",    "riskLevel": "low",    "sideEffectScope": "session",   "needsApproval": False, "destructive": False, "readOnly": True},
     "load_skill":  {"permission": "read",    "riskLevel": "low",    "sideEffectScope": "none",      "needsApproval": False, "destructive": False, "readOnly": True},
-    "subtask":     {"permission": "subagent","riskLevel": "low",    "sideEffectScope": "session",   "needsApproval": False, "destructive": False, "readOnly": True},
 }
 
 _DEFAULT_SPEC = {"permission": "unknown", "riskLevel": "medium", "sideEffectScope": "workspace",
@@ -84,16 +83,13 @@ def _capability(tool_name: str, tool_input: dict) -> dict:
 def hard_deny_reason(tool_name: str, tool_input: dict) -> str | None:
     if tool_name == "bash":
         return "当前沙箱禁止宿主命令"
-    if tool_name in ("write_file", "edit_file", "delete_file", "read_file", "rag_ingest"):
+    if tool_name == "rag_ingest":
         try:
             safe_path(str(tool_input.get("path", "")))
         except ValueError as exc:
             return str(exc)
-    if tool_name == "glob":
-        try:
-            safe_glob_pattern(str(tool_input.get("pattern", "")))
-        except (ValueError, OSError, RuntimeError) as exc:
-            return str(exc)
+    if tool_name in {"write_file", "str_replace", "read_file", "glob", "ls", "grep"}:
+        return "文件工具必须在沙箱内执行"
     return None
 
 
@@ -150,7 +146,12 @@ def check_permission(
     cap = _capability(tool_name, tool_input)
 
     # 硬拒优先于所有模式和规则。
-    hard = None if tool_name == "bash" and sandboxed else hard_deny_reason(tool_name, tool_input)
+    sandbox_files = {"read_file", "write_file", "str_replace", "glob", "ls", "grep"}
+    if sandboxed and tool_name in sandbox_files:
+        path = tool_input.get("path")
+        hard = None if isinstance(path, str) and path.startswith("/") and "\0" not in path else "路径必须是容器内绝对路径"
+    else:
+        hard = None if tool_name == "bash" and sandboxed else hard_deny_reason(tool_name, tool_input)
     if hard:
         return _deny("hard.deny", hard)
 

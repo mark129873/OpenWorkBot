@@ -14,7 +14,6 @@ from app.config import settings
 from app.models import Message, Part, Session, Todo, TurnUsage
 from app.sessions import chat_store as store
 from app.sessions import execution_state, session_permissions
-from app.sessions import store as legacy_store
 from app.user_context import scoped
 
 

@@ -100,12 +100,6 @@ class Runtime:
         self.rag = rag
         self.sandbox_provider = sandbox_provider
         self.sandbox_leases = sandbox_leases
-        if sandbox_provider:
-            from app.agent.network_approvals import NetworkApprovals
-            self.network_approvals = NetworkApprovals(self, sandbox_provider)
-        else:
-            self.network_approvals = None
-        self.network_poller: asyncio.Task | None = None
         self.owns_memory = memory is None
         self.memory_reads: set[asyncio.Task] = set()
         self.data_dir = settings.data_dir
@@ -196,15 +190,13 @@ class Runtime:
                 session.commit()
         self.main_loop = asyncio.create_task(self._consume(), name="main-chat")
         self.scheduler = asyncio.create_task(self._schedule(), name="task-scheduler")
-        if self.network_approvals:
-            self.network_poller = asyncio.create_task(self.network_approvals.run(), name="sandbox-network-approvals")
         if (meta.get("reset") or {}).get("status") in {"stopping", "deleting"}:
             self.reset_task = asyncio.create_task(self._finish_reset(meta["reset"]["id"]))
         self.wake.set()
 
     async def close(self) -> None:
         self.closing = True
-        pending = [task for task in [self.main_call, self.main_loop, self.scheduler, self.reset_task, self.network_poller,
+        pending = [task for task in [self.main_call, self.main_loop, self.scheduler, self.reset_task,
                                      *self.workers.values(), *self.direct_calls.values()] if task]
         for task in pending:
             task.cancel()
@@ -505,13 +497,6 @@ class Runtime:
         if option_id not in {"allowOnce", "allowSession", "deny"} or (feedback and len(feedback) > 4096):
             raise ValueError("审批选项或理由无效")
 
-        with db.new_session() as session:
-            record = store.get(session, f"approval:{request_id}")
-        if record and record.get("kind") == "sandbox_network":
-            if not self.network_approvals:
-                raise Conflict("审批已失效")
-            return await self.network_approvals.decide(request_id, option_id, feedback, assistant_id)
-
         def save(session):
             self._check_assistant(session, assistant_id)
             record = store.get(session, f"approval:{request_id}")
@@ -690,8 +675,8 @@ class Runtime:
             if not current:
                 return
             await self.release_sandboxes()
-            if self.network_approvals:
-                await self.network_approvals.reset()
+            if self.sandbox_provider:
+                await self.run_tool(self.sandbox_provider.reset_user, self.user_id)
             def mark_deleting(session):
                 meta = store.get(session, "meta")
                 current = meta.get("reset")
@@ -702,8 +687,6 @@ class Runtime:
                 return True
             if not await self.change(mark_deleting, "reset"):
                 return
-            if self.network_approvals:
-                await self.network_approvals.forget_grants()
             await self.memory.clear()
             for thread_id in current.get("thread_ids", []):
                 await self.graph.delete_thread(thread_id)

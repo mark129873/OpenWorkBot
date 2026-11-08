@@ -1,29 +1,24 @@
 """会话授权仅存内存，不读写项目规则。"""
 
 import json
-import os
-
-from app.agent.tools import safe_path
 
 # 文件内容可变，未知参数仍须精确匹配以防扩权。
 _FILE_PAYLOADS = {
-    "read_file": ("offset", "limit"), "write_file": ("content",),
-    "edit_file": ("old_text", "new_text"), "delete_file": (),
+    "read_file": ("start_line", "end_line", "description"),
+    "write_file": ("content", "description"),
+    "str_replace": ("old_str", "new_str", "description"),
+    "ls": ("description",), "glob": ("description",), "grep": ("description",),
 }
 _grants: dict[str, set[tuple[str, str]]] = {}
 
 
-def scope_for(tool: str, tool_input: dict) -> tuple[str, str] | None:
+def scope_for(tool: str, tool_input: dict, *, canonical_path: str | None = None) -> tuple[str, str] | None:
     """文件绑定真实路径；其他工具精确匹配完整参数，不支持通配。"""
     scoped = dict(tool_input)
     if tool in _FILE_PAYLOADS:
-        path = scoped.get("path")
-        if not isinstance(path, str) or not path:
+        if not isinstance(canonical_path, str) or not canonical_path.startswith("/"):
             return None
-        try:
-            scoped["path"] = os.path.normcase(str(safe_path(path)))
-        except (ValueError, OSError):
-            return None
+        scoped["path"] = canonical_path
         for key in _FILE_PAYLOADS[tool]:
             scoped.pop(key, None)
     try:
@@ -45,8 +40,8 @@ def grant(session_id: str, scope: tuple[str, str]) -> None:
     _grants.setdefault(session_id, set()).add(scope)
 
 
-def allows(session_id: str, tool: str, tool_input: dict) -> bool:
-    scope = scope_for(tool, tool_input)
+def allows(session_id: str, tool: str, tool_input: dict, *, canonical_path: str | None = None) -> bool:
+    scope = scope_for(tool, tool_input, canonical_path=canonical_path)
     return scope is not None and scope in _grants.get(session_id, set())
 
 

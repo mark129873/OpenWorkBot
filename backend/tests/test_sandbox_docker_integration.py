@@ -27,6 +27,15 @@ def test_real_quiet_command_uses_aio_timeout(tmp_path):
     try:
         sandbox_id = provider.acquire("quiet-test", user_id=user)
         sandbox = provider.get_scoped(sandbox_id, thread_id="quiet-test", user_id=user)
+        physical_id = provider._sandbox_id(user)
+        discovered = backend.discover(physical_id)
+        assert discovered and discovered.user_id == user and len(backend.list_running()) == 1
+        assert not backend.is_absent(physical_id) and "relay_token" not in discovered.to_dict()
+        limits = backend._inspect("container", discovered.container_id)["HostConfig"]
+        assert (limits["Memory"], limits["NanoCpus"], limits["PidsLimit"]) == (1024 ** 3, 10 ** 9, 512)
+        assert "seccomp=unconfined" in limits["SecurityOpt"]
+        proxy_limits = backend._inspect("container", discovered.proxy_id)["HostConfig"]
+        assert (proxy_limits["Memory"], proxy_limits["NanoCpus"], proxy_limits["PidsLimit"]) == (256 * 1024 ** 2, 10 ** 9, 128)
         assert "quiet-done" in sandbox.execute_command_in_scope("sleep 2; echo quiet-done", timeout=5, scope_id="quiet")
         sandbox.release_command_scope("quiet")
         provider.release(sandbox_id)
@@ -35,10 +44,11 @@ def test_real_quiet_command_uses_aio_timeout(tmp_path):
         if sandbox_id:
             provider.release(sandbox_id)
         provider.close()
+    assert backend.is_absent(physical_id)
 
 
 @pytest.mark.skipif(os.environ.get("OPENWORKBOT_DOCKER_TEST") != "1", reason="需要专用 Docker 验证")
-def test_real_sandbox_files_commands_and_network_grants(tmp_path, monkeypatch):
+def test_real_sandbox_files_commands_and_network_allowlist(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
     monkeypatch.setattr(settings, "workspaces_dir", tmp_path / "workspaces")
     monkeypatch.setattr(settings, "modelio_dir", tmp_path / "logs")
@@ -68,8 +78,19 @@ def test_real_sandbox_files_commands_and_network_grants(tmp_path, monkeypatch):
                 with db.new_session() as session:
                     return store.get(session, f"execution:{identity}")["output"]
 
-            assert "已写入" in await call("write_file", {"path": "真实测试.txt", "content": "内容"})
-            assert "内容" in await call("read_file", {"path": "真实测试.txt"})
+            path = "/mnt/user-data/workspace/真实测试.txt"
+            assert "OK" in await call("write_file", {"path": path, "content": "内容"})
+            nested = "/mnt/user-data/workspace/missing-parent/file.txt"
+            assert await call("write_file", {"path": nested, "content": "nested"}) == "OK"
+            assert "nested" in await call("read_file", {"path": nested})
+            assert "内容" in await call("read_file", {"path": path})
+            assert "真实测试.txt" in await call("glob", {"path": "/mnt/user-data/workspace", "pattern": "*.txt"})
+            assert "真实测试.txt" in await call("grep", {"path": "/mnt/user-data/workspace", "pattern": "内容"})
+            await call("bash", {"command": "printf old >/mnt/user-data/workspace/link-target.txt; ln -s /mnt/user-data/workspace/link-target.txt /tmp/owb-link"})
+            link = "/tmp/owb-link"
+            assert "old" in await call("read_file", {"path": link})
+            assert "OK" in await call("str_replace", {"path": link, "old_str": "old", "new_str": "new"})
+            assert "new" in await call("read_file", {"path": "/mnt/user-data/workspace/link-target.txt"})
             first_sandbox = runtime.direct_sandboxes[task["id"]]["sandbox_id"]
             with bind_user("b" * 32):
                 other = Runtime(client=object(), sandbox_provider=provider, sandbox_leases=leases)
@@ -82,7 +103,7 @@ def test_real_sandbox_files_commands_and_network_grants(tmp_path, monkeypatch):
                         session.commit()
                     other_worker = Worker(other, other_task["id"])
                     other_worker.context_id, other_worker.run_id = other_task["context_id"], other_task["run_id"]
-                    other_group, other_identity = await group(other, other_worker, "read_file", {"path": "真实测试.txt"})
+                    other_group, other_identity = await group(other, other_worker, "read_file", {"path": path})
                     await other_worker.process_group(other_group)
                     with db.new_session() as session:
                         assert store.get(session, f"execution:{other_identity}")["output"].startswith("Error:")
@@ -91,6 +112,24 @@ def test_real_sandbox_files_commands_and_network_grants(tmp_path, monkeypatch):
                     await other.close()
             await call("bash", {"command": "export OWB_TEST_VALUE=ok"})
             assert "ok" in await call("bash", {"command": "printf '%s' \"$OWB_TEST_VALUE\""})
+            context = runtime.direct_sandboxes[task["id"]]
+            sandbox = provider.get_scoped(first_sandbox, thread_id=context["thread_id"], user_id=runtime.user_id)
+            temporary = await asyncio.to_thread(sandbox.execute_command_in_scope,
+                "printf '%s|%s|%s' \"$PWD\" \"$OWB_TEST_VALUE\" \"$OWB_TEMP\"",
+                env={"OWB_TEMP": "temporary"}, scope_id=context["owner_id"])
+            assert temporary == "/mnt/user-data/workspace||temporary"
+            assert "ok|" in await call("bash", {"command": "printf '%s|%s' \"$OWB_TEST_VALUE\" \"$OWB_TEMP\""})
+            scope = sandbox._scope(context["owner_id"])
+            marker = f"OPENWORKBOT_SCOPE_{scope.token.upper()}"
+            collision = await asyncio.to_thread(sandbox.execute_command_in_scope,
+                f"printf '%s' \"${marker}\"", env={marker: "caller-value"}, scope_id=context["owner_id"])
+            assert collision == "caller-value" and len(scope.tokens) == 2
+            waiting = asyncio.create_task(asyncio.to_thread(sandbox.execute_command_in_scope,
+                "sleep 60", env={"OWB_TEMP": "temporary"}, scope_id="env-cancel"))
+            await asyncio.sleep(1)
+            sandbox.request_command_cancel("env-cancel")
+            assert "命令已停止" in await asyncio.wait_for(waiting, 20)
+            await asyncio.to_thread(sandbox.release_command_scope, "env-cancel")
             dns = await call("bash", {"command": "python -c \"import socket; socket.getaddrinfo('example.com',443)\""})
             assert dns.startswith("Error:")
             direct = await call("bash", {"command": "python -c \"import socket; socket.create_connection(('1.1.1.1',443),3)\""})
@@ -98,18 +137,9 @@ def test_real_sandbox_files_commands_and_network_grants(tmp_path, monkeypatch):
             output = await call("bash", {"command": "python -c \"print('x'*25000)\""})
             assert len(output) <= 20000 and "中段已截断" in output
 
-            await call("bash", {"command": "curl -fsSI --max-time 15 https://example.com"})
-            async with asyncio.timeout(30):
-                while True:
-                    snapshot = await runtime.snapshot()
-                    approval = next((item for item in snapshot["approvals"]
-                                     if item.get("kind") == "sandbox_network"
-                                     and item["input"]["host"] == "example.com"), None)
-                    if approval:
-                        break
-                    await asyncio.sleep(0.2)
-            await runtime.decide(approval["request_id"], "allowSession", assistant_id=snapshot["assistant_id"])
-            assert "200" in await call("bash", {"command": "curl -fsSI --max-time 15 https://example.com"})
+            denied = await call("bash", {"command": "curl -sS -o /dev/null -w '%{http_code}' --max-time 15 http://example.com"})
+            assert "403" in denied
+            assert not (await runtime.snapshot())["approvals"]
 
             background = await call("bash", {"command": "sleep 60 >/dev/null 2>&1 & echo background-pid:$!"})
             match = re.search(r"background-pid:(\d+)", background)
@@ -121,7 +151,7 @@ def test_real_sandbox_files_commands_and_network_grants(tmp_path, monkeypatch):
             assert "stopped" in await call("bash", {"command": check})
             await runtime.release_direct_sandbox(worker.task_id)
             await asyncio.to_thread(provider.cleanup_idle)
-            assert "200" in await call("bash", {"command": "curl -fsSI --max-time 15 https://example.com"})
+            assert "403" in await call("bash", {"command": "curl -sS -o /dev/null -w '%{http_code}' --max-time 15 http://example.com"})
             await call("bash", {"command": "exit 0"})
             assert "shell-recreated" in await call("bash", {"command": "echo shell-recreated"})
         finally:

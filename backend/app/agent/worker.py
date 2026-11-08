@@ -24,6 +24,7 @@ _PROMPT = """你是后台工作助手，专注完成给定任务。独立保存�
 知识库由所有用户共享。查询用 rag_search；仅在用户明确要求时调用 rag_ingest 或 rag_remove。
 已指定文件时直接入库；移出前用 rag_list 查文件 ID。普通知识问答完整返回工具答案。
 bash 仅在用户共享沙箱内运行，并按权限审批；宿主命令不可用。
+文件工具使用容器内绝对路径，工作区为 /mnt/user-data/workspace；知识库入库仍使用工作区相对路径。
 必须遵守用户限定的操作和顺序；不确定时询问主助手。
 关键进展或需要用户确认的问题使用 task_report 告诉主助手。完成后简短汇报结果、验证及未解决的问题。
 收到用户修改、停止或同伴消息时按最新要求调整；不要冒充主助手或其他助手。"""
@@ -36,6 +37,40 @@ def _limit_result(text: str) -> str:
     marker = "\n[结果过长，已截断]"
     budget = 16 * 1024 - len(marker.encode("utf-8"))
     return data[:budget].decode("utf-8", errors="ignore") + marker
+
+
+def _read_page(content: str, start: int, end: int | None) -> str:
+    lines = content.split("\n") if content else []
+    if lines and not lines[-1]:
+        lines.pop()
+    stop = min(end if end is not None else len(lines), start + 1999, len(lines))
+    rows, size, next_line = [], 0, None
+    for index in range(start - 1, stop):
+        line = lines[index].rstrip("\r")
+        row = f"{index + 1}: {line[:2000]}"
+        if len(line) > 2000:
+            row += " …（该行超过 2000 字符，余下内容已截断）"
+        if size + len(row) + 1 > 99900:
+            next_line = index + 1
+            break
+        rows.append(row)
+        size += len(row) + 1
+    if next_line is None and stop < len(lines) and (end is None or stop < end):
+        next_line = stop + 1
+    if next_line is not None:
+        rows.append(f"[继续读取：start_line={next_line}]")
+    return "\n".join(rows) if rows else "(文件为空或已到文件末尾)"
+
+
+def _replace_content(content: str, old: str, new: str, replace_all: bool) -> str | None:
+    if not old:
+        return content
+    if "\r\n" in content:
+        crlf_old = old.replace("\r\n", "\n").replace("\n", "\r\n")
+        if content.count("\r\n") == content.count("\n") or (old not in content and crlf_old in content):
+            old = crlf_old
+            new = new.replace("\r\n", "\n").replace("\n", "\r\n")
+    return content.replace(old, new, -1 if replace_all else 1) if old in content else None
 
 
 class AgentWaiting(Exception):
@@ -164,7 +199,7 @@ class Worker:
         name, args = execution["name"], execution["input"]
         if not isinstance(args, dict):
             return "Error: 工具参数必须是对象"
-        if name in {"read_file", "write_file", "edit_file", "glob", "delete_file"}:
+        if name in {"read_file", "write_file", "str_replace", "glob", "ls", "grep"}:
             schema = next(spec["input_schema"] for spec in tools.TOOLS if spec["name"] == name)
             try:
                 validate(args, {**schema, "additionalProperties": False})
@@ -184,20 +219,12 @@ class Worker:
             return await self.rag_tool(execution)
         if name == "bash":
             return await self.bash_tool(execution)
+        if name in {"read_file", "write_file", "str_replace"}:
+            return await self.file_tool(execution)
+        if name in {"ls", "glob", "grep"}:
+            return await self.search_tool(execution)
         if name not in tools.TOOL_HANDLERS and name != "todo_write":
             return f"Error: 未知工具 {name}"
-        if name in {"read_file", "write_file", "edit_file", "delete_file"}:
-            return await self.file_tool(execution)
-        if name == "glob":
-            if self.sandbox is None:
-                return "Error: 沙箱不可用，文件操作未执行。"
-            error = await self.authorize(execution)
-            if error:
-                return error
-            error = await self.started(execution)
-            if error:
-                return error
-            return await self.runtime.run_tool(self.sandbox.file_operation, name, args)
         error = await self.authorize(execution)
         if error:
             return error
@@ -206,11 +233,10 @@ class Worker:
             return error
         if name == "todo_write":
             from app.agent.todo import parse_items, render_panel
-            from app.sessions.store import replace_todos
             items, error = parse_items(args.get("items"))
             if error:
                 return error
-            await self.runtime.change(lambda session: replace_todos(session, scoped("main"), items, commit=False))
+            await self.runtime.change(lambda session: store.replace_todos(session, scoped("main"), items, commit=False))
             return render_panel(items)
         return await self.runtime.run_tool(tools.execute_tool, name, args)
 
@@ -219,7 +245,8 @@ class Worker:
 
         args = execution["input"]
         command = args.get("command")
-        if set(args) != {"command"} or not isinstance(command, str) or not command.strip():
+        if (set(args) - {"command", "description"} or not isinstance(command, str) or not command.strip()
+                or ("description" in args and not isinstance(args["description"], str))):
             return "Error: 命令参数无效。"
         if self.sandbox is None or not self.sandbox_scope:
             return "Error: 沙箱不可用，禁止宿主命令。"
@@ -387,12 +414,15 @@ class Worker:
                 return not bool(re.search(r"(?:不要|禁止|不许|别|无需|不必|do not|don't|never).{0,30}(?:" + actions + r"|重试|再试|retry)", text))
         return False
 
-    async def authorize(self, execution: dict, *, sandboxed: bool = False) -> str | None:
+    async def authorize(self, execution: dict, *, sandboxed: bool = False,
+                        canonical_path: str | None = None) -> str | None:
         name, args = execution["name"], execution["input"]
         deps = SimpleNamespace(recorder=SimpleNamespace(session_id=scoped("main")),
                                stop_flag=lambda: self.stop.is_set(),
-                               approver=lambda tool, inputs, reason: self.approve(execution, reason, sandboxed=sandboxed))
-        return await approvals.authorize_tool(deps, name, args, data_dir=settings.data_dir, sandboxed=sandboxed)
+                               approver=lambda tool, inputs, reason: self.approve(
+                                   execution, reason, sandboxed=sandboxed, canonical_path=canonical_path))
+        return await approvals.authorize_tool(deps, name, args, data_dir=settings.data_dir, sandboxed=sandboxed,
+                                              canonical_path=canonical_path)
 
     async def started(self, execution: dict, expected_user_seq: int | None = None) -> str | None:
         def started(session):
@@ -429,9 +459,19 @@ class Worker:
         name, args = execution["name"], execution["input"]
         if self.sandbox is None:
             return "Error: 沙箱不可用，文件操作未执行。"
+        requested_path = args.get("path")
+        if not isinstance(requested_path, str) or not requested_path.startswith("/") or "\0" in requested_path:
+            return "Error: 路径必须是容器内绝对路径。"
+        if name == "read_file" and args.get("end_line") is not None and args.get("start_line", 1) > args["end_line"]:
+            return "Error: 读取行范围无效。"
+        if name == "write_file" and not args.get("append", False) and len(args["content"].encode("utf-8")) > 80 * 1024:
+            return "Error: 单次写入不能超过 80 KiB，请分段追加。"
+        from app.agent.permission_service import evaluate
+        if evaluate(settings.data_dir, name, args, sandboxed=True)["decision"] == "deny":
+            return "Error: 已被安全策略拒绝。"
         try:
-            path = os.path.normcase(str(tools.safe_path(args["path"])))
-        except (KeyError, TypeError, ValueError, OSError) as exc:
+            path = await self.runtime.run_tool(self.sandbox.real_path, requested_path)
+        except Exception as exc:
             return f"Error: 文件路径无效：{exc}"
         writing = name != "read_file"
         if writing:
@@ -442,12 +482,21 @@ class Worker:
         async with lock:
             if self.stop.is_set():
                 return "Error: 用户已停止任务，工具未执行。"
-            initial_version = await self.runtime.run_tool(self.sandbox.file_operation, "version", {"path": args["path"]})
-            if initial_version.startswith("Error:"):
-                return initial_version
+            error = await self.authorize(execution, sandboxed=True, canonical_path=path)
+            if error:
+                return error
+            try:
+                if await self.runtime.run_tool(self.sandbox.real_path, requested_path) != path:
+                    return "Error: 文件路径已变化，请重新发起操作。"
+            except Exception:
+                return "Error: 文件路径已变化，请重新发起操作。"
+            content = await self.runtime.run_tool(self.sandbox.read_file, requested_path)
+            uninspectable = content.startswith("Error:")
+            if not writing and uninspectable:
+                return content
+            initial_version = None if uninspectable else hashlib.sha256(content.encode("utf-8")).hexdigest()
+            version_key = f"version:{self.context_id}:{hashlib.sha256(path.encode()).hexdigest()}"
             if writing:
-                current_version = initial_version
-                version_key = f"version:{self.context_id}:{hashlib.sha256(path.encode()).hexdigest()}"
                 with db.new_session() as session:
                     read_version = store.get(session, version_key)
                     owners = [task for task in store.records(session, "task_state")
@@ -455,16 +504,9 @@ class Worker:
                               and task["status"] not in {"completed", "failed", "stopped"}]
                 if owners:
                     return "Error: 文件已被其他任务占用，请等待并重新读取。"
-                if read_version and read_version["version"] != current_version:
-                    return "Error: 文件读取后已被修改，请重新读取并重新发起操作。"
-            error = await self.authorize(execution)
-            if error:
-                return error
-            try:
-                if os.path.normcase(str(tools.safe_path(args["path"]))) != path:
-                    return "Error: 文件路径已变化，请重新发起操作。"
-            except (ValueError, OSError):
-                return "Error: 文件路径已变化，请重新发起操作。"
+                # shortcut: DeerFlow 对读取失败放行，若上游能可靠区分不存在再收紧。
+                if not uninspectable and (not read_version or read_version["version"] != initial_version):
+                    return "Error: 请先读取文件的当前版本，再重新发起操作。"
             if writing:
                 def claim(session):
                     task = store.get(session, f"task:{self.task_id}")
@@ -472,23 +514,73 @@ class Worker:
                         task["files"].append(path)
                         store.put(session, f"task:{self.task_id}", task)
                 await self.runtime.change(claim)
-                if read_version and read_version["version"] != await self.runtime.run_tool(
-                        self.sandbox.file_operation, "version", {"path": args["path"]}):
+                latest = await self.runtime.run_tool(self.sandbox.read_file, requested_path)
+                if (not uninspectable and latest != content) or (uninspectable and not latest.startswith("Error:")):
                     return "Error: 审批期间文件已被修改，请重新读取并重新发起操作。"
             error = await self.started(execution)
             if error:
                 return error
-            result = await self.runtime.run_tool(self.sandbox.file_operation, name, args)
-            if not result.startswith("Error:"):
-                version = await self.runtime.run_tool(self.sandbox.file_operation, "version", {"path": args["path"]})
-                if version.startswith("Error:"):
-                    return "Error: 文件操作后版本结果未知，请先核查。"
-                if not writing and version != initial_version:
+            if not writing:
+                latest = await self.runtime.run_tool(self.sandbox.read_file, requested_path)
+                if latest != content:
                     return "Error: 读取期间文件发生变化，请重新读取。"
-                key = f"version:{self.context_id}:{hashlib.sha256(path.encode()).hexdigest()}"
-                await self.runtime.change(lambda session: store.put(session, key, {
-                    "type": "file_version", "context_id": self.context_id, "path": path, "version": version}))
-            return result
+                await self.runtime.change(lambda session: store.put(session, version_key, {
+                    "type": "file_version", "context_id": self.context_id, "path": path, "version": initial_version}))
+                return _read_page(content, args.get("start_line", 1), args.get("end_line"))
+            try:
+                if name == "write_file":
+                    await self.runtime.run_tool(self.sandbox.write_file, requested_path, args["content"],
+                                                append=args.get("append", False))
+                else:
+                    current = await self.runtime.run_tool(self.sandbox.read_file, requested_path)
+                    if current.startswith("Error:"):
+                        return current
+                    replacement = _replace_content(current, args["old_str"], args["new_str"], args.get("replace_all", False))
+                    if replacement is None:
+                        return "Error: 文件中没有找到要替换的内容。"
+                    if args["old_str"]:
+                        await self.runtime.run_tool(self.sandbox.write_file, requested_path, replacement)
+            except Exception as exc:
+                return f"Error: 写入失败或结果未知，请先核查：{type(exc).__name__}"
+            await self.runtime.change(lambda session: store.put(session, version_key, {
+                "type": "file_version", "context_id": self.context_id, "path": path, "version": None}))
+            return "OK"
+
+    async def search_tool(self, execution: dict) -> str:
+        name, args = execution["name"], execution["input"]
+        if self.sandbox is None:
+            return "Error: 沙箱不可用，文件操作未执行。"
+        path = args.get("path")
+        if not isinstance(path, str) or not path.startswith("/") or "\0" in path:
+            return "Error: 路径必须是容器内绝对路径。"
+        try:
+            canonical = await self.runtime.run_tool(self.sandbox.real_path, path)
+            error = await self.authorize(execution, sandboxed=True, canonical_path=canonical)
+            if error:
+                return error
+            if await self.runtime.run_tool(self.sandbox.real_path, path) != canonical:
+                return "Error: 文件路径已变化，请重新发起操作。"
+            error = await self.started(execution)
+            if error:
+                return error
+            if name == "ls":
+                entries = await self.runtime.run_tool(self.sandbox.list_dir, path)
+                return "\n".join(entries)[:20000] or "(空目录)"
+            if name == "glob":
+                matches, truncated = await self.runtime.run_tool(
+                    self.sandbox.glob, path, args["pattern"], include_dirs=args.get("include_dirs", False),
+                    max_results=args.get("max_results", 200))
+                rows = matches
+            else:
+                matches, truncated = await self.runtime.run_tool(
+                    self.sandbox.grep, path, args["pattern"], glob=args.get("glob"), literal=args.get("literal", False),
+                    case_sensitive=args.get("case_sensitive", False), max_results=args.get("max_results", 100))
+                rows = [f"{match.path}:{match.line_number}: {match.line}" for match in matches]
+            if truncated:
+                rows.append("[结果已截断]")
+            return "\n".join(rows) or "(无匹配结果)"
+        except Exception as exc:
+            return f"Error: 文件搜索失败：{exc}"
 
     async def wait_for_file(self, path: str, identity: str) -> str | None:
         with db.new_session() as session:
@@ -542,9 +634,10 @@ class Worker:
         await self.runtime.change(lambda session: store.put(session, key, {
             "type": "file_wait", "task_id": self.task_id, "path": path, "status": "completed"}))
 
-    async def approve(self, execution: dict, reason: str, *, sandboxed: bool = False) -> dict:
+    async def approve(self, execution: dict, reason: str, *, sandboxed: bool = False,
+                      canonical_path: str | None = None) -> dict:
         request_id = new_id()
-        scope = session_permissions.scope_for(execution["name"], execution["input"])
+        scope = session_permissions.scope_for(execution["name"], execution["input"], canonical_path=canonical_path)
         event = asyncio.Event()
         self.runtime.approval_events[request_id] = event
         def request(session):
@@ -556,7 +649,8 @@ class Worker:
             store.put(session, f"approval:{request_id}", {"type": "approval", "request_id": request_id,
                       "task_id": self.task_id, "task_title": task["title"], "run_id": self.run_id,
                       "tool_call_id": execution["call_id"], "tool": execution["name"], "input": execution["input"],
-                      "scope": scope, "reason": reason, "options": approvals.build_options(execution["name"], execution["input"]),
+                      "scope": scope, "reason": reason, "options": approvals.build_options(
+                          execution["name"], execution["input"], canonical_path=canonical_path),
                       "status": "requested", "order": store.get(session, "meta")["revision"] + 1})
         try:
             await self.runtime.change(request, "approval")
@@ -577,8 +671,13 @@ class Worker:
         allowed = bool(record and record["status"] == "resolved" and record["option_id"] != "deny" and not self.stop.is_set())
         if allowed:
             from app.agent.permission_service import evaluate
+            if canonical_path is not None:
+                try:
+                    canonical_path = await self.runtime.run_tool(self.sandbox.real_path, execution["input"]["path"])
+                except Exception:
+                    canonical_path = None
             allowed = (evaluate(settings.data_dir, execution["name"], execution["input"], sandboxed=sandboxed)["decision"] != "deny"
-                       and scope == session_permissions.scope_for(execution["name"], execution["input"]))
+                       and scope == session_permissions.scope_for(execution["name"], execution["input"], canonical_path=canonical_path))
         if allowed and record["option_id"] == "allowSession" and scope is not None:
             session_permissions.grant(scoped("main"), scope)
         def resolved(session):

@@ -9,11 +9,8 @@ import sys
 import time
 
 
-OWNER_ENV = b"OPENWORKBOT_SCOPE_TOKEN="
-
-
 def matching_processes(token):
-    expected = OWNER_ENV + token.encode("ascii")
+    expected = f"OPENWORKBOT_SCOPE_{token.upper()}=1".encode("ascii")
     handles = []
     try:
         for name in os.listdir("/proc"):

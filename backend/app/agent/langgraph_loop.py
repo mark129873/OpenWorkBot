@@ -68,7 +68,7 @@ class LangGraphLoop:
                                 args_schema=spec["input_schema"], coroutine=_placeholder)
                  for spec in unique.values()]
         middleware = [OrderedToolMiddleware()]
-        self.sandbox_middleware = SandboxMiddleware(leases) if leases else None
+        self.sandbox_middleware = SandboxMiddleware(leases=leases) if leases else None
         if self.sandbox_middleware:
             middleware.append(self.sandbox_middleware)
         middleware.append(_LoopMiddleware())

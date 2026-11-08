@@ -3,7 +3,6 @@ import hashlib
 import io
 import ipaddress
 import json
-import math
 import os
 import re
 import secrets
@@ -18,11 +17,11 @@ import httpx
 from app.community.aio_sandbox.backend import SandboxBackend
 from app.community.aio_sandbox.sandbox_info import SandboxInfo
 from app.config import DEFAULT_SANDBOX_ALLOW_DOMAINS
+from app.user_context import current_user
 
 
 AIO_IMAGE = "enterprise-public-cn-beijing.cr.volces.com/vefaas-public/all-in-one-sandbox@sha256:6328d7fd2f0ff0b4c147c3d05b3df1ce331f4a482eb6e550ecd64ed1fcf906e7"
 PROXY_IMAGE = "ghcr.io/bytedance/deer-flow-sandbox-network-proxy@sha256:ab8e86073cfef47f72b5b07ca3e92a8c9f8ff5b50328c16436f21d35ab359a40"
-_PROXY_SCRIPT = "/opt/deerflow-network-proxy.py"
 _LABEL = "openworkbot.sandbox"
 _DESKTOP_PROXY = """import runpy,socket,sys
 original=socket.getaddrinfo
@@ -31,22 +30,6 @@ def ipv4(host,port,family=0,type=0,proto=0,flags=0):
 socket.getaddrinfo=ipv4
 sys.argv=['/opt/deerflow-network-proxy.py','serve']
 runpy.run_path(sys.argv[0],run_name='__main__')
-"""
-_NETWORK_EVENTS = """import json,sqlite3
-db=sqlite3.connect('/tmp/deerflow-network-policy.sqlite3',timeout=5)
-rows=db.execute('SELECT request_id,host,port,method,created_at FROM events WHERE surfaced=0 AND decision IS NULL ORDER BY created_at LIMIT 100').fetchall()
-print(json.dumps([dict(zip(('request_id','host','port','method','created_at'),row)) for row in rows]))
-"""
-_ACK_NETWORK_EVENT = """import sqlite3,sys
-db=sqlite3.connect('/tmp/deerflow-network-policy.sqlite3',timeout=5)
-db.execute('UPDATE events SET surfaced=1 WHERE request_id=? AND decision IS NULL',(sys.argv[1],))
-db.commit()
-"""
-_SEED_NETWORK_GRANTS = """import json,sqlite3,sys
-db=sqlite3.connect('/tmp/deerflow-network-policy.sqlite3',timeout=5)
-grants=json.load(sys.stdin)
-db.executemany('INSERT INTO grants(host,port,expires_at) VALUES (?,?,?) ON CONFLICT(host,port) DO UPDATE SET expires_at=excluded.expires_at',grants)
-db.commit()
 """
 
 
@@ -142,7 +125,7 @@ class LocalContainerBackend(SandboxBackend):
         return output.getvalue()
 
     def _workspace(self, user_id: str) -> Path:
-        if not re.fullmatch(r"[0-9a-f]{32}", user_id):
+        if not re.fullmatch(r"(?:[0-9a-f]{32}|default)", user_id):
             raise ValueError("用户身份无效")
         target = self.workspaces_dir / user_id
         if target.is_symlink() or (hasattr(target, "is_junction") and target.is_junction()):
@@ -166,17 +149,20 @@ class LocalContainerBackend(SandboxBackend):
         if self._inspect("image", image) is None:
             self._docker("pull", image, timeout=600)
 
-    def create(self, thread_id: str, sandbox_id: str, extra_mounts=None, *, user_id: str) -> SandboxInfo:
-        if not re.fullmatch(r"[0-9a-f]{32}", sandbox_id) or not thread_id:
+    def create(self, thread_id: str | None, sandbox_id: str, extra_mounts=None,
+               *, user_id: str | None = None) -> SandboxInfo:
+        user_id = user_id or current_user() or "default"
+        if (current_user() and user_id != current_user()) or (not current_user() and user_id != "default"):
+            raise PermissionError("沙箱不属于当前用户")
+        if not re.fullmatch(r"[0-9a-f]{32}", sandbox_id):
             raise ValueError("沙箱身份无效")
         if extra_mounts:
             raise ValueError("不支持额外挂载")
         workspace = self._workspace(user_id)
         if not self.skills_dir.is_dir():
             raise RuntimeError("技能目录不存在")
-        file_helper = Path(__file__).with_name("file_ops.py").resolve()
         process_helper = Path(__file__).with_name("process_cleanup.py").resolve()
-        if not file_helper.is_file() or not process_helper.is_file():
+        if not process_helper.is_file():
             raise RuntimeError("沙箱受控程序不存在")
         desktop = self._check_engine()
         self._ensure_image(AIO_IMAGE)
@@ -205,7 +191,7 @@ class LocalContainerBackend(SandboxBackend):
                                  "-e", "DEERFLOW_NETWORK_MODE=allowlist", "-e",
                                  f"DEERFLOW_ALLOW_DOMAINS_JSON={json.dumps(self.allow_domains)}", "-e",
                                  f"DEERFLOW_SANDBOX_TARGET={names['sandbox']}:8080", "-e",
-                                 f"DEERFLOW_ALLOW_SYNTHETIC_DNS={int(desktop)}", "-e", "DEERFLOW_RECORD_DENIALS=1",
+                                 f"DEERFLOW_ALLOW_SYNTHETIC_DNS={int(desktop)}", "-e", "DEERFLOW_RECORD_DENIALS=0",
                                  "-e", "DEERFLOW_RELAY_TOKEN", PROXY_IMAGE,
                                  *(["python", "-c", _DESKTOP_PROXY] if desktop else []), env=env)
             self._docker("network", "connect", names["network"], proxy)
@@ -227,13 +213,14 @@ class LocalContainerBackend(SandboxBackend):
                                    "--security-opt", "seccomp=unconfined", "--memory", "1g", "--cpus", "1",
                                    "--pids-limit", "512", "--mount", self._mount(workspace, "/mnt/user-data/workspace"),
                                    "--mount", self._mount(self.skills_dir, "/mnt/skills", True),
-                                   "--mount", self._mount(file_helper, "/opt/openworkbot-file-ops.py", True),
                                    "--mount", self._mount(process_helper, "/opt/openworkbot-process-cleanup.py", True),
                                    *(part for key, value in environment.items() for part in ("-e", f"{key}={value}")),
                                    AIO_IMAGE)
             self._docker("start", sandbox)
-            info = SandboxInfo(sandbox_id, user_id, generation, sandbox, proxy, network, egress,
-                               f"http://127.0.0.1:{match[1]}", token)
+            info = SandboxInfo(sandbox_id=sandbox_id, sandbox_url=f"http://127.0.0.1:{match[1]}",
+                               container_name=names["sandbox"], container_id=sandbox, user_id=user_id,
+                               generation=generation, proxy_id=proxy, network_id=network, egress_network_id=egress,
+                               relay_token=token, request_headers={"X-DeerFlow-Relay-Token": token})
             deadline = time.monotonic() + 60
             with httpx.Client(trust_env=False, headers={"X-DeerFlow-Relay-Token": token}) as client:
                 while time.monotonic() < deadline:
@@ -314,6 +301,94 @@ class LocalContainerBackend(SandboxBackend):
             return False
         return True
 
+    def _resources(self, sandbox_id: str) -> dict[str, dict]:
+        if not re.fullmatch(r"[0-9a-f]{32}", sandbox_id):
+            raise ValueError("沙箱身份无效")
+        filters = ("--filter", f"label={_LABEL}.instance={self.instance}",
+                   "--filter", f"label={_LABEL}.id={sandbox_id}")
+        groups = (("container", self._docker("ps", "-aq", *filters).splitlines()),
+                  ("network", self._docker("network", "ls", "-q", *filters).splitlines()))
+        resources = {}
+        for kind, identities in groups:
+            for identity in identities:
+                resource = self._inspect(kind, identity)
+                if resource is None:
+                    raise RuntimeError("Docker 资源状态正在变化")
+                labels = (resource.get("Config") or {}).get("Labels") if kind == "container" else resource.get("Labels")
+                role = (labels or {}).get(f"{_LABEL}.role")
+                allowed = {"sandbox", "proxy"} if kind == "container" else {"network", "egress"}
+                user = (labels or {}).get(f"{_LABEL}.user", "")
+                generation = (labels or {}).get(f"{_LABEL}.generation", "")
+                if (role not in allowed or role in resources or not re.fullmatch(r"(?:[0-9a-f]{32}|default)", user)
+                        or not re.fullmatch(r"[0-9a-f]{32}", generation)
+                        or any(labels.get(key) != value for key, value in
+                               self._labels(sandbox_id, user, generation, role).items())):
+                    raise RuntimeError("Docker 资源归属无法确认")
+                resources[role] = resource
+        return resources
+
+    def discover(self, sandbox_id: str) -> SandboxInfo | None:
+        resources = self._resources(sandbox_id)
+        sandbox = resources.get("sandbox")
+        if not sandbox or not sandbox.get("State", {}).get("Running"):
+            return None
+        if set(resources) != {"sandbox", "proxy", "network", "egress"}:
+            raise RuntimeError("沙箱资源不完整")
+        labels = sandbox["Config"]["Labels"]
+        user, generation = labels[f"{_LABEL}.user"], labels[f"{_LABEL}.generation"]
+        for role, resource in resources.items():
+            actual = (resource.get("Config") or {}).get("Labels") if role in {"sandbox", "proxy"} else resource.get("Labels")
+            if any(actual.get(key) != value for key, value in self._labels(sandbox_id, user, generation, role).items()):
+                raise RuntimeError("沙箱资源归属不一致")
+        proxy = resources["proxy"]
+        ports = proxy.get("NetworkSettings", {}).get("Ports", {}).get("8080/tcp") or []
+        env = (proxy.get("Config") or {}).get("Env") or []
+        tokens = [item.split("=", 1)[1] for item in env if item.startswith("DEERFLOW_RELAY_TOKEN=")]
+        if (len(ports) != 1 or ports[0].get("HostIp") != "127.0.0.1" or not ports[0].get("HostPort")
+                or len(tokens) != 1 or not tokens[0]):
+            raise RuntimeError("沙箱连接信息无法确认")
+        info = SandboxInfo(
+            sandbox_id=sandbox_id, sandbox_url=f"http://127.0.0.1:{ports[0]['HostPort']}",
+            container_name=(sandbox.get("Name") or "").lstrip("/"), container_id=sandbox.get("Id"),
+            user_id=user, generation=generation, proxy_id=proxy.get("Id"),
+            network_id=resources["network"].get("Id"), egress_network_id=resources["egress"].get("Id"),
+            relay_token=tokens[0], request_headers={"X-DeerFlow-Relay-Token": tokens[0]})
+        if not self.is_alive(info):
+            raise RuntimeError("沙箱资源状态异常")
+        return info
+
+    def is_absent(self, sandbox_id: str) -> bool:
+        return not self._resources(sandbox_id)
+
+    def inspect_runtime(self, sandbox_id: str) -> SandboxInfo | None:
+        info = self.discover(sandbox_id)
+        if info is not None:
+            return info
+        resources = self._resources(sandbox_id)
+        if not resources:
+            return None
+        sandbox = resources.get("sandbox")
+        if not sandbox:
+            raise RuntimeError("沙箱资源不完整")
+        labels = sandbox["Config"]["Labels"]
+        return SandboxInfo(sandbox_id, "", container_id=sandbox.get("Id"),
+                           user_id=labels[f"{_LABEL}.user"], generation=labels[f"{_LABEL}.generation"],
+                           requires_replacement=True)
+
+    def list_running(self) -> list[SandboxInfo]:
+        selector = ("--filter", f"label={_LABEL}.instance={self.instance}",
+                    "--filter", f"label={_LABEL}.role=sandbox")
+        result = []
+        for identity in self._docker("ps", "-q", *selector).splitlines():
+            resource = self._inspect("container", identity)
+            if resource is None:
+                raise RuntimeError("Docker 资源状态正在变化")
+            sandbox_id = (resource.get("Config", {}).get("Labels") or {}).get(f"{_LABEL}.id", "")
+            info = self.discover(sandbox_id)
+            if info:
+                result.append(info)
+        return result
+
     def reconcile(self) -> None:
         selector = f"label={_LABEL}.instance={self.instance}"
         groups = (("container", self._docker("ps", "-aq", "--filter", selector).splitlines()),
@@ -329,7 +404,7 @@ class LocalContainerBackend(SandboxBackend):
                 sandbox_id = (labels or {}).get(f"{_LABEL}.id", "")
                 generation = (labels or {}).get(f"{_LABEL}.generation", "")
                 allowed = {"sandbox", "proxy"} if kind == "container" else {"network", "egress"}
-                if (role not in allowed or not re.fullmatch(r"[0-9a-f]{32}", user_id)
+                if (role not in allowed or not re.fullmatch(r"(?:[0-9a-f]{32}|default)", user_id)
                         or not re.fullmatch(r"[0-9a-f]{32}", sandbox_id)
                         or not re.fullmatch(r"[0-9a-f]{32}", generation)
                         or any(labels.get(key) != value for key, value in
@@ -343,60 +418,3 @@ class LocalContainerBackend(SandboxBackend):
                     raise RuntimeError("Docker 旧资源未被清理")
         if self._docker("ps", "-aq", "--filter", selector) or self._docker("network", "ls", "-q", "--filter", selector):
             raise RuntimeError("仍有未清理的 Docker 旧资源")
-
-    @staticmethod
-    def _network_target(host: str, port: int) -> tuple[str, int]:
-        if not isinstance(host, str) or type(port) is not int or port not in {80, 443}:
-            raise ValueError("网络授权目标无效")
-        rules = normalize_allow_domains(host)
-        if len(rules) != 1 or rules[0].startswith("*."):
-            raise ValueError("网络授权域名无效")
-        return rules[0], port
-
-    def network_events(self, info: SandboxInfo) -> list[dict]:
-        raw = self._docker("exec", info.proxy_id, "python", "-c", _NETWORK_EVENTS)
-        events = json.loads(raw)
-        if not isinstance(events, list):
-            raise RuntimeError("代理返回的网络事件无效")
-        valid = []
-        for event in events:
-            if not isinstance(event, dict) or not isinstance(event.get("request_id"), str):
-                raise RuntimeError("代理返回的网络事件无效")
-            try:
-                uuid.UUID(event["request_id"])
-            except ValueError as exc:
-                raise RuntimeError("代理返回的网络事件无效") from exc
-            try:
-                event["host"], event["port"] = self._network_target(event.get("host"), event.get("port"))
-                method = event.get("method")
-                if not isinstance(method, str) or not re.fullmatch(r"[A-Z0-9!#$%&'*+.^_`|~-]{1,32}", method):
-                    raise ValueError("网络请求方式无效")
-            except (TypeError, ValueError):
-                self.decide_network_event(info, event["request_id"], "deny")
-                continue
-            valid.append(event)
-        return valid
-
-    def acknowledge_network_event(self, info: SandboxInfo, request_id: str) -> None:
-        uuid.UUID(request_id)
-        self._docker("exec", info.proxy_id, "python", "-c", _ACK_NETWORK_EVENT, request_id)
-
-    def decide_network_event(self, info: SandboxInfo, request_id: str, decision: str) -> None:
-        uuid.UUID(request_id)
-        if decision not in {"deny", "allow_temporary", "allow_sandbox"}:
-            raise ValueError("网络审批选项无效")
-        self._docker("exec", info.proxy_id, "python", _PROXY_SCRIPT, "decide", request_id, decision, "--ttl", "300")
-
-    def seed_network_grants(self, info: SandboxInfo, grants: list[tuple[str, int, float | None]]) -> None:
-        values = []
-        for host, port, expiry in grants:
-            host, port = self._network_target(host, port)
-            if expiry is not None:
-                if type(expiry) not in {int, float} or not math.isfinite(expiry):
-                    raise ValueError("网络授权期限无效")
-                if expiry <= time.time():
-                    continue
-            values.append((host, port, expiry))
-        if values:
-            self._docker("exec", "-i", info.proxy_id, "python", "-c", _SEED_NETWORK_GRANTS,
-                         input_text=json.dumps(values, ensure_ascii=True))

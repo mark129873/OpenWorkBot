@@ -1,7 +1,13 @@
 from abc import ABC, abstractmethod
 
+from app.sandbox.search import GrepMatch
+
 
 class Sandbox(ABC):
+    artifact_root: str | None = None
+    persistent_shell_sessions: bool | None = None
+    supports_command_cancellation = False
+
     def __init__(self, sandbox_id: str) -> None:
         self._id = sandbox_id
 
@@ -30,6 +36,24 @@ class Sandbox(ABC):
         raise NotImplementedError
 
     @abstractmethod
+    def download_file(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        raise NotImplementedError
+
+    @abstractmethod
+    def list_dir(self, path: str, max_depth: int = 2) -> list[str]:
+        raise NotImplementedError
+
+    @abstractmethod
     def glob(self, path: str, pattern: str, *, include_dirs: bool = False,
              max_results: int = 200) -> tuple[list[str], bool]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def grep(self, path: str, pattern: str, *, glob: str | None = None,
+             literal: bool = False, case_sensitive: bool = False,
+             max_results: int = 100) -> tuple[list[GrepMatch], bool]:
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_file(self, path: str, content: bytes) -> None:
         raise NotImplementedError

@@ -13,13 +13,6 @@
   },
   "features": [
     {
-      "id": "Backend-08",
-      "name": "多用户 Gateway 与长期记忆改造",
-      "description": "保留主 Agent、后台 Worker 和通信架构，增加用户隔离、SQLite 检查点、本地沙箱和长期记忆。",
-      "status": "passing",
-      "evidence": "后端全量 239 项通过、6 项按环境跳过；摘要与事实提示词变更后记忆专项 20 项通过。未调用真实模型或模拟真实断电。"
-    },
-    {
       "id": "Backend-01",
       "name": "后台多助手协作",
       "description": "主助手首轮意图和动作、直接执行、后台调度、授权与恢复。",
@@ -95,6 +88,20 @@
       "description": "结构化解析、保守清洗及 500/50 字符结构切块。",
       "status": "in_progress",
       "evidence": "隔离全量 119 项及重建失败专项 1 项曾通过；真实新索引导入 100 份 PDF、1,277 块。v2 50 题文档 Recall@5=1、NDCG@5=0.8778；不代表条款完整或复杂题效果。"
+    },
+    {
+      "id": "Backend-08",
+      "name": "多用户 Gateway 与长期记忆改造",
+      "description": "保留主 Agent、后台 Worker 和通信架构，增加用户隔离、SQLite 检查点、本地沙箱和长期记忆。",
+      "status": "passing",
+      "evidence": "后端全量 239 项通过、6 项按环境跳过；摘要与事实提示词变更后记忆专项 20 项通过。未调用真实模型或模拟真实断电。"
+    },
+    {
+      "id": "Backend-09",
+      "name": "DeerFlow AIO 沙箱接口对齐",
+      "description": "每用户共享容器、静态网络 deny、AIO 文件与命令接口；删除旧会话链路。",
+      "status": "passing",
+      "evidence": "隔离空库后端 233 项、父目录专项 2 项、Docker 专项 2 项通过；前端 2 项及构建、lint 通过。白名单实测可访问，写前读取失败沿用 DeerFlow 放行；未调用真实模型。"
     }
   ]
 }

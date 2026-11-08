@@ -1,7 +1,5 @@
-import { Suspense, lazy, useState } from 'react'
-import { CaretRight, CheckCircle, Circle, CircleHalf, FileText, ListChecks, TerminalWindow } from '@phosphor-icons/react'
-
-import type { TodoItem, WorkItem } from '../types'
+import { Suspense, lazy } from 'react'
+import { FileText } from '@phosphor-icons/react'
 
 const LazyMarkdown = lazy(() => import('./Markdown'))
 
@@ -14,25 +12,6 @@ export function MarkdownWithCopy({ text, streaming = false, onRegenerate }: { te
   )
 }
 
-const TOOL_STATUS_WORD: Record<string, string> = {
-  pending: '等待中',
-  running: '执行中',
-  completed: '已执行',
-  failed: '执行失败',
-  denied: '已拒绝',
-  stopped: '已停止',
-}
-
-function inputSummary(input: unknown): string {
-  if (input == null) return ''
-  if (typeof input === 'string') return input
-  try {
-    return JSON.stringify(input)
-  } catch {
-    return String(input)
-  }
-}
-
 export function UserBubble({ text, attachments = [] }: { text: string; attachments?: { id: string; name: string; path: string }[] }) {
   return (
     <div className="flex justify-end">
@@ -42,104 +21,6 @@ export function UserBubble({ text, attachments = [] }: { text: string; attachmen
           <FileText size={16} aria-hidden="true" /><span>{item.name}</span>
         </div>)}
       </div>
-    </div>
-  )
-}
-
-export function TodoCard({ items }: { items: TodoItem[] }) {
-  const icons = { pending: Circle, in_progress: CircleHalf, completed: CheckCircle }
-  const words = { pending: '待办', in_progress: '进行中', completed: '已完成' }
-  const color = {
-    pending: 'text-zinc-500',
-    in_progress: 'text-accent-700',
-    completed: 'text-accent-700',
-  } as const
-  return (
-    <div className="rounded-xl border border-zinc-200/80 bg-white px-4 py-3">
-      <p className="mb-3 flex items-center gap-2 text-[12px] font-semibold text-zinc-600"><ListChecks size={16} />任务板<span className="font-num ml-auto font-normal">{items.filter(x => x.status === 'completed').length}/{items.length}</span></p>
-      <ul className="space-y-2.5">
-        {items.map((it, i) => {
-          const Icon = icons[it.status]
-          return <li key={i} className="flex items-start gap-2.5 text-[13px] leading-5">
-            <Icon size={17} className={`mt-0.5 shrink-0 ${color[it.status]}`} aria-label={words[it.status]} />
-            <span className={it.status === 'completed' ? 'text-zinc-500 line-through' : 'text-zinc-700'}>
-              {it.content}
-            </span>
-          </li>
-        })}
-      </ul>
-    </div>
-  )
-}
-
-export function ErrorCard({ message, onRetry }: { message: string; onRetry?: () => void }) {
-  return (
-    <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2">
-      <p className="text-[13px] text-red-700">出错了：{message}</p>
-      {onRetry && (
-        <button
-          type="button"
-          onClick={onRetry}
-          className="mt-1.5 rounded border border-red-300 px-2 py-0.5 text-xs text-red-700 transition hover:bg-red-100"
-        >
-          重试
-        </button>
-      )}
-    </div>
-  )
-}
-
-export function ToolCallCard({
-  item,
-}: {
-  item: Extract<WorkItem, { kind: 'tool_call' }>
-}) {
-  const [open, setOpen] = useState(false)
-  const running = item.status === 'running' || item.status === 'pending'
-  const statusWord = TOOL_STATUS_WORD[item.status] ?? item.status
-
-  return (
-    <div className="overflow-hidden rounded-xl border border-zinc-200/80 bg-white">
-      <button
-        type="button"
-        onClick={() => setOpen(!open)}
-        className="flex w-full items-center gap-2.5 px-3 py-3 text-left hover:bg-zinc-50"
-        aria-expanded={open}
-      >
-        {item.name === 'bash' ? <TerminalWindow size={17} className="shrink-0 text-zinc-500" /> : <FileText size={17} className="shrink-0 text-zinc-500" />}
-        <span className={`font-mono text-[12px] font-medium ${running ? 'text-accent-700' : 'text-zinc-700'}`}>
-          {item.name}
-        </span>
-        <span className="min-w-0 flex-1 truncate text-[12px] text-zinc-500">
-          {inputSummary(item.input)}
-        </span>
-        <span
-          className={`shrink-0 text-[11px] ${
-            item.status === 'failed'
-              ? 'text-red-600'
-              : item.status === 'denied'
-                ? 'text-amber-700'
-                : running
-                  ? 'text-accent-700'
-                  : 'text-accent-700'
-          }`}
-        >
-          {statusWord}
-        </span>
-        <CaretRight size={14} className={`shrink-0 text-zinc-500 transition ${open ? 'rotate-90' : ''}`} />
-      </button>
-      {open && (
-        <div className="border-t border-zinc-100 px-3 py-2">
-          <pre className="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded bg-zinc-50 p-2 text-[12px] text-zinc-600">
-            {JSON.stringify(item.input ?? {}, null, 2)}
-          </pre>
-          {item.output && (
-            <pre className="mt-2 max-h-64 overflow-auto whitespace-pre-wrap break-all rounded-lg bg-zinc-50 p-3 text-[12px] leading-6 text-zinc-700">
-              {item.output}
-            </pre>
-          )}
-        </div>
-      )}
     </div>
   )
 }

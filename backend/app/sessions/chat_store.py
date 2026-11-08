@@ -72,6 +72,22 @@ def clear(db) -> None:
     db.execute(delete(TurnUsage).where(TurnUsage.session_id == session_id))
 
 
+def replace_todos(db, session_id: str, items: list[dict], *, commit: bool = True) -> None:
+    try:
+        db.execute(delete(Todo).where(Todo.session_id == session_id))
+        now = now_ms()
+        db.add_all([Todo(session_id=session_id, position=i, content=item["content"], status=item["status"],
+                         time_created=now, time_updated=now) for i, item in enumerate(items)])
+        row = db.get(Session, session_id)
+        if row is not None:
+            row.time_updated = now
+        if commit:
+            db.commit()
+    except Exception:
+        db.rollback()
+        raise
+
+
 def get(db, key: str) -> dict | None:
     row = db.get(Part, scoped(key))
     return read(row) if row else None

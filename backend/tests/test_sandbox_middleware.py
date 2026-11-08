@@ -1,5 +1,6 @@
 import asyncio
 
+import pytest
 from langchain.agents import create_agent
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage
@@ -36,10 +37,16 @@ async def read_file(path: str) -> str:
     return path
 
 
+@tool("read_file")
+def read_file_sync(path: str) -> str:
+    """Read a test file."""
+    return path
+
+
 def test_langgraph_tool_lifecycle_acquires_and_releases_sandbox():
     async def run():
         provider = Provider()
-        middleware = SandboxMiddleware(SandboxLeaseManager(provider))
+        middleware = SandboxMiddleware(leases=SandboxLeaseManager(provider))
         context = {"user_id": require_user(), "thread_id": "thread", "owner_id": "run"}
         graph = create_agent(Model(), [read_file], middleware=[middleware])
         try:
@@ -51,3 +58,20 @@ def test_langgraph_tool_lifecycle_acquires_and_releases_sandbox():
         finally:
             await middleware.release(context)
     asyncio.run(run())
+
+
+@pytest.mark.parametrize("lazy_init", [True, False])
+def test_synchronous_middleware_acquires_and_releases(lazy_init):
+    provider = Provider()
+    middleware = SandboxMiddleware(lazy_init=lazy_init, leases=SandboxLeaseManager(provider))
+    context = {"user_id": require_user(), "thread_id": "thread", "owner_id": "run"}
+    graph = create_agent(Model(), [read_file_sync], middleware=[middleware])
+    result = graph.invoke({"messages": [("user", "读取文件")]}, context=context)
+    assert result["messages"][-1].content == "完成"
+    assert provider.acquired == [("thread", require_user())]
+    assert provider.released == [f"sandbox-{require_user()}"]
+
+
+def test_middleware_rejects_per_agent_skill_isolation():
+    with pytest.raises(ValueError, match="共享"):
+        SandboxMiddleware(available_skills={"one"})

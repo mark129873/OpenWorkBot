@@ -32,9 +32,13 @@ class RecordingSandbox(FakeSandbox):
     def request_command_cancel(self, scope_id):
         self.stopped.set()
 
-    def file_operation(self, name, args):
-        self.operations.append(name)
-        return super().file_operation(name, args)
+    def read_file(self, path, start_line=None, end_line=None):
+        self.operations.append("read_file")
+        return super().read_file(path, start_line, end_line)
+
+    def write_file(self, path, content, append=False):
+        self.operations.append("write_file")
+        return super().write_file(path, content, append)
 
 
 @pytest.fixture
@@ -130,13 +134,61 @@ def test_file_tools_use_the_sandbox_and_keep_versions(isolated_runtime):
         runtime, worker, sandbox = isolated_runtime
         execution_state.save_execution_state(settings.data_dir, "edit")
         try:
-            group_id, _ = await group(runtime, worker, "write_file", {"path": "test.txt", "content": "hello"})
+            path = "/mnt/user-data/workspace/nested/dir/test.txt"
+            group_id, _ = await group(runtime, worker, "write_file", {"path": path, "content": "hello"})
             await worker.process_group(group_id)
-            group_id, identity = await group(runtime, worker, "read_file", {"path": "test.txt"})
+            group_id, identity = await group(runtime, worker, "read_file", {"path": path})
             await worker.process_group(group_id)
-            assert sandbox.operations == ["version", "write_file", "version", "version", "read_file", "version"]
+            assert sandbox.operations.count("write_file") == 1 and sandbox.operations.count("read_file") >= 2
             with db.new_session() as session:
                 assert "hello" in store.get(session, f"execution:{identity}")["output"]
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_existing_file_requires_reread_between_writes(isolated_runtime):
+    async def run():
+        runtime, worker, sandbox = isolated_runtime
+        execution_state.save_execution_state(settings.data_dir, "edit")
+        path = "/mnt/user-data/workspace/versioned.txt"
+
+        async def call(name, args):
+            group_id, identity = await group(runtime, worker, name, args)
+            await worker.process_group(group_id)
+            with db.new_session() as session:
+                return store.get(session, f"execution:{identity}")["output"]
+
+        try:
+            assert await call("write_file", {"path": path, "content": "old old"}) == "OK"
+            assert "先读取" in await call("write_file", {"path": path, "content": "blocked"})
+            assert "old old" in await call("read_file", {"path": path})
+            assert await call("str_replace", {"path": path, "old_str": "old", "new_str": "new"}) == "OK"
+            assert sandbox.read_file(path) == "new old"
+            assert "先读取" in await call("write_file", {"path": path, "content": "!", "append": True})
+            assert "new old" in await call("read_file", {"path": path})
+            assert await call("write_file", {"path": path, "content": "! old", "append": True}) == "OK"
+            assert sandbox.read_file(path) == "new old! old"
+            assert "new old! old" in await call("read_file", {"path": path})
+            assert await call("str_replace", {"path": path, "old_str": "old", "new_str": "NEW", "replace_all": True}) == "OK"
+            assert sandbox.read_file(path) == "new NEW! NEW"
+        finally:
+            await runtime.close()
+    asyncio.run(run())
+
+
+def test_write_guard_matches_deerflow_uninspectable_content(isolated_runtime):
+    async def run():
+        runtime, worker, sandbox = isolated_runtime
+        execution_state.save_execution_state(settings.data_dir, "edit")
+        path = "/mnt/user-data/workspace/error-prefix.txt"
+        sandbox.write_file(path, "Error: existing content")
+        try:
+            group_id, identity = await group(runtime, worker, "write_file", {"path": path, "content": "replaced"})
+            await worker.process_group(group_id)
+            with db.new_session() as session:
+                assert store.get(session, f"execution:{identity}")["output"] == "OK"
+            assert sandbox.read_file(path) == "replaced"
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -262,24 +314,24 @@ def test_cancelled_file_operation_keeps_lease_until_thread_finishes(isolated_run
     async def run():
         runtime, worker, sandbox = isolated_runtime
         started, finish = threading.Event(), threading.Event()
-        original = sandbox.file_operation
+        original = sandbox.read_file
         provider = runtime.agent_loop.sandbox_middleware.leases.provider
         release = provider.release
         released = []
 
-        def slow(name, args):
+        def slow(*args, **kwargs):
             started.set()
             assert finish.wait(5)
-            return original(name, args)
+            return original(*args, **kwargs)
 
         def record_release(sandbox_id):
             released.append(sandbox_id)
             release(sandbox_id)
 
-        monkeypatch.setattr(sandbox, "file_operation", slow)
+        monkeypatch.setattr(sandbox, "read_file", slow)
         monkeypatch.setattr(provider, "release", record_release)
         try:
-            group_id, _ = await group(runtime, worker, "read_file", {"path": "missing.txt"})
+            group_id, _ = await group(runtime, worker, "read_file", {"path": "/mnt/user-data/workspace/missing.txt"})
             operation = asyncio.create_task(worker.process_group(group_id))
             assert await asyncio.to_thread(started.wait, 5)
             operation.cancel()

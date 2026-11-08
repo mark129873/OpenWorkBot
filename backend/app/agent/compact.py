@@ -1,14 +1,5 @@
 import asyncio
-import logging
 from copy import deepcopy
-from typing import AsyncIterator
-
-from sqlalchemy import func, select
-
-from app.models import Message, Part
-from app.sessions import store
-
-logger = logging.getLogger(__name__)
 
 _MICRO_PLACEHOLDER = "[旧工具结果已清除以节省上下文]"
 
@@ -64,32 +55,6 @@ def is_context_limit_error(exc: Exception) -> bool:
         "prompt is too long", "prompt too long", "prompt_too_long",
         "context_length_exceeded", "maximum context length", "input is too long",
     ))
-
-
-def microcompact_parts(db, session_id: str, keep: int, *, before_sequence: int | None = None) -> int:
-    """替换旧工具输出，保留顺序与最近完整结果。"""
-    query = select(Part).where(
-        Part.session_id == session_id, func.json_extract(Part.data, "$.type") == "tool")
-    if before_sequence is not None:
-        query = query.join(Message, Part.message_id == Message.id).where(Message.sequence < before_sequence)
-    parts = list(db.execute(query.order_by(Part.time_updated.asc())).scalars())
-    candidates = [p for p in parts if _has_output(p)]
-    to_clear = candidates[:-keep] if keep > 0 else candidates
-    changed = 0
-    for part in to_clear:
-        data = store._load(part.data)
-        key = "error" if data["state"]["status"] == "error" else "output"
-        data["state"][key] = _MICRO_PLACEHOLDER
-        part.data = store._dump(data)
-        changed += 1
-    if changed:
-        db.commit()
-    return changed
-
-
-def _has_output(part: Part) -> bool:
-    data = store.part_data(part)
-    return bool(data.get("output")) and data.get("output") != _MICRO_PLACEHOLDER
 
 
 def build_transcript(history: list) -> str:
@@ -191,62 +156,3 @@ async def context_history(runtime, context_id: str) -> list:
             "type": "agent_summary", "context_id": context_id, "boundary_id": boundary_id, "summary": summary}))
 
     return await prepare_history(runtime.client, messages, settings, on_summary=save_summary)
-
-
-async def maybe_compact(deps, *, force: bool = False) -> AsyncIterator[dict]:
-    """仅压缩旧轮前缀，保留活跃轮及工具配对。"""
-    settings, history = deps.settings, deps.history
-    active_start = getattr(deps, "active_history_start", None)
-    if active_start is None:
-        active_start = max(0, len(history) - 1)
-    if not force and not needs_compact(settings, history, deps.last_input_tokens,
-                                      getattr(deps, "measured_history_tokens", None)):
-        return
-    if active_start <= 0:
-        return  # 当前轮过大且无安全前缀时失败，不硬截断。
-    session_id = deps.recorder.session_id
-    cutoff = deps.recorder.first_user_sequence - 1
-
-    # 仅按 callID 替换旧前缀，保留未落库活跃历史。
-    cleared = microcompact_parts(deps.recorder.db, session_id, settings.microcompact_keep,
-                                 before_sequence=cutoff + 1)
-    if cleared:
-        cleared_ids = set()
-        parts = deps.recorder.db.scalars(select(Part).where(Part.session_id == session_id)).all()
-        for part in parts:
-            data = store.part_data(part)
-            if data.get("output") == _MICRO_PLACEHOLDER:
-                cleared_ids.add(data.get("tool_call_id"))
-        for message in history[:active_start]:
-            if isinstance(message.get("content"), list):
-                for block in message["content"]:
-                    if block.get("type") == "tool_result" and block.get("tool_use_id") in cleared_ids:
-                        block["content"] = _MICRO_PLACEHOLDER
-        deps.last_input_tokens = None
-        deps.measured_history_tokens = None
-    if not force and not needs_compact(settings, history, deps.last_input_tokens,
-                                      getattr(deps, "measured_history_tokens", None)):
-        return
-    # 摘要失败时保持原历史与边界。
-    prior = deepcopy(history[:active_start])
-    tokens_before = estimate_history_tokens(history)
-    try:
-        summary_text = await asyncio.wait_for(summarize_history(deps.client, prior), timeout=120)
-        if not isinstance(summary_text, str) or not summary_text.strip():
-            raise ValueError("摘要为空，保留原上下文")
-        summary_text = summary_text.strip()
-        summary = {"role": "user", "content": f"<此前对话摘要>\n{summary_text}\n</此前对话摘要>"}
-        if estimate_history_tokens([summary]) >= estimate_history_tokens(prior):
-            raise ValueError("摘要未缩短上下文，保留原历史")
-    except Exception as exc:
-        logger.warning("compact 摘要失败: %s", exc)
-        return
-
-    store.save_compaction(deps.recorder.db, session_id, deps.recorder.turn_id,
-                          cutoff, summary_text, tokens_before, estimate_tokens(summary_text))
-    deps.history[:] = [summary, *history[active_start:]]
-    deps.active_history_start = 1
-    deps.last_input_tokens = None
-    deps.measured_history_tokens = None
-    yield {"type": "compacted", "tokens_before": tokens_before,
-           "tokens_after": estimate_history_tokens(deps.history)}

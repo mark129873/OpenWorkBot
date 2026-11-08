@@ -1,6 +1,8 @@
+import base64
+import errno
 import json
 import math
-import os
+import re
 import shlex
 import threading
 import time
@@ -9,9 +11,11 @@ from dataclasses import dataclass, field
 
 import httpx
 from agent_sandbox import Sandbox as AioClient
+from pydantic import ValidationError
 
 from app.community.aio_sandbox.sandbox_info import SandboxInfo
 from app.sandbox.sandbox import Sandbox
+from app.sandbox.search import GrepMatch, ignored, path_matches
 
 
 _REQUEST = {"timeout_in_seconds": 5, "max_retries": 0}
@@ -33,6 +37,7 @@ class CommandResult:
 @dataclass
 class _Scope:
     token: str = field(default_factory=lambda: uuid.uuid4().hex)
+    tokens: set[str] = field(default_factory=set)
     session_id: str | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
     cancelled: threading.Event = field(default_factory=threading.Event)
@@ -47,12 +52,15 @@ def _preview(text: str) -> str:
 
 
 class AioSandbox(Sandbox):
+    artifact_root = "/mnt/user-data"
+    persistent_shell_sessions = True
+    supports_command_cancellation = True
+
     def __init__(self, info: SandboxInfo, *, on_uncertain=None) -> None:
         super().__init__(info.sandbox_id)
         self.info = info
         self._http = httpx.Client(trust_env=False, timeout=30)
-        self._client = AioClient(base_url=info.sandbox_url,
-                                 headers={"X-DeerFlow-Relay-Token": info.relay_token}, httpx_client=self._http)
+        self._client = AioClient(base_url=info.sandbox_url, headers=info.request_headers, httpx_client=self._http)
         self._on_uncertain = on_uncertain
         self._lock = threading.RLock()
         self._scopes: dict[str, _Scope] = {}
@@ -106,8 +114,10 @@ class AioSandbox(Sandbox):
                                         timeout: float | None = None, *, scope_id: str | None = None) -> CommandResult:
         if not isinstance(command, str) or not command.strip():
             raise ValueError("命令不能为空")
-        if env:
-            raise ValueError("当前沙箱命令不接受额外环境变量")
+        if env is not None and (not isinstance(env, dict) or any(
+                not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                or not isinstance(value, str) or "\0" in value for key, value in env.items())):
+            raise ValueError("环境变量无效")
         if timeout is not None and (type(timeout) not in {int, float} or not math.isfinite(timeout) or timeout <= 0):
             raise ValueError("命令超时无效")
         duration = float(120 if timeout is None else timeout)
@@ -115,8 +125,11 @@ class AioSandbox(Sandbox):
         with scope.lock:
             if scope.cancelled.is_set():
                 return CommandResult("", "cancelled", None)
+            if env:
+                return self._execute_extra_env(command, env, duration, scope)
             session_id = self._shell_session(scope)
-            prepared = f"export OPENWORKBOT_SCOPE_TOKEN={scope.token}; {command}"
+            scope.tokens.add(scope.token)
+            prepared = f"export OPENWORKBOT_SCOPE_{scope.token.upper()}=1; {command}"
             try:
                 result = self._client.shell.exec_command(id=session_id, command=prepared, async_mode=True,
                                                          hard_timeout=duration,
@@ -153,6 +166,69 @@ class AioSandbox(Sandbox):
                 self._uncertain("命令执行结果未知")
                 return CommandResult("", "unknown", None)
 
+    def _execute_extra_env(self, command: str, env: dict[str, str], duration: float, scope: _Scope) -> CommandResult:
+        token = scope.token
+        while f"OPENWORKBOT_SCOPE_{token.upper()}" in env:
+            token = uuid.uuid4().hex
+        scope.tokens.add(token)
+        variables = {**env, f"OPENWORKBOT_SCOPE_{token.upper()}": "1"}
+        session_id = str(uuid.uuid4())
+        created = False
+        result = CommandResult("", "unknown", None)
+        try:
+            session = self._client.bash.create_session(session_id=session_id, exec_dir="/mnt/user-data/workspace",
+                                                       request_options=_REQUEST)
+            if not session.success or not session.data or session.data.session_id != session_id:
+                raise RuntimeError("沙箱临时会话创建失败")
+            created = True
+            execution = self._client.bash.exec(session_id=session_id, command=command, env=variables,
+                                               async_mode=True, hard_timeout=duration, request_options=_REQUEST)
+            if not execution.success or not execution.data or not execution.data.command_id:
+                raise RuntimeError("沙箱未确认命令受理")
+            command_id = execution.data.command_id
+            output, offset, error_offset = "", 0, 0
+            deadline = time.monotonic() + duration
+            while True:
+                if scope.cancelled.is_set() or time.monotonic() >= deadline:
+                    stopped = self._client.bash.kill(session_id=session_id, request_options=_REQUEST)
+                    if not stopped.success:
+                        raise RuntimeError("无法停止临时命令")
+                    self._stop_scope(scope)
+                    result = CommandResult(output, "cancelled" if scope.cancelled.is_set() else "timeout", None)
+                    break
+                response = self._client.bash.output(session_id=session_id, command_id=command_id,
+                                                    offset=offset, stderr_offset=error_offset,
+                                                    wait=True, wait_timeout=1, request_options=_REQUEST)
+                if not response.success or not response.data:
+                    raise RuntimeError("沙箱命令结果不可用")
+                data = response.data
+                output = _preview(output + (data.stdout or "") + (data.stderr or ""))
+                offset, error_offset = data.offset, data.stderr_offset
+                if data.command and data.command.status not in {"pending", "running"}:
+                    status = data.command.status
+                    exit_code = data.command.exit_code
+                    if status == "completed" and exit_code is not None:
+                        result = CommandResult(output, "completed", exit_code)
+                    elif status == "timed_out":
+                        self._stop_scope(scope)
+                        result = CommandResult(output, "timeout", exit_code)
+                    else:
+                        raise RuntimeError("沙箱命令状态不完整")
+                    break
+        except Exception:
+            self._uncertain("临时命令执行结果未知")
+            result = CommandResult("", "unknown", None)
+        finally:
+            if created:
+                try:
+                    closed = self._client.bash.close_session(session_id, request_options=_REQUEST)
+                    if not closed.success:
+                        raise RuntimeError("沙箱临时会话清理失败")
+                except Exception:
+                    self._uncertain("沙箱临时会话清理失败")
+                    result = CommandResult("", "unknown", None)
+        return result
+
     def request_command_cancel(self, scope_id: str) -> None:
         with self._lock:
             scope = self._scopes.get(scope_id)
@@ -175,9 +251,7 @@ class AioSandbox(Sandbox):
                 result = self._client.shell.kill_process(id=session_id, request_options=_REQUEST)
                 if not result.success:
                     raise RuntimeError("无法停止 shell")
-            response = self._bash_helper("python /opt/openworkbot-process-cleanup.py " + shlex.quote(scope.token), None)
-            if not response.get("ok"):
-                raise RuntimeError("不能确认残留进程已结束")
+            self._cleanup_scope_processes(scope)
             if session_id:
                 self._cleanup_shell_session(session_id)
         except Exception:
@@ -185,6 +259,12 @@ class AioSandbox(Sandbox):
             raise
         finally:
             scope.session_id = None
+
+    def _cleanup_scope_processes(self, scope: _Scope) -> None:
+        for token in scope.tokens:
+            response = self._bash_helper("python /opt/openworkbot-process-cleanup.py " + shlex.quote(token), None)
+            if not response.get("ok"):
+                raise RuntimeError("不能确认残留进程已结束")
 
     def _cleanup_shell_session(self, session_id: str) -> None:
         result = self._client.shell.cleanup_session(session_id, request_options=_REQUEST)
@@ -225,7 +305,7 @@ class AioSandbox(Sandbox):
                 if len(output) > 1024 * 1024 or len(error) > 30000:
                     raise RuntimeError("沙箱辅助程序输出异常")
                 offset, error_offset = data.offset, data.stderr_offset
-                if data.command and data.command.status != "running":
+                if data.command and data.command.status not in {"pending", "running"}:
                     if data.command.status != "completed" or data.command.exit_code != 0:
                         raise RuntimeError("沙箱辅助程序执行失败")
                     result = json.loads(output)
@@ -241,54 +321,123 @@ class AioSandbox(Sandbox):
                 result = self._client.bash.close_session(session_id, request_options=_REQUEST)
                 if not result.success:
                     raise RuntimeError("沙箱辅助会话清理失败")
-            except Exception:
+            except Exception as exc:
                 self._uncertain("沙箱辅助会话清理失败")
-
-    def file_operation(self, operation: str, args: dict) -> str:
-        if operation not in {"read_file", "write_file", "edit_file", "glob", "delete_file", "version"}:
-            raise ValueError("未知文件操作")
-        request = json.dumps({"operation": operation, "args": args, "windows_newline": os.name == "nt"},
-                             ensure_ascii=True) + "\n"
-        result = self._bash_helper("python /opt/openworkbot-file-ops.py", request)
-        if not result["ok"]:
-            return f"Error: {result.get('error', '文件操作失败')}"
-        if not isinstance(result.get("output"), str):
-            raise RuntimeError("沙箱文件操作返回无效结果")
-        return result["output"]
-
-    @staticmethod
-    def _workspace_path(path: str) -> str:
-        root = "/mnt/user-data/workspace"
-        if path == root:
-            return "."
-        if path.startswith(root + "/"):
-            return path[len(root) + 1:]
-        if path.startswith("/"):
-            raise ValueError("路径必须位于工作区内")
-        return path
+                raise RuntimeError("沙箱辅助会话清理失败") from exc
 
     def read_file(self, path: str, start_line: int | None = None, end_line: int | None = None) -> str:
-        offset = start_line or 1
-        limit = min(2000, end_line - offset + 1) if end_line is not None else 2000
-        return self.file_operation("read_file", {"path": self._workspace_path(path), "offset": offset, "limit": limit})
+        try:
+            kwargs = {}
+            if start_line is not None:
+                kwargs["start_line"] = max(start_line - 1, 0)
+            if end_line is not None:
+                kwargs["end_line"] = max(end_line, 0)
+            result = self._client.file.read_file(file=path, **kwargs)
+            return result.data.content if result.data else ""
+        except ValidationError:
+            return f"Error: file not found or unreadable: {path}"
+        except Exception as exc:
+            return f"Error: {exc}"
 
     def write_file(self, path: str, content: str, append: bool = False) -> None:
-        output = self.file_operation("write_file", {"path": self._workspace_path(path), "content": content,
-                                                    "append": append})
-        if output.startswith("Error:"):
-            raise OSError(output)
+        result = self._client.file.write_file(file=path, content=content, append=append)
+        if not result.success:
+            raise OSError("沙箱写入失败")
+
+    def download_file(self, path: str, *, max_bytes: int | None = None) -> bytes:
+        if max_bytes is not None and (type(max_bytes) is not int or max_bytes < 0):
+            raise ValueError("下载大小限制无效")
+        normal = path.replace("\\", "/")
+        if ".." in normal.split("/") or not (normal == "/mnt/user-data" or normal.startswith("/mnt/user-data/")):
+            raise PermissionError("下载路径必须位于 /mnt/user-data")
+        limit = min(max_bytes, 100 * 1024 * 1024) if max_bytes is not None else 100 * 1024 * 1024
+        chunks, size = [], 0
+        stream = None
+        try:
+            stream = self._client.file.download_file(path=path)
+            for chunk in stream:
+                size += len(chunk)
+                if size > limit:
+                    raise OSError(errno.EFBIG, "文件超过下载大小限制", path)
+                chunks.append(chunk)
+            return b"".join(chunks)
+        except OSError:
+            raise
+        except Exception as exc:
+            raise OSError(f"无法下载文件：{path}") from exc
+        finally:
+            if stream is not None and hasattr(stream, "close"):
+                stream.close()
+
+    def update_file(self, path: str, content: bytes) -> None:
+        result = self._client.file.write_file(file=path, content=base64.b64encode(content).decode(), encoding="base64")
+        if not result.success:
+            raise OSError("沙箱写入失败")
+
+    def real_path(self, path: str) -> str:
+        program = "import json,os,sys; print(json.dumps({'ok':True,'path':os.path.realpath(sys.argv[1])}))"
+        result = self._bash_helper(f"python -c {shlex.quote(program)} {shlex.quote(path)}", None)
+        resolved = result.get("path")
+        if not isinstance(resolved, str) or not resolved.startswith("/"):
+            raise OSError("沙箱路径解析失败")
+        return resolved
+
+    def list_dir(self, path: str, max_depth: int = 2) -> list[str]:
+        if type(max_depth) is not int or max_depth < 0:
+            raise ValueError("目录深度无效")
+        result = self._client.file.list_path(path=path, recursive=True, show_hidden=True, max_depth=max_depth)
+        if not result.success or not result.data:
+            raise OSError(f"无法列出目录：{path}")
+        entries = [entry.path for entry in result.data.files or [] if not ignored(entry.path, path)]
+        return [path, *[entry for entry in entries if entry != path]][:500]
 
     def glob(self, path: str, pattern: str, *, include_dirs: bool = False,
              max_results: int = 200) -> tuple[list[str], bool]:
-        if include_dirs:
-            raise ValueError("仅支持工作区内文件查找")
-        directory = self._workspace_path(path) if path else "."
-        prefix = "" if directory == "." else directory.rstrip("/") + "/"
-        output = self.file_operation("glob", {"pattern": prefix + pattern})
-        if output.startswith("Error:"):
-            raise OSError(output)
-        lines = [] if output == "(无匹配文件)" else output.splitlines()
-        return lines[:max_results], len(lines) > max_results
+        root = path.rstrip("/") or "/"
+        if not include_dirs:
+            result = self._client.file.find_files(path=path, glob=pattern)
+            if not result.success:
+                raise OSError("沙箱文件搜索失败")
+            files = result.data.files if result.data and result.data.files else []
+            matches = [item for item in files if not ignored(item, root)]
+        else:
+            result = self._client.file.list_path(path=path, recursive=True, show_hidden=False)
+            if not result.success:
+                raise OSError("沙箱文件搜索失败")
+            entries = result.data.files if result.data and result.data.files else []
+            prefix = "/" if root == "/" else root + "/"
+            matches = [entry.path for entry in entries if entry.path.startswith(prefix)
+                       and not ignored(entry.path, root) and path_matches(pattern, entry.path[len(prefix):])]
+        return matches[:max_results], len(matches) > max_results
+
+    def grep(self, path: str, pattern: str, *, glob: str | None = None, literal: bool = False,
+             case_sensitive: bool = False, max_results: int = 100) -> tuple[list[GrepMatch], bool]:
+        re.compile(re.escape(pattern) if literal else pattern, 0 if case_sensitive else re.IGNORECASE)
+        result = self._client.file.grep_files(path=path, pattern=pattern, case_insensitive=not case_sensitive,
+                                              fixed_strings=literal, max_results=max(max_results * 4, max_results + 50),
+                                              max_file_size="1M", recursive=True)
+        if not result.success:
+            raise OSError("沙箱内容搜索失败")
+        data = result.data
+        root = path.rstrip("/") or "/"
+        prefix = "/" if root == "/" else root + "/"
+        matches = []
+        for item in data.matches if data and data.matches else []:
+            if ignored(item.file, root):
+                continue
+            if item.file == root:
+                relative = item.file.rsplit("/", 1)[-1]
+            elif item.file.startswith(prefix):
+                relative = item.file[len(prefix):]
+            else:
+                continue
+            if glob is not None and not path_matches(glob, relative):
+                continue
+            line = item.line_content.rstrip("\r\n")
+            matches.append(GrepMatch(item.file, item.line_number, line if len(line) <= 200 else line[:197] + "..."))
+            if len(matches) > max_results:
+                return matches[:max_results], True
+        return matches, bool(data and data.truncated)
 
     def release_command_scope(self, scope_id: str) -> None:
         with self._lock:
@@ -296,12 +445,11 @@ class AioSandbox(Sandbox):
         if not scope:
             return
         with scope.lock:
-            if scope.session_id:
+            if scope.tokens or scope.session_id:
                 try:
-                    result = self._bash_helper("python /opt/openworkbot-process-cleanup.py " + shlex.quote(scope.token), None)
-                    if not result.get("ok"):
-                        raise RuntimeError("不能确认残留进程已结束")
-                    self._cleanup_shell_session(scope.session_id)
+                    self._cleanup_scope_processes(scope)
+                    if scope.session_id:
+                        self._cleanup_shell_session(scope.session_id)
                 except Exception:
                     self._uncertain("无法确认残留进程已结束")
                     raise
