@@ -108,7 +108,7 @@
       "name": "助手内部 TODO",
       "description": "各助手使用独立 LangGraph state，模型按复杂度判断使用 write_todos。",
       "status": "passing",
-      "evidence": "提示词调整后隔离专项 5 项通过；此前覆盖 SQLite 持久化、用户重置及混合调用。未调用真实模型，异常重启恢复尚未设计。"
+      "evidence": "采用新提示词后隔离专项 5 项通过；此前覆盖 SQLite 持久化、用户重置及混合调用。未调用真实模型，异常重启恢复尚未设计。"
     }
   ]
 }
