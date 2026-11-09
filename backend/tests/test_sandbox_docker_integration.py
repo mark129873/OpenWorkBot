@@ -6,7 +6,6 @@ import pytest
 
 from app import db
 from app.agent.runtime import Runtime
-from app.agent.skills import SKILLS_DIR
 from app.agent.worker import Worker
 from app.community.aio_sandbox.aio_sandbox_provider import AioSandboxProvider
 from app.community.aio_sandbox.local_backend import LocalContainerBackend
@@ -20,7 +19,7 @@ from test_sandbox_runtime import group
 
 @pytest.mark.skipif(os.environ.get("OPENWORKBOT_DOCKER_TEST") != "1", reason="需要专用 Docker 验证")
 def test_real_quiet_command_uses_aio_timeout(tmp_path):
-    backend = LocalContainerBackend(tmp_path / "data", tmp_path / "workspaces", SKILLS_DIR)
+    backend = LocalContainerBackend(tmp_path / "data", tmp_path / "workspaces", settings.user_skills_dir)
     provider = AioSandboxProvider(backend, tmp_path / "data")
     user = require_user()
     sandbox_id = None
@@ -53,9 +52,13 @@ def test_real_sandbox_files_commands_and_network_allowlist(tmp_path, monkeypatch
     monkeypatch.setattr(settings, "workspaces_dir", tmp_path / "workspaces")
     monkeypatch.setattr(settings, "modelio_dir", tmp_path / "logs")
     monkeypatch.setattr(settings, "bash_timeout", 30)
+    for user, name in (("a" * 32, "alice-only"), ("b" * 32, "bob-only")):
+        directory = settings.user_skills_dir / user / name / "scripts"
+        directory.mkdir(parents=True)
+        (directory / "marker.txt").write_text(name, encoding="utf-8")
     db.dispose_engine()
     db.init_db(settings.data_dir)
-    backend = LocalContainerBackend(settings.data_dir, settings.workspaces_dir, SKILLS_DIR)
+    backend = LocalContainerBackend(settings.data_dir, settings.workspaces_dir, settings.user_skills_dir)
     provider = AioSandboxProvider(backend, settings.data_dir, idle_timeout=0)
 
     async def run():
@@ -78,6 +81,10 @@ def test_real_sandbox_files_commands_and_network_allowlist(tmp_path, monkeypatch
                 with db.new_session() as session:
                     return store.get(session, f"execution:{identity}")["output"]
 
+            alice_skill = "/mnt/skills/alice-only/scripts/marker.txt"
+            assert "alice-only" in await call("read_file", {"path": alice_skill})
+            assert "alice-only" in await call("bash", {"command": f"cat {alice_skill}"})
+            assert (await call("write_file", {"path": "/mnt/skills/new.txt", "content": "no"})).startswith("Error:")
             path = "/mnt/user-data/workspace/真实测试.txt"
             assert "OK" in await call("write_file", {"path": path, "content": "内容"})
             nested = "/mnt/user-data/workspace/missing-parent/file.txt"
@@ -107,6 +114,15 @@ def test_real_sandbox_files_commands_and_network_allowlist(tmp_path, monkeypatch
                     await other_worker.process_group(other_group)
                     with db.new_session() as session:
                         assert store.get(session, f"execution:{other_identity}")["output"].startswith("Error:")
+                    other_group, other_identity = await group(other, other_worker, "read_file", {"path": alice_skill})
+                    await other_worker.process_group(other_group)
+                    with db.new_session() as session:
+                        assert store.get(session, f"execution:{other_identity}")["output"].startswith("Error:")
+                    other_group, other_identity = await group(other, other_worker, "read_file", {
+                        "path": "/mnt/skills/bob-only/scripts/marker.txt"})
+                    await other_worker.process_group(other_group)
+                    with db.new_session() as session:
+                        assert "bob-only" in store.get(session, f"execution:{other_identity}")["output"]
                     assert other.direct_sandboxes[other_task["id"]]["sandbox_id"] != first_sandbox
                 finally:
                     await other.close()

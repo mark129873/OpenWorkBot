@@ -14,6 +14,7 @@ from urllib.parse import urlparse
 
 import httpx
 
+from app.agent.skills import user_skills_path
 from app.community.aio_sandbox.backend import SandboxBackend
 from app.community.aio_sandbox.sandbox_info import SandboxInfo
 from app.config import DEFAULT_SANDBOX_ALLOW_DOMAINS
@@ -159,8 +160,8 @@ class LocalContainerBackend(SandboxBackend):
         if extra_mounts:
             raise ValueError("不支持额外挂载")
         workspace = self._workspace(user_id)
-        if not self.skills_dir.is_dir():
-            raise RuntimeError("技能目录不存在")
+        skills = user_skills_path(user_id, self.skills_dir)
+        skills.mkdir(parents=True, exist_ok=True)
         process_helper = Path(__file__).with_name("process_cleanup.py").resolve()
         if not process_helper.is_file():
             raise RuntimeError("沙箱受控程序不存在")
@@ -212,7 +213,7 @@ class LocalContainerBackend(SandboxBackend):
                                    "--cap-add=SETGID", "--cap-add=DAC_OVERRIDE", "--security-opt", "no-new-privileges",
                                    "--security-opt", "seccomp=unconfined", "--memory", "1g", "--cpus", "1",
                                    "--pids-limit", "512", "--mount", self._mount(workspace, "/mnt/user-data/workspace"),
-                                   "--mount", self._mount(self.skills_dir, "/mnt/skills", True),
+                                   "--mount", self._mount(skills, "/mnt/skills", True),
                                    "--mount", self._mount(process_helper, "/opt/openworkbot-process-cleanup.py", True),
                                    *(part for key, value in environment.items() for part in ("-e", f"{key}={value}")),
                                    AIO_IMAGE)

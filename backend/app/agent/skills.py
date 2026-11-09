@@ -1,11 +1,39 @@
 import json
+import re
+import shutil
+import tempfile
 from pathlib import Path, PureWindowsPath
 
 import yaml
 
-from app.config import BACKEND_ROOT
+from app.config import BACKEND_ROOT, settings
+from app.user_context import require_user
 
-SKILLS_DIR = BACKEND_ROOT / "skills"
+SKILL_TEMPLATE = BACKEND_ROOT / "skills" / "code-review"
+
+
+def user_skills_path(user_id: str, root: Path | None = None) -> Path:
+    if not isinstance(user_id, str) or not re.fullmatch(r"(?:[0-9a-f]{32}|default)", user_id):
+        raise ValueError("用户身份无效")
+    parent = (root or settings.user_skills_dir).resolve()
+    target = parent / user_id
+    if target.is_symlink() or (hasattr(target, "is_junction") and target.is_junction()):
+        raise ValueError("用户技能目录不能是链接")
+    if target.resolve().parent != parent:
+        raise ValueError("用户技能目录无效")
+    return target
+
+
+def initialize_user_skills(user_id: str) -> None:
+    target = user_skills_path(user_id)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        raise FileExistsError("用户技能目录已存在")
+    with tempfile.TemporaryDirectory(prefix=".init-", dir=target.parent) as temporary:
+        staged = Path(temporary) / user_id
+        staged.mkdir()
+        shutil.copytree(SKILL_TEMPLATE, staged / "code-review")
+        staged.rename(target)
 
 
 def _valid_name(name: object) -> bool:
@@ -15,11 +43,11 @@ def _valid_name(name: object) -> bool:
 
 
 def list_skills() -> list[dict[str, str]]:
-    if not SKILLS_DIR.is_dir():
+    root = user_skills_path(require_user())
+    if not root.is_dir():
         return []
     skills = []
-    root = SKILLS_DIR.resolve()
-    for manifest in sorted(SKILLS_DIR.glob("*/SKILL.md")):
+    for manifest in sorted(root.glob("*/SKILL.md")):
         try:
             directory = manifest.parent.resolve()
             if directory == root or not directory.is_relative_to(root) or not manifest.resolve().is_relative_to(directory):
@@ -66,7 +94,7 @@ def tool_load_skill(name: str, path: str | None = None, offset: int = 0) -> str:
     if type(offset) is not int or offset < 0:
         return "Error: offset 必须为非负整数"
     try:
-        root = SKILLS_DIR.resolve()
+        root = user_skills_path(require_user())
         directory = (root / name).resolve()
         manifest = (directory / "SKILL.md").resolve()
         if (directory == root or not directory.is_relative_to(root) or not manifest.is_relative_to(directory)

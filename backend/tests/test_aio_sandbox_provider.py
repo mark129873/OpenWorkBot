@@ -1,11 +1,14 @@
 import asyncio
+import csv
 import contextvars
 import threading
+from types import SimpleNamespace
 
 import pytest
 
 from app.community.aio_sandbox.aio_sandbox_provider import AioSandboxProvider
-from app.community.aio_sandbox.local_backend import LocalContainerBackend
+from app.community.aio_sandbox import local_backend
+from app.community.aio_sandbox.local_backend import AIO_IMAGE, LocalContainerBackend
 from app.community.aio_sandbox.sandbox_info import SandboxInfo
 from app.sandbox.lease import SandboxLeaseManager
 from app.user_context import bind_user, require_user
@@ -149,6 +152,46 @@ def test_default_workspace_and_extra_mount_boundary(tmp_path):
     assert backend._workspace("default") == tmp_path / "workspaces" / "default"
     with pytest.raises(ValueError, match="不支持额外挂载"):
         backend.create(None, "a" * 32, extra_mounts=[("host", "/other", True)], user_id=require_user())
+
+
+def test_sandbox_mounts_only_current_user_skills_readonly(tmp_path, monkeypatch):
+    root = tmp_path / "skills"
+    backend = LocalContainerBackend(tmp_path / "data", tmp_path / "workspaces", root)
+    calls = []
+
+    def docker(*args, **kwargs):
+        calls.append(args)
+        if args[0] == "port":
+            return "127.0.0.1:12345"
+        return "resource"
+
+    class Client:
+        def __init__(self, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def get(self, *args, **kwargs):
+            return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(backend, "_docker", docker)
+    monkeypatch.setattr(backend, "_check_engine", lambda: False)
+    monkeypatch.setattr(backend, "_ensure_image", lambda image: None)
+    monkeypatch.setattr(local_backend.httpx, "Client", Client)
+    for user in ("a" * 32, "b" * 32):
+        with bind_user(user):
+            backend.create("thread", user, user_id=user)
+    creations = [call for call in calls if call[0] == "create" and AIO_IMAGE in call]
+    assert len(creations) == 2
+    for call, user in zip(creations, ("a" * 32, "b" * 32)):
+        mounts = [next(csv.reader([call[index + 1]])) for index, value in enumerate(call) if value == "--mount"]
+        skill_mount = next(mount for mount in mounts if "dst=/mnt/skills" in mount)
+        assert f"src={(root / user).resolve()}" in skill_mount
+        assert "readonly" in skill_mount
 
 
 def test_shutdown_during_creation_cleans_new_resources(tmp_path, monkeypatch):

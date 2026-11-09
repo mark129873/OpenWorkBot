@@ -9,7 +9,10 @@ TEST_USER = "a" * 32
 
 @pytest.fixture(autouse=True)
 def isolated_user(tmp_path, monkeypatch):
+    monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
+    monkeypatch.setattr(settings, "modelio_dir", tmp_path / "modelio")
     monkeypatch.setattr(settings, "workspaces_dir", tmp_path)
+    monkeypatch.setattr(settings, "user_skills_dir", tmp_path / "user_skills")
     with bind_user(TEST_USER):
         yield
 

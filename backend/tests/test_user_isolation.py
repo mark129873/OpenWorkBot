@@ -345,6 +345,9 @@ def test_reset_deletes_only_current_users_data(tmp_path, monkeypatch):
                         {"configurable": {"thread_id": loop_thread}},
                         {"todos": [{"content": user_id[0], "status": "pending"}]})
                     (settings.workspaces_dir / user_id / "keep.txt").write_text("keep", encoding="utf-8")
+                    skill = settings.user_skills_dir / user_id / "private" / "SKILL.md"
+                    skill.parent.mkdir(parents=True)
+                    skill.write_text(user_id[0], encoding="utf-8")
                     log_dir = settings.modelio_dir / user_id
                     log_dir.mkdir(parents=True)
                     (log_dir / "model-io-main.jsonl").write_text("old", encoding="utf-8")
@@ -360,12 +363,14 @@ def test_reset_deletes_only_current_users_data(tmp_path, monkeypatch):
                 assert _read_files("a" * 32) == (empty_memory(), [])
                 assert not (settings.modelio_dir / ("a" * 32) / "model-io-main.jsonl").exists()
                 assert (settings.workspaces_dir / ("a" * 32) / "keep.txt").exists()
+                assert (settings.user_skills_dir / ("a" * 32) / "private" / "SKILL.md").read_text(encoding="utf-8") == "a"
                 assert await saver.aget_tuple({"configurable": {"thread_id": old_thread}}) is None
                 assert await saver.aget_tuple({"configurable": {"thread_id": old_loop}}) is None
             with bind_user("b" * 32):
                 assert (await runtimes[1].snapshot())["messages"][0]["text"] == "b"
                 assert _read_files("b" * 32)[1][0]["content"] == "b"
                 assert (settings.modelio_dir / ("b" * 32) / "model-io-main.jsonl").exists()
+                assert (settings.user_skills_dir / ("b" * 32) / "private" / "SKILL.md").read_text(encoding="utf-8") == "b"
                 loop_thread = runtimes[1].graph.thread_id("main:loop", parent_context="main")
                 state = await runtimes[1].agent_loop.graph.aget_state({"configurable": {"thread_id": loop_thread}})
                 assert state.values["todos"] == [{"content": "b", "status": "pending"}]
@@ -685,6 +690,7 @@ def test_worker_limit_is_six_for_each_user(tmp_path, monkeypatch):
 
 
 def test_login_csrf_and_account_isolation(tmp_path, monkeypatch):
+    from app.api.auth import SESSION_COOKIE, lookup
     from app.main import create_app
 
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
@@ -699,6 +705,11 @@ def test_login_csrf_and_account_isolation(tmp_path, monkeypatch):
         response = first.post("/api/auth/register", json={"username": "alice", "password": "a"},
                               headers={"X-CSRF-Token": csrf})
         assert response.status_code == 201
+        alice_user = lookup(first.cookies.get(SESSION_COOKIE))[0]
+        alice_skill = settings.user_skills_dir / alice_user / "code-review" / "SKILL.md"
+        template = alice_skill.read_text(encoding="utf-8")
+        assert "代码审查技能" in template
+        alice_skill.write_text(template + "\n仅 Alice 修改", encoding="utf-8")
         alice_csrf = response.json()["csrf"]
         alice_id = first.get("/api/chat").json()["assistant_id"]
         message = {"assistant_id": alice_id, "client_message_id": "same-id", "text": "alice"}
@@ -711,6 +722,10 @@ def test_login_csrf_and_account_isolation(tmp_path, monkeypatch):
         response = first.post("/api/auth/register", json={"username": "bob", "password": "b"},
                               headers={"X-CSRF-Token": csrf})
         assert response.status_code == 201
+        bob_user = lookup(first.cookies.get(SESSION_COOKIE))[0]
+        bob_skill = settings.user_skills_dir / bob_user / "code-review" / "SKILL.md"
+        assert bob_skill.read_text(encoding="utf-8") == template
+        assert "仅 Alice 修改" in alice_skill.read_text(encoding="utf-8")
         bob_csrf = response.json()["csrf"]
         bob = first.get("/api/chat").json()
         assert bob["assistant_id"] != alice_id and bob["messages"] == []
@@ -719,3 +734,24 @@ def test_login_csrf_and_account_isolation(tmp_path, monkeypatch):
         first.cookies.clear()
         first.cookies.update(alice_cookies)
         assert first.get("/api/chat").json()["messages"][0]["text"] == "alice"
+
+
+def test_registration_fails_when_skill_template_is_missing(tmp_path, monkeypatch):
+    from sqlalchemy import select
+
+    from app.agent import skills
+    from app.main import create_app
+    from app.models import User
+
+    monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
+    monkeypatch.setattr(settings, "modelio_dir", tmp_path / "modelio")
+    monkeypatch.setattr(skills, "SKILL_TEMPLATE", tmp_path / "missing-template")
+    with TestClient(create_app(), base_url="http://127.0.0.1", client=("127.0.0.1", 1111),
+                    raise_server_exceptions=False) as client:
+        csrf = client.get("/api/auth/session").json()["csrf"]
+        response = client.post("/api/auth/register", json={"username": "alice", "password": "a"},
+                               headers={"X-CSRF-Token": csrf})
+        assert response.status_code == 500
+        with db.new_session() as session:
+            assert session.scalar(select(User).where(User.username == "alice")) is None
+        assert list(settings.user_skills_dir.iterdir()) == []

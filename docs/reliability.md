@@ -10,7 +10,7 @@
 ## 2. 干净环境
 
 - 按 AGENTS.md，开发阶段不做 schema 迁移；测试从空库开始。
-- 重建前停止相关服务、核对 DATA_DIR；确认 `backend/data/` 中的数据可丢弃。用户工作区独立放在 `backend/workspaces/`，不得随清库删除。
+- 重建前停止相关服务、核对 DATA_DIR；确认 `backend/data/` 中的数据可丢弃。`backend/workspaces/` 和 `backend/user_skills/` 独立保存，不得随清库删除。
 - 未来验证使用独立临时目录及假模型；不得与真实数据共用目录。
 - OpenAI 请求使用 `store=false`；真实调用须待用户填写配置并通知后进行。
 - 不提交 .env、密钥、数据库、日志、缓存、依赖目录、构建产物与外部参考仓库。

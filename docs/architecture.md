@@ -260,7 +260,7 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 ## 15. 已批准的 AIO Docker 沙箱改造
 
 - 主 Agent 和后台 Worker 保留每用户 Runtime 共用的 LangGraph `create_agent` 图、现有回调、调度、消息、审批、停止和恢复。
-- 对齐 DeerFlow 的 `SandboxMiddleware`、`SandboxProvider`、`Sandbox`、`AioSandboxProvider`、`AioSandbox` 和 `LocalContainerBackend` 接口及职责，只实现 Docker AIO；不保留 Lark 参数，非空额外挂载明确报错。Skills 为所有 Agent 共享，不做单 Agent 隔离。
+- 对齐 DeerFlow 的 `SandboxMiddleware`、`SandboxProvider`、`Sandbox`、`AioSandboxProvider`、`AioSandbox` 和 `LocalContainerBackend` 接口及职责，只实现 Docker AIO；不保留 Lark 参数，非空额外挂载明确报错。Skills 按用户隔离，同一用户的 Agent 共用。
 - 每用户共享一个 AIO 容器和一个网络代理，按 Agent / Run 管理独立租约与命令会话。无用户身份使用独立的 `default` 沙箱；无线程的底层调用使用独立逻辑 ID，多个逻辑 ID 指向同一用户容器。等待同伴或依赖时保留租约和 shell，直到 Run 结束。
 - 静态 allowlist 位于 `backend/.env` 的 `SANDBOX_ALLOW_DOMAINS`，默认 `pypi.org`、`files.pythonhosted.org`、`registry.npmjs.org`、`github.com`，修改后重启。代理只转发允许的 HTTP / HTTPS 公网目标；未列域名在所有模式直接拒绝，不产生网络审批或临时授权。Docker Desktop 代理仅解析 IPv4。
 - 文件工具使用容器内绝对路径及 DeerFlow AIO 文件接口；不再用 `openat2` 拦截符号链接。保留真实目标文件占用、版本检查和既有审批；写已有文件须先读当前版本，写后须重读。对齐 DeerFlow：写前读取报错或正文以 `Error:` 开头时放行检查，由 AIO 写接口和容器权限决定结果，可能绕过先读要求。命令可直接修改文件，由 Worker 协调，不设置工作区级锁。
@@ -276,3 +276,9 @@ Worker 可直接给忙碌同伴发信息，对方在当前模型步或工具结�
 - 使用 `<todo_list_system>` 分隔 TODO 系统提示词；工具描述参考 DeerFlow，说明适用场景、状态、完成条件和阻塞处理。用户明确要求时少于三步也可使用，清单不在前端展示。
 - 移除 `route_input` 模型路由，主助手直接判断并使用现有任务和工作工具。同一轮调用先整体登记，再按模型给出的顺序执行；出错后停止后续调用并交主助手判断。必要时可先查询任务再执行。用户消息和审批按序处理，同一操作较新的决定优先，相关性由模型判断；不新增审批编号字段。
 - 沿用现有权限、异步聊天和后台任务边界；不新增 TODO 的重启恢复流程，模型根据可用上下文自行判断，结果未知的外部操作不自动重跑。使用独立空库和模拟模型验证状态隔离、压缩提醒、工具顺序、失败停止、消息与审批顺序和任务清理。
+
+## 17. 用户私有 Skills
+
+- `backend/skills/code-review/` 仅作模板；注册时复制到 `backend/user_skills/<用户 ID>/code-review/`，初始化失败则注册失败。已有账号不补发，不迁移旧数据。
+- 主助手和 Worker 仅发现、加载当前用户目录；每次模型请求注入技能元数据，正文及资源按需读取。沙箱只读挂载当前用户目录至 `/mnt/skills`；路径不得越界，沿用现有权限。
+- 用户私有 Skills 不入 Git，重置助手保留；隔离测试覆盖注册、模板独立性、跨用户读取及沙箱挂载。

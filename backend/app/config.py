@@ -43,6 +43,7 @@ class Settings:
     port: int = 8100
     data_dir: Path = field(default=BACKEND_ROOT / "data")
     workspaces_dir: Path = field(default=BACKEND_ROOT / "workspaces")
+    user_skills_dir: Path = field(default=BACKEND_ROOT / "user_skills")
 
     log_level: str = "INFO"
 

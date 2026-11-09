@@ -10,6 +10,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 
 from app import db
+from app.agent.skills import initialize_user_skills
 from app.models import LoginSession, User
 
 
@@ -89,6 +90,7 @@ def register(body: Credentials, request: Request):
         session.add(user)
         try:
             session.flush()
+            initialize_user_skills(user.id)
             response = _login_response(session, user, request)
         except IntegrityError as exc:
             session.rollback()

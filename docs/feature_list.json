@@ -109,6 +109,13 @@
       "description": "各助手使用独立 LangGraph state，模型按复杂度判断使用 write_todos。",
       "status": "passing",
       "evidence": "提示词和工具说明更新后隔离专项 7 项通过，含模拟模型请求；此前覆盖 SQLite 持久化、用户重置及混合调用。未调用真实模型，异常重启恢复尚未设计。"
+    },
+    {
+      "id": "Backend-11",
+      "name": "用户私有 Skills",
+      "description": "新账号复制 code-review 模板；技能发现、加载和沙箱按用户隔离。",
+      "status": "passing",
+      "evidence": "隔离空库后端全量 231 项通过、2 项 Docker 默认跳过；真实 Docker 双用户隔离与只读专项 1 项、最终技能专项 5 项通过。未调用真实模型。"
     }
   ]
 }

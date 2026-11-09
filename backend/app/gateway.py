@@ -6,7 +6,6 @@ from app import db
 from app.agent.runtime import Runtime
 from app.agent.memory import Memory
 from app.agent.rag_client import RagClient
-from app.agent.skills import SKILLS_DIR
 from app.community.aio_sandbox.aio_sandbox_provider import AioSandboxProvider
 from app.community.aio_sandbox.local_backend import LocalContainerBackend
 from app.config import settings
@@ -20,7 +19,7 @@ class Gateway:
         self.checkpointer = checkpointer
         self.memory = Memory()
         self.rag = RagClient()
-        backend = LocalContainerBackend(settings.data_dir, settings.workspaces_dir, SKILLS_DIR,
+        backend = LocalContainerBackend(settings.data_dir, settings.workspaces_dir, settings.user_skills_dir,
                                         settings.sandbox_allow_domains)
         self.sandbox_provider = AioSandboxProvider(backend, settings.data_dir)
         self.sandbox_leases = SandboxLeaseManager(self.sandbox_provider)

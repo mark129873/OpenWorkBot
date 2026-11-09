@@ -132,8 +132,7 @@ def isolated(tmp_path, monkeypatch):
 def test_skill_catalog_and_loading_in_main_and_worker(isolated, monkeypatch):
     from app.agent import skills
 
-    monkeypatch.setattr(skills, "SKILLS_DIR", isolated / "skills")
-    directory = skills.SKILLS_DIR / "review-guide"
+    directory = skills.user_skills_path("a" * 32) / "review-guide"
     (directory / "references").mkdir(parents=True)
     (directory / "SKILL.md").write_text(
         "---\nname: review-guide\ndescription: 用于代码审查\n---\n说明正文标记", encoding="utf-8")
@@ -1999,8 +1998,7 @@ class FirstActionModel:
 def test_first_action_can_load_skill(isolated, monkeypatch):
     from app.agent import skills
 
-    monkeypatch.setattr(skills, "SKILLS_DIR", isolated / "skills")
-    directory = skills.SKILLS_DIR / "review-guide"
+    directory = skills.user_skills_path("a" * 32) / "review-guide"
     directory.mkdir(parents=True)
     (directory / "SKILL.md").write_text(
         "---\nname: review-guide\ndescription: 用于代码审查\n---\n说明正文标记", encoding="utf-8")
