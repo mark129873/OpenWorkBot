@@ -4,6 +4,19 @@
 
 OpenWorkBot 旨在打造类 OpenAI Dots 的自主智能员工,面向个人与企业提供主动执行、多智能体协同、长期记忆与工作流自动化能力,构建可自主规划、调用工具、根据反馈调整执行的 Agent 协作系统。
 
+## 技术栈
+
+| 层 | 选型 |
+| --- | --- |
+| 前端 | React 19 · TypeScript（严格模式）· Vite 8 · Tailwind CSS v4 · React Router 7 |
+| 后端 | Python 3.11 · FastAPI（全异步）· uv · LangChain · LangGraph |
+| 数据 | SQLAlchemy 2.0 Async + SQLite（当前）或 PostgreSQL（可配置） |
+| 模型 | Ollama 本地、OPENAI API、智谱 GLM API 、 DeepSeek API|
+| 记忆 | 按用户隔离的 JSON 分类摘要 + Markdown 事实 |
+| RAG | MCP + Milvus Cloud + dense + BM25  + RRF|
+| 重排 | llama serve Qwen3 Reranker GGUF； Embedding 使用 llama serve Qwen3 GGUF|
+| 观测 | Python 标准日志与滚动文件 · 模型调用 JSONL 快照 ·  Langfuse RAG 追踪 |
+
 ## 2.系统架构
 
 项目采用主Agent与后台 SubAgent Worker协作的架构：
@@ -72,9 +85,9 @@ OpenWorkBot 旨在打造类 OpenAI Dots 的自主智能员工,面向个人与企
 - 任务状态与对话解耦，变成独立、可持久化的 Agent State，来管理复杂的多步骤目标 
 - 通过 Middleware 构建一个「规划 → 执行 → 检查 → 修正」的动态规划闭环, 防止任务漂移
 
-**模型自主规划**：Agent 自己规划/修正任务, 根据用户目标决定是否拆分任务, 简单任务直接处理
-**状态持久化**：保存在 GraphState 的 state.todos 中
-**上下文压缩恢复**：当聊天历史被压缩时，重新向模型展示当前 任务 状态
+1. **模型自主规划**：Agent 自己规划/修正任务, 根据用户目标决定是否拆分任务, 简单任务直接处理
+2. **状态持久化**：保存在 GraphState 的 state.todos 中
+3. **上下文压缩恢复**：当聊天历史被压缩时，重新向模型展示当前 任务 状态
 
 
 ### 2.4 上下文压缩
@@ -159,7 +172,7 @@ Agent Runtime：管理用户运行时和后台任务调度
 - 用户工作区以可读写方式挂载；容器回收后，工作区文件仍保留在宿主机。
 - 资源限制： 1 GiB / 1 CPU / 512 PIDs
 
-### 2.7 安全与权限
+### 2.7 权限
 
 | 判断结果  | 含义                      |
 | ----- | ----------------------- |
@@ -180,8 +193,7 @@ Agent Runtime：管理用户运行时和后台任务调度
 | Always allow in this conversation（在此对话中始终允许） | 批准当前调用，后续在当前会话中匹配的操作不再询问 | 只保存在内存，不写入项目规则；重启或新建会话不保留 |
 | Deny（拒绝）                                     | 不执行当前调用，拒绝原因回填模型         | 不添加永久拒绝规则                 |
 
-
-### 2.8 幂等 出错 恢复
+### 2.8 幂等 出错 恢复 (TODO)
 模型调用失败
 无法连接llm
 
