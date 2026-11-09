@@ -22,6 +22,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env_str(name, str(default)))
+    except ValueError:
+        return default
+
+
 @dataclass
 class Settings:
     llm_provider: str = "openai"
@@ -36,7 +43,13 @@ class Settings:
     context_window: int = 1_000_000
     compact_output_reserve: int = 32000
     compact_buffer: int = 13000
-    microcompact_keep: int = 5
+    compact_trigger_tokens: int = 800000
+    compact_trigger_messages: int = 200
+    compact_trigger_fraction: float = 0.8
+    compact_keep_messages: int = 20
+    tool_output_threshold: int = 12000
+    tool_output_preview_head: int = 2000
+    tool_output_preview_tail: int = 1000
     sandbox_allow_domains: str = DEFAULT_SANDBOX_ALLOW_DOMAINS
 
     host: str = "127.0.0.1"
@@ -73,7 +86,13 @@ def load_settings() -> Settings:
         context_window=_env_int("CONTEXT_WINDOW", 1_000_000),
         compact_output_reserve=_env_int("COMPACT_OUTPUT_RESERVE", 32000),
         compact_buffer=_env_int("COMPACT_BUFFER", 13000),
-        microcompact_keep=_env_int("MICROCOMPACT_KEEP", 5),
+        compact_trigger_tokens=_env_int("COMPACT_TRIGGER_TOKENS", 800000),
+        compact_trigger_messages=_env_int("COMPACT_TRIGGER_MESSAGES", 200),
+        compact_trigger_fraction=_env_float("COMPACT_TRIGGER_FRACTION", 0.8),
+        compact_keep_messages=_env_int("COMPACT_KEEP_MESSAGES", 20),
+        tool_output_threshold=_env_int("TOOL_OUTPUT_THRESHOLD", 12000),
+        tool_output_preview_head=_env_int("TOOL_OUTPUT_PREVIEW_HEAD", 2000),
+        tool_output_preview_tail=_env_int("TOOL_OUTPUT_PREVIEW_TAIL", 1000),
         sandbox_allow_domains=os.environ.get("SANDBOX_ALLOW_DOMAINS", DEFAULT_SANDBOX_ALLOW_DOMAINS).strip(),
         host=_env_str("HOST", "127.0.0.1"),
         port=_env_int("PORT", 8000),

@@ -96,9 +96,8 @@ def test_main_context_survives_restart_in_sqlite(isolated):
 def test_compaction_updates_checkpoint_and_flushes_old_messages(isolated, monkeypatch):
     async def run():
         _install_user()
-        monkeypatch.setattr(settings, "context_window", 300)
-        monkeypatch.setattr(settings, "compact_output_reserve", 50)
-        monkeypatch.setattr(settings, "compact_buffer", 50)
+        monkeypatch.setattr(settings, "compact_trigger_messages", 4)
+        monkeypatch.setattr(settings, "compact_keep_messages", 2)
         model, memory = Model(), MemorySpy()
         async with SqliteSaver.from_conn_string(str(isolated / "app.db")) as saver:
             runtime = Runtime(client=model, checkpointer=saver, memory=memory)
@@ -328,9 +327,8 @@ def test_failed_memory_flush_does_not_block_compaction(isolated, monkeypatch):
     from app.agent import compact
 
     async def run():
-        monkeypatch.setattr(settings, "context_window", 300)
-        monkeypatch.setattr(settings, "compact_output_reserve", 50)
-        monkeypatch.setattr(settings, "compact_buffer", 50)
+        monkeypatch.setattr(settings, "compact_trigger_messages", 3)
+        monkeypatch.setattr(settings, "compact_keep_messages", 1)
         runtime = Runtime(client=Model(), memory=MemorySpy())
         messages = [HumanMessage(id="first", content="文" * 1000),
                     AIMessage(id="answer", content="答复"), HumanMessage(id="last", content="继续")]
@@ -339,9 +337,10 @@ def test_failed_memory_flush_does_not_block_compaction(isolated, monkeypatch):
             raise OSError("队列不可用")
 
         context = {"flush_memory": fail}
-        projected = await compact.context_history(runtime, {"messages": messages}, context)
-        assert "此前对话摘要" in projected[0]["content"]
-        assert context["compacted_context"]["ids"] == ["first", "answer"]
+        assemble = lambda state, _: ("system", compact.history_for_state(state), [])
+        update = await compact.compact_state(runtime, {"messages": messages}, context, assemble)
+        assert update["summary_text"] == "已讨论此前工作。"
+        assert [message.id for message in update["messages"]] == ["first", "answer"]
         await runtime.close()
     asyncio.run(run())
 

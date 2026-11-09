@@ -34,8 +34,17 @@ class _Model(BaseChatModel):
         acknowledge = context.get("acknowledge_pending")
         if acknowledge:
             records = context.pop("pending_context_records", [])
-            await acknowledge(confirmed(records, state.get("messages", [])))
-        message = await callback(state, context)
+            if records:
+                identities = confirmed(records, state.get("messages", []))
+                await acknowledge(identities)
+                if len(identities) != len(records):
+                    raise ValueError("上下文消息未能确认，暂不压缩或调用模型")
+        try:
+            message = await callback(state, context)
+        except Exception:
+            context["model_request_failed"] = True
+            raise
+        context.pop("model_request_failed", None)
         return ChatResult(generations=[ChatGeneration(message=message)])
 
 
@@ -68,10 +77,6 @@ class _LoopMiddleware(AgentMiddleware):
             status = runtime.context.pop("memory_status", "completed")
             result["messages"] = [last.model_copy(update={"additional_kwargs": {**last.additional_kwargs,
                                                                                  "memory_status": status}})] + result.get("messages", [])
-        compacted = runtime.context.pop("compacted_context", None)
-        if compacted:
-            result["messages"] = [RemoveMessage(id=identity) for identity in compacted["ids"]] + result.get("messages", [])
-            result["summary_text"] = compacted["summary"]
         return result or None
 
     async def awrap_model_call(self, request, handler):
@@ -103,6 +108,21 @@ class _LoopMiddleware(AgentMiddleware):
                            status="error" if output.startswith("Error:") else "success")
 
 
+class _CompactMiddleware(AgentMiddleware):
+    async def abefore_model(self, state, runtime):
+        context = runtime.context
+        acknowledge = context.get("acknowledge_pending")
+        if acknowledge:
+            records = context.pop("pending_context_records", [])
+            if records:
+                identities = confirmed(records, state.get("messages", []))
+                await acknowledge(identities)
+                if len(identities) != len(records):
+                    raise ValueError("上下文消息未能确认，暂不压缩或调用模型")
+        callback = context.get("compact_before_model")
+        return await callback(state, context) if callback else None
+
+
 async def _placeholder(**kwargs):
     raise RuntimeError("工具调用缺少运行上下文")
 
@@ -120,6 +140,7 @@ class LangGraphLoop:
         if "write_todos" in unique:
             middleware.append(TodoMiddleware())
         middleware.append(_LoopMiddleware())
+        middleware.append(_CompactMiddleware())
         self.graph = create_agent(_Model(), tools, middleware=middleware, checkpointer=checkpointer,
                                   state_schema=ConversationState)
 
@@ -129,8 +150,19 @@ class LangGraphLoop:
         try:
             durability = {"durability": "sync"} if self.graph.checkpointer else {}
             initial = [] if context.get("collect_pending") else [HumanMessage(content="开始")]
-            result = await self.graph.ainvoke({"messages": initial},
-                                              config, context=context, **durability)
+            try:
+                result = await self.graph.ainvoke({"messages": initial}, config, context=context, **durability)
+            except Exception as exc:
+                from app.agent.compact import is_context_limit_error
+                if (not context.get("compact_before_model") or not context.pop("model_request_failed", False)
+                        or context.get("message_id")
+                        or not is_context_limit_error(exc)):
+                    raise
+                context["force_compact"] = True
+                context["reactive_retry"] = True
+                if "step" in context:
+                    context["step"] = max(0, context["step"] - 1)
+                result = await self.graph.ainvoke({"messages": []}, config, context=context, **durability)
             if context.get("collect_pending") and context.get("acknowledge_pending"):
                 try:
                     records = context["collect_pending"]()

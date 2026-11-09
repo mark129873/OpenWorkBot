@@ -46,10 +46,12 @@ TOOLS: list[dict] = [
          "description": {"type": "string"}}, ["command"],
     ),
     _schema(
-        "read_file", "按行读取容器内文本文件，超长时提示下一行。",
+        "read_file", "按行读取容器内文本文件；/mnt/user-data/workspace/.tool-results/ 的归档可使用 offset 和 limit 按字符分页。",
         {"path": {"type": "string", "description": "容器内绝对路径"}, "description": {"type": "string"},
          "start_line": {"type": "integer", "minimum": 1},
-         "end_line": {"type": "integer", "minimum": 1}}, ["path"],
+         "end_line": {"type": "integer", "minimum": 1},
+         "offset": {"type": "integer", "minimum": 0},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 10000}}, ["path"],
     ),
     _schema(
         "write_file", "写入或追加容器内文本文件；已有文件须先读取当前版本。",
@@ -74,8 +76,9 @@ TOOLS: list[dict] = [
         ["pattern", "path"],
     ),
     _schema(
-        "ls", "列出容器目录中最多两层的内容。",
-        {"path": {"type": "string", "description": "容器内绝对路径"}, "description": {"type": "string"}}, ["path"],
+        "ls", "列出容器目录内容；/mnt/user-data/workspace/.tool-results 可用 offset 和 limit 分页查看归档。",
+        {"path": {"type": "string", "description": "容器内绝对路径"}, "description": {"type": "string"},
+         "offset": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 50}}, ["path"],
     ),
     _schema(
         "grep", "搜索容器内文件的文本内容。",

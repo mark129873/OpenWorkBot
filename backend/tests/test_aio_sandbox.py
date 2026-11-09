@@ -53,13 +53,14 @@ def make_sandbox(on_uncertain):
     return sandbox, shell
 
 
-def test_command_output_keeps_head_and_tail_with_deerflow_limit():
+def test_command_output_remains_complete_before_archiving():
     sandbox, shell = make_sandbox(lambda reason: None)
     try:
         output = sandbox.execute_command_in_scope("echo test", scope_id="worker")
-        assert len(output) == 20000
+        assert len(output) == 30008
         assert output.startswith("head") and output.endswith("tail")
-        assert "中段已截断" in output
+        assert "中段已截断" not in output
+        assert shell.options["truncate"] is False
         assert shell.options["no_change_timeout"] == 600
     finally:
         sandbox.close()

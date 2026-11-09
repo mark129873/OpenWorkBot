@@ -49,21 +49,37 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
         context["dynamic_note"] = (f"{context['note']}\n{task_note}\n"
                                    f"较新的用户操作：{store.dump(decisions)}\n审批：{store.dump(approvals)}\n当前任务：{store.dump(tasks)}")
         dialog_tools = [tool for tool in MAIN_TOOLS if required_review or tool["name"] != "task_review"] + SHARED_TOOLS
-        if allow_direct and (not direct_task_id or (direct_task and direct_task["status"] not in _TERMINAL
-                            and not direct_task.get("stop_requested") and direct_task.get("steps", 0) < 40)):
+        direct_available = allow_direct and (not direct_task_id or (direct_task and direct_task["status"] not in _TERMINAL
+                                             and not direct_task.get("stop_requested") and direct_task.get("steps", 0) < 40))
+        if direct_available:
             dialog_tools += DIRECT_TOOLS
+        elif not direct_task_id:
+            dialog_tools += [tool for tool in DIRECT_TOOLS if tool["name"] in {"read_file", "ls"}]
         context.update(tools=dialog_tools, message_id=None, text="", saved_length=0,
-                       last_update=0.0, turn_id=new_id())
+                       last_update=0.0, turn_id=new_id(), archive_only=not direct_available)
+
+    def assemble(state, context):
+        system = (_PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt() + "\n" + todo.PROMPT
+                  + "\n" + compact.state_instructions(state))
+        messages = compact.history_for_state(state)
+        messages.append({"role": "user", "content": context["dynamic_note"]})
+        messages = todo.remind(runtime.memory_messages(runtime.main_memory, messages), state)
+        return system, messages, context["tools"]
+
+    async def compact_before_model(state, context):
+        if generation != runtime.generation:
+            raise asyncio.CancelledError
+        result = await compact.compact_state(runtime, state, context, assemble, force=context.pop("force_compact", False))
+        if generation != runtime.generation:
+            raise asyncio.CancelledError
+        return result
 
     async def model_call(state, context):
         step = context["step"]
         context["step"] += 1
         deps = SimpleNamespace(client=runtime.client,
                                recorder=SimpleNamespace(session_id="main", turn_id=context["turn_id"]))
-        system = _PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt() + "\n" + todo.PROMPT
-        messages = await compact.context_history(runtime, state, context)
-        messages.append({"role": "user", "content": context["dynamic_note"]})
-        messages = todo.remind(runtime.memory_messages(runtime.main_memory, messages), state)
+        system, messages, _ = assemble(state, context)
         choice = {"tool_choice": {"type": "tool", "name": "task_review"}} if required_review and step == 0 else {}
         with record_model_step(deps, system, messages, context["tools"]) as reply:
             async for event in runtime.client.stream(system=system, messages=messages,
@@ -82,6 +98,9 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
                         await runtime.change(lambda session: store.update_visible(
                             session, context["message_id"], text=context["text"]))
                         context["saved_length"], context["last_update"] = len(context["text"]), time.monotonic()
+        await runtime.run_tool(compact.record_usage, context, system, messages, context["tools"], reply.usage,
+                               getattr(runtime.client, "model", ""),
+                               separate_cache=type(runtime.client).__name__ == "AnthropicStreamClient")
         if generation != runtime.generation:
             raise asyncio.CancelledError
         context["reply"] = reply
@@ -101,7 +120,19 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
             if (len(reply.tool_uses) != 1 or reply.tool_uses[0].get("name") != "task_review"
                     or (reply.tool_uses[0].get("input") or {}).get("task_id") != required_review):
                 raise ValueError("模型没有对指定任务作出有效判断")
-        if any(call.get("name") not in {tool["name"] for tool in context["tools"]} for call in reply.tool_uses):
+        unavailable = any(call.get("name") not in {tool["name"] for tool in context["tools"]}
+                          for call in reply.tool_uses)
+        if context["archive_only"]:
+            for call in reply.tool_uses:
+                if call.get("name") in {"read_file", "ls"}:
+                    path = (call.get("input") or {}).get("path", "")
+                    archive_root = "/mnt/user-data/workspace/.tool-results"
+                    valid = (isinstance(path, str) and ".." not in path.split("/") and
+                             (path.startswith(archive_root + "/") or
+                              (call["name"] == "ls" and path.rstrip("/") == archive_root)))
+                    if not valid:
+                        unavailable = True
+        if unavailable:
             context["unavailable"] += 1
             blocks = reply.assistant_blocks()
             results = [{"type": "tool_result", "tool_use_id": call["id"],
@@ -192,7 +223,7 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
         if any(call.get("name") in {tool["name"] for tool in DIRECT_TOOLS} for call in reply.tool_uses):
             group_id = await runtime.change(lambda session: runtime._queue_direct(
                 session, blocks, reply.tool_uses, source_seq, reply_id, direct_task_id, direct_report_id,
-                context["decision_seq"], main_step_id=f"step:{context['turn_id']}"))
+                context["decision_seq"], main_step_id=f"step:{context['turn_id']}", archive_only=context["archive_only"]))
             if not group_id:
                 context["memory_status"] = "interrupted"
                 return {"jump_to": "end"}
@@ -240,6 +271,20 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
             return output
         try:
             output = await runtime.change(execute)
+            from app.agent.tool_output import archive
+            preview = await archive(runtime, "main", call["name"], f"{context['group_id']}:{call['id']}", output)
+            if preview != output:
+                def save_preview(session):
+                    group = store.get(session, f"group:{context['group_id']}")
+                    group["outputs"][call["id"]] = preview
+                    store.put(session, f"group:{context['group_id']}", group)
+                    key = f"action:main:{context['group_id']}:{call['id']}"
+                    action = store.get(session, key)
+                    if action:
+                        action["output"] = preview
+                        store.put(session, key, action)
+                await runtime.change(save_preview)
+                output = preview
         except Exception:
             hooks.trigger("PostToolUse", {**hook_context, "status": "error", "duration_ms": (time.monotonic() - started_at) * 1000})
             raise
@@ -294,7 +339,8 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
     context.update(thread_id=thread_id, before_model=before_model, model_call=model_call,
                    after_model=after_model, tool_call=tool_call, skip_tool_call=skip_tool_call,
                    collect_pending=lambda: agent_context.pending("main"), acknowledge_pending=acknowledge,
-                   flush_memory=flush_memory, repair_messages=agent_context.repair_main_history)
+                   flush_memory=flush_memory, repair_messages=agent_context.repair_main_history,
+                   compact_before_model=compact_before_model)
     try:
         await runtime.graph.invoke_loop(runtime.agent_loop, thread_id, context)
     except asyncio.CancelledError:

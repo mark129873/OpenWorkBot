@@ -150,8 +150,13 @@ def test_real_sandbox_files_commands_and_network_allowlist(tmp_path, monkeypatch
             assert dns.startswith("Error:")
             direct = await call("bash", {"command": "python -c \"import socket; socket.create_connection(('1.1.1.1',443),3)\""})
             assert direct.startswith("Error:")
-            output = await call("bash", {"command": "python -c \"print('x'*25000)\""})
-            assert len(output) <= 20000 and "中段已截断" in output
+            output = await call("bash", {"command": "python -c \"print('x'*35000+'MIDDLEMARK'+'y'*35000)\""})
+            match = re.search(r"\[完整工具结果：([^\]]+)\]", output)
+            assert match and len(output) < 10000
+            archived = settings.workspaces_dir / runtime.user_id / match.group(1).removeprefix("/mnt/user-data/workspace/")
+            assert "x" * 35000 + "MIDDLEMARK" + "y" * 35000 in archived.read_text(encoding="utf-8")
+            page = await call("read_file", {"path": match.group(1), "offset": 34000, "limit": 3000})
+            assert "MIDDLEMARK" in page
 
             denied = await call("bash", {"command": "curl -sS -o /dev/null -w '%{http_code}' --max-time 15 http://example.com"})
             assert "403" in denied

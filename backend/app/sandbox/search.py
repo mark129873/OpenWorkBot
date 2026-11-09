@@ -4,7 +4,7 @@ from pathlib import PurePosixPath
 
 
 IGNORE_PATTERNS = (
-    ".git", ".svn", ".hg", ".bzr", "node_modules", "__pycache__", ".venv", "venv",
+    ".git", ".svn", ".hg", ".bzr", ".tool-results", "node_modules", "__pycache__", ".venv", "venv",
     ".env", "env", ".tox", ".nox", ".eggs", "*.egg-info", "site-packages", "dist", "build",
     ".next", ".nuxt", ".output", ".turbo", "target", "out", ".idea", ".vscode", "*.swp",
     "*.swo", "*~", ".project", ".classpath", ".settings", ".DS_Store", "Thumbs.db", "desktop.ini",

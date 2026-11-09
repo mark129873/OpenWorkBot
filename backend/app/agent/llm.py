@@ -195,8 +195,9 @@ class OpenAIStreamClient:
                                 call["name"] += part.function.name or ""
                                 call["arguments"] += part.function.arguments or ""
         except APIError as exc:
+            from app.agent.compact import is_context_limit_error
             status = getattr(exc, "status_code", None)
-            reason = exc.code if exc.code in ("context_length_exceeded", "prompt_too_long") else status
+            reason = "context_length_exceeded" if is_context_limit_error(exc) else status
             raise RuntimeError(f"OpenAI 请求失败：{reason or '连接错误'}") from None
         if finish_reason == "length":
             yield {"type": "stop_reason", "reason": "max_tokens"}

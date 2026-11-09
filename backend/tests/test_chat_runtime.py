@@ -725,9 +725,8 @@ def test_compaction_keeps_latest_message_and_isolates_contexts(isolated, monkeyp
     from app.agent.context import messages_from_records
 
     async def run():
-        monkeypatch.setattr(settings, "context_window", 700)
-        monkeypatch.setattr(settings, "compact_output_reserve", 50)
-        monkeypatch.setattr(settings, "compact_buffer", 50)
+        monkeypatch.setattr(settings, "compact_trigger_messages", 5)
+        monkeypatch.setattr(settings, "compact_keep_messages", 1)
         runtime = Runtime(client=FakeModel())
         with db.new_session() as session:
             store.initialize(session, isolated)
@@ -739,11 +738,14 @@ def test_compaction_keeps_latest_message_and_isolates_contexts(isolated, monkeyp
             session.commit()
             first = messages_from_records(store.records(session, "context_pending", context_id="ctx-a"))
             second = messages_from_records(store.records(session, "context_pending", context_id="ctx-b"))
-        compaction = {}
-        projected = await compact.context_history(runtime, {"messages": first}, compaction)
+        assemble = lambda state, _: ("system", compact.history_for_state(state), [])
+        update = await compact.compact_state(runtime, {"messages": first}, {}, assemble)
+        removed = {message.id for message in update["messages"]}
+        projected = compact.history_for_state({"messages": [message for message in first if message.id not in removed],
+                                               "summary_text": update["summary_text"]})
         assert "此前对话摘要" in projected[0]["content"]
         assert projected[-1]["content"] == "最新请求"
-        assert len(compaction["compacted_context"]["ids"]) == 10
+        assert len(removed) == 10
         assert second[0].content == "独立任务"
     asyncio.run(run())
 

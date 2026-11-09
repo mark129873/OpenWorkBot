@@ -685,6 +685,11 @@ class Runtime:
                 return True
             if not await self.change(mark_deleting, "reset"):
                 return
+            from app.agent.tool_output import clear as clear_tool_outputs
+            with db.new_session() as session:
+                archived = [item for item in store.records(session, "tool_archive")
+                            if item.get("assistant_id") == current["assistant_id"]]
+            await self.run_tool(clear_tool_outputs, archived)
             await self.memory.clear()
             for thread_id in current.get("thread_ids", []):
                 await self.graph.delete_thread(thread_id)
@@ -771,9 +776,11 @@ class Runtime:
                 except asyncio.CancelledError:
                     if self.closing:
                         raise
-                except Exception:
+                except Exception as exc:
                     logger.exception("主助手执行失败")
-                    error = (f"模型配置有误，请检查 {', '.join(validate_llm_config(settings))}。" if self.client is None
+                    from app.agent.compact import ContextCompactionError
+                    error = (str(exc) if isinstance(exc, ContextCompactionError) else
+                             f"模型配置有误，请检查 {', '.join(validate_llm_config(settings))}。" if self.client is None
                              else "助手暂时无法处理这条消息，请稍后重试。")
                     await self._error_item(kind, item, error)
                 finally:
@@ -942,7 +949,8 @@ class Runtime:
 
     def _queue_direct(self, session, blocks: list, calls: list, source_seq: int | None,
                       reply_id: str | None, task_id: str | None, report_id: str | None,
-                      decision_seq: int | None = None, *, main_step_id: str | None = None) -> None:
+                      decision_seq: int | None = None, *, main_step_id: str | None = None,
+                      archive_only: bool = False) -> None:
         row = store.get(session, f"reply:{reply_id}") if reply_id else None
         if reply_id and (not row or row["status"] != "pending"):
             return
@@ -971,7 +979,8 @@ class Runtime:
                     "type": "tool_execution", "id": identity, "task_id": task["id"],
                     "context_id": task["context_id"], "run_id": task["run_id"], "call_id": call["id"],
                     "name": call["name"], "input": args, "status": "pending",
-                    "user_seq": source_seq, "decision_seq": decision_seq})
+                    "user_seq": source_seq, "decision_seq": decision_seq,
+                    "archive_only": archive_only and call["name"] in {"read_file", "ls"}})
             executions.append(identity)
         store.stage_context(session, task["context_id"], "assistant", blocks, key=f"step:{group_id}")
         store.put(session, f"group:{group_id}", {"type": "tool_group", "id": group_id,

@@ -62,6 +62,15 @@ def _read_page(content: str, start: int, end: int | None) -> str:
     return "\n".join(rows) if rows else "(文件为空或已到文件末尾)"
 
 
+def _read_archive_page(content: str, offset: int, limit: int) -> str:
+    result = content[offset:offset + limit]
+    if result.startswith("Error:"):
+        result = "[工具结果正文]\n" + result
+    if offset + limit < len(content):
+        result += f"\n[继续读取：offset={offset + limit}]"
+    return result or "(文件为空或已到文件末尾)"
+
+
 def _replace_content(content: str, old: str, new: str, replace_all: bool) -> str | None:
     if not old:
         return content
@@ -163,12 +172,30 @@ class Worker:
         except Exception:
             hooks.trigger("PostToolUse", {**context, "status": "error", "duration_ms": (time.monotonic() - started_at) * 1000})
             raise
+        rag_answer = None
+        result_unknown = output.startswith("Error:") and ("结果未知" in output or "结果可能未知" in output)
+        if execution["name"] == "rag_search":
+            try:
+                result = json.loads(output)
+                if result.get("status") in {"success", "insufficient"} and isinstance(result.get("answer"), str):
+                    rag_answer = _limit_result(result["answer"])
+            except (TypeError, ValueError, AttributeError):
+                pass
+        from app.agent.tool_output import archive
+        listing_path = execution["input"].get("path")
+        archive_root = "/mnt/user-data/workspace/.tool-results"
+        listing = (execution["name"] == "ls" and isinstance(listing_path, str)
+                   and (listing_path.rstrip("/") == archive_root or listing_path.startswith(archive_root + "/")))
+        if not listing:
+            output = await archive(self.runtime, self.task_id, execution["name"], identity, output)
         hooks.trigger("PostToolUse", {**context, "status": "error" if output.startswith("Error:") else "completed",
                                        "duration_ms": (time.monotonic() - started_at) * 1000})
         def save_result(session):
             current = store.get(session, f"execution:{identity}")
             current.update(status="completed", output=output)
-            if "结果未知" in output or "结果可能未知" in output:
+            if rag_answer is not None:
+                current["rag_answer"] = rag_answer
+            if result_unknown:
                 current["result_unknown"] = True
             store.put(session, f"execution:{identity}", current)
         await self.runtime.change(save_result)
@@ -360,7 +387,6 @@ class Worker:
                     if (not isinstance(answer, dict) or answer.get("status") not in {"success", "insufficient"}
                             or not isinstance(answer.get("answer"), str)):
                         return "Error: 知识库返回格式无效。"
-                    answer["answer"] = _limit_result(answer["answer"])
                     result = json.dumps(answer, ensure_ascii=False)
                 except (TypeError, ValueError):
                     return "Error: 知识库返回格式无效。"
@@ -471,6 +497,8 @@ class Worker:
             return "Error: 路径必须是容器内绝对路径。"
         if name == "read_file" and args.get("end_line") is not None and args.get("start_line", 1) > args["end_line"]:
             return "Error: 读取行范围无效。"
+        if name == "read_file" and ({"offset", "limit"} & args.keys()) and ({"start_line", "end_line"} & args.keys()):
+            return "Error: 字符分页不能与行分页同时使用。"
         if name == "write_file" and not args.get("append", False) and len(args["content"].encode("utf-8")) > 80 * 1024:
             return "Error: 单次写入不能超过 80 KiB，请分段追加。"
         from app.agent.permission_service import evaluate
@@ -480,6 +508,12 @@ class Worker:
             path = await self.runtime.run_tool(self.sandbox.real_path, requested_path)
         except Exception as exc:
             return f"Error: 文件路径无效：{exc}"
+        archive_root = "/mnt/user-data/workspace/.tool-results/"
+        archive_file = requested_path.startswith(archive_root) and path.startswith(archive_root)
+        if execution.get("archive_only") and not archive_file:
+            return "Error: 当前只能读取工具结果归档。"
+        if name == "read_file" and ({"offset", "limit"} & args.keys()) and not archive_file:
+            return "Error: 字符分页仅用于工具结果归档。"
         writing = name != "read_file"
         if writing:
             waited = await self.wait_for_file(path, execution["id"])
@@ -499,6 +533,10 @@ class Worker:
                 return "Error: 文件路径已变化，请重新发起操作。"
             content = await self.runtime.run_tool(self.sandbox.read_file, requested_path)
             uninspectable = content.startswith("Error:")
+            if uninspectable and archive_file and not writing:
+                from app.agent.tool_output import matches_file
+                if await self.runtime.run_tool(matches_file, requested_path, content):
+                    uninspectable = False
             if not writing and uninspectable:
                 return content
             initial_version = None if uninspectable else hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -533,6 +571,8 @@ class Worker:
                     return "Error: 读取期间文件发生变化，请重新读取。"
                 await self.runtime.change(lambda session: store.put(session, version_key, {
                     "type": "file_version", "context_id": self.context_id, "path": path, "version": initial_version}))
+                if archive_file and not ({"start_line", "end_line"} & args.keys()):
+                    return _read_archive_page(content, args.get("offset", 0), args.get("limit", 10000))
                 return _read_page(content, args.get("start_line", 1), args.get("end_line"))
             try:
                 if name == "write_file":
@@ -562,6 +602,13 @@ class Worker:
             return "Error: 路径必须是容器内绝对路径。"
         try:
             canonical = await self.runtime.run_tool(self.sandbox.real_path, path)
+            archive_root = "/mnt/user-data/workspace/.tool-results"
+            archive_dir = (path.rstrip("/") == archive_root or path.startswith(archive_root + "/")) and (
+                canonical == archive_root or canonical.startswith(archive_root + "/"))
+            if execution.get("archive_only") and not archive_dir:
+                return "Error: 当前只能列出工具结果归档。"
+            if ({"offset", "limit"} & args.keys()) and (name != "ls" or not archive_dir):
+                return "Error: 目录分页仅用于工具结果归档。"
             error = await self.authorize(execution, sandboxed=True, canonical_path=canonical)
             if error:
                 return error
@@ -571,8 +618,11 @@ class Worker:
             if error:
                 return error
             if name == "ls":
+                if archive_dir:
+                    from app.agent.tool_output import list_directory
+                    return await self.runtime.run_tool(list_directory, canonical, args.get("offset", 0), args.get("limit", 50))
                 entries = await self.runtime.run_tool(self.sandbox.list_dir, path)
-                return "\n".join(entries)[:20000] or "(空目录)"
+                return "\n".join(entries) or "(空目录)"
             if name == "glob":
                 matches, truncated = await self.runtime.run_tool(
                     self.sandbox.glob, path, args["pattern"], include_dirs=args.get("include_dirs", False),
@@ -857,6 +907,11 @@ class Worker:
                 calls = [item for item in store.records(session, "tool_execution", context_id=self.context_id)
                          if item.get("run_id") == self.run_id and item.get("name") == "rag_search"]
                 if len(calls) == 1 and calls[0].get("status") == "completed":
+                    if isinstance(calls[0].get("rag_answer"), str):
+                        agent_bus.send(session, source=self.context_id, target="main", task_id=self.task_id,
+                                       content=calls[0]["rag_answer"], kind="rag_answer",
+                                       message_id=f"finish:{self.task_id}:{self.run_id}", run_id=self.run_id)
+                        return
                     try:
                         answer = json.loads(calls[0].get("output", ""))
                     except (ValueError, TypeError):

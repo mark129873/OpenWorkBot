@@ -1,52 +1,94 @@
 import asyncio
+import json
 import logging
+import math
 from copy import deepcopy
+from functools import lru_cache
 
-_MICRO_PLACEHOLDER = "[旧工具结果已清除以节省上下文]"
+from langchain_core.messages import AIMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
+
 logger = logging.getLogger(__name__)
 
 
+class ContextCompactionError(ValueError):
+    pass
+
+
 def context_budget(settings) -> int:
-    return settings.context_window - settings.compact_output_reserve - settings.compact_buffer
+    return max(1, settings.context_window - settings.compact_output_reserve - settings.compact_buffer)
+
+
+@lru_cache(maxsize=1)
+def _encoding():
+    try:
+        import tiktoken
+        return tiktoken.get_encoding("cl100k_base")
+    except Exception:
+        logger.warning("token 词表不可用，使用字符估算")
+        return None
 
 
 def estimate_tokens(text: str) -> int:
-    return max(1, len(text) // 4)
-
-
-def estimate_history_tokens(history: list) -> int:
-    total = 0
-    for msg in history:
-        content = msg.get("content")
-        if isinstance(content, str):
-            total += estimate_tokens(content) + 4
-        elif isinstance(content, list):
-            for block in content:
-                total += estimate_tokens(json_dumps_safe(block)) + 4
-    return total
+    encoding = _encoding()
+    if encoding:
+        return len(encoding.encode(text, disallowed_special=()))
+    return max(len(text) // 3, len(text.encode("utf-8")) // 2, 1)
 
 
 def json_dumps_safe(obj) -> str:
-    import json
-
     try:
-        return json.dumps(obj, ensure_ascii=False)
+        return json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError):
         return str(obj)
 
 
-def needs_compact(settings, history: list, last_input_tokens: int | None = None,
-                  measured_history_tokens: int | None = None) -> bool:
-    """真实用量加新增历史估算，避免旧用量掩盖大输出。"""
-    estimate = estimate_history_tokens(history)
-    if last_input_tokens is not None and last_input_tokens > 0:
-        growth = max(0, estimate - measured_history_tokens) if measured_history_tokens is not None else 0
-        estimate = max(estimate, last_input_tokens + growth)
-    return estimate > context_budget(settings)
+def estimate_history_tokens(history: list) -> int:
+    return sum(estimate_tokens(json_dumps_safe(message)) + 4 for message in history)
+
+
+def estimate_request_tokens(system: str, messages: list, tools: list) -> int:
+    return estimate_tokens(system) + estimate_history_tokens(messages) + estimate_tokens(json_dumps_safe(tools)) + 8
+
+
+def record_usage(context: dict, system: str, messages: list, tools: list, usage: dict, model: str,
+                 *, separate_cache: bool = False) -> None:
+    actual = usage.get("input_tokens", 0)
+    if separate_cache and isinstance(actual, int):
+        actual += (usage.get("cache_read_tokens") or 0) + (usage.get("cache_creation_tokens") or 0)
+    if not isinstance(actual, int) or actual <= 0:
+        context.pop("compact_usage", None)
+        return
+    context["compact_usage"] = {"system": system, "messages": deepcopy(messages), "tools": deepcopy(tools),
+                                "model": model, "estimated": estimate_request_tokens(system, messages, tools),
+                                "actual": actual}
+
+
+def request_tokens(context: dict, system: str, messages: list, tools: list, model: str) -> int:
+    estimated = estimate_request_tokens(system, messages, tools)
+    anchor = context.get("compact_usage") or {}
+    previous = anchor.get("messages")
+    same_prefix = (isinstance(previous, list) and (messages[:len(previous)] == previous or
+                   (bool(previous) and len(messages) >= len(previous) and messages[-1] == previous[-1]
+                    and messages[:len(previous) - 1] == previous[:-1])))
+    if (anchor.get("model") == model and anchor.get("system") == system and anchor.get("tools") == tools
+            and same_prefix):
+        estimated = max(estimated, anchor["actual"] + max(0, estimated - anchor["estimated"]))
+    return estimated
+
+
+def needs_compact(settings, message_count: int, tokens: int) -> bool:
+    fraction = settings.compact_trigger_fraction
+    if not math.isfinite(fraction) or not 0 < fraction <= 1:
+        raise ValueError("上下文压缩比例配置无效")
+    return (message_count >= max(1, settings.compact_trigger_messages)
+            or tokens >= max(1, settings.compact_trigger_tokens)
+            or tokens >= max(1, int(settings.context_window * fraction))
+            or tokens >= context_budget(settings))
 
 
 def is_context_limit_error(exc: Exception) -> bool:
-    """仅输入上下文超限可重试，其他错误不重试。"""
+    if getattr(exc, "code", None) in {"context_length_exceeded", "prompt_too_long"}:
+        return True
     body = getattr(exc, "body", None)
     error = body.get("error", body) if isinstance(body, dict) else {}
     code = error.get("code") or error.get("type") if isinstance(error, dict) else None
@@ -60,7 +102,7 @@ def is_context_limit_error(exc: Exception) -> bool:
 
 
 def build_transcript(history: list) -> str:
-    lines: list[str] = []
+    lines = []
     for msg in history:
         role = "用户" if msg.get("role") == "user" else "助手"
         content = msg.get("content")
@@ -78,81 +120,166 @@ def build_transcript(history: list) -> str:
     return "\n".join(lines)
 
 
-COMPACT_PROMPT = """你是会话压缩器。把下面这段"助手与用户的对话稿"压缩为结构化摘要，供助手后续继续工作使用。要求：
-1. 【当前任务】逐字保留最后一条用户请求原文；
-2. 【已完成】关键步骤与结果；
-3. 【关键决定】重要方案决定；
-4. 【涉及文件】创建/修改过的文件路径；
-5. 【待办】未完成事项；
-6. 【失败与教训】报错与规避方式；
-7. 【用户约束】用户提出的硬性要求，逐字保留。
-直接输出摘要正文，不要输出任何解释。"""
+COMPACT_PROMPT = """你是会话压缩器。将已有摘要和较早对话一次性整理为简洁、忠实的结构化摘要，供助手继续工作。
+记录任务目标、用户约束、重要决定、已完成工作、关键工具结果和文件路径、错误与未完成事项。
+保留相关的工具结果文件路径，不臆造或忽略不确定性。较新的用户要求优先于旧决定。
+直接输出摘要正文，不要输出解释。"""
 
 
-async def summarize_history(client, history: list) -> str:
+async def summarize_history(client, history: list, previous_summary: str = "") -> str:
     transcript = build_transcript(history)
-    chunks: list[str] = []
-    async for event in client.stream(
-        system=COMPACT_PROMPT,
-        messages=[{"role": "user", "content": f"<对话稿>\n{transcript}\n</对话稿>"}],
-        tools=[],
-    ):
+    text = f"<已有摘要>\n{previous_summary}\n</已有摘要>\n<对话稿>\n{transcript}\n</对话稿>"
+    chunks = []
+    completed = False
+    async for event in client.stream(system=COMPACT_PROMPT, messages=[{"role": "user", "content": text}], tools=[]):
         if event.get("type") == "text_delta":
             chunks.append(event.get("text", ""))
-        elif event.get("type") == "stop_reason" and event.get("reason") == "max_tokens":
-            raise ValueError("摘要输出达到上限")
+        elif event.get("type") == "stop_reason":
+            if event.get("reason") in {"max_tokens", "length"}:
+                raise ContextCompactionError("摘要输出达到上限，已保留原始上下文。")
+            if event.get("reason") not in {"end_turn", "stop"}:
+                raise ContextCompactionError("上下文摘要输出不完整，请稍后重试。")
+            completed = True
+        elif event.get("type") == "tool_use":
+            raise ContextCompactionError("上下文摘要无效，请稍后重试。")
+    if not completed:
+        raise ContextCompactionError("上下文摘要输出不完整，请稍后重试。")
     return "".join(chunks).strip()
 
 
-async def prepare_history(client, history: list, config, *, on_summary=None) -> list:
-    """只压缩发送给模型的副本，不修改保存的原始记录。"""
-    projected = deepcopy(history)
-    if not needs_compact(config, projected):
-        return projected
-    results = [block for message in projected if isinstance(message.get("content"), list)
-               for block in message["content"] if block.get("type") == "tool_result"]
-    keep = max(0, config.microcompact_keep)
-    for block in results[:-keep] if keep else results:
-        block["content"] = _MICRO_PLACEHOLDER
-    if not needs_compact(config, projected):
-        return projected
-    boundaries = [i for i, message in enumerate(projected) if i > 0 and (
-        (message.get("role") == "user" and isinstance(message.get("content"), str))
-        or (message.get("role") == "assistant" and projected[i - 1].get("role") == "user"))]
-    if not boundaries:
-        raise ValueError("上下文过长且没有可压缩的完整前缀")
-    cutoff = boundaries[-1]
-    summary = await asyncio.wait_for(summarize_history(client, projected[:cutoff]), timeout=120)
-    if not summary or estimate_history_tokens([{"role": "user", "content": summary}]) >= estimate_history_tokens(projected[:cutoff]):
-        raise ValueError("上下文摘要无效，保留原始记录")
-    projected = [{"role": "user", "content": f"<此前对话摘要>\n{summary}\n</此前对话摘要>"}, *projected[cutoff:]]
-    if needs_compact(config, projected):
-        raise ValueError("压缩后上下文仍然过长")
-    if on_summary:
-        await on_summary(cutoff, summary)
-    return projected
+def _safe_cutoff(messages: list, keep: int) -> int:
+    cutoff = max(0, len(messages) - keep)
+    if cutoff < len(messages) and isinstance(messages[cutoff], ToolMessage):
+        call_id = messages[cutoff].tool_call_id
+        for index in range(cutoff - 1, -1, -1):
+            message = messages[index]
+            if isinstance(message, AIMessage) and any(call.get("id") == call_id for call in message.tool_calls):
+                return index
+        while cutoff < len(messages) and isinstance(messages[cutoff], ToolMessage):
+            cutoff += 1
+    return cutoff
 
 
-async def context_history(runtime, state: dict, context: dict) -> list:
+def select_messages(messages: list, keep: int) -> tuple[list, list]:
+    cutoff = _safe_cutoff(messages, max(0, keep))
+    latest_user = next((message for message in reversed(messages) if isinstance(message, HumanMessage)
+                        and str(message.id or "").startswith("input:")), None)
+    latest_update = next((message for message in reversed(messages) if isinstance(message, HumanMessage)
+                          and str(message.id or "").startswith("bus:")), None)
+    latest_human = next((message for message in reversed(messages) if isinstance(message, HumanMessage)), None)
+    protected = {id(message) for message in (latest_user, latest_update, latest_human) if message is not None}
+    old, rescued = [], []
+    for message in messages[:cutoff]:
+        identity = str(message.id or "")
+        metadata = message.additional_kwargs or {}
+        if (id(message) in protected or isinstance(message, SystemMessage)
+                or identity.startswith(("goal:", "help:"))
+                or metadata.get("dynamic_context_reminder")):
+            rescued.append(message)
+        else:
+            old.append(message)
+    return old, [*rescued, *messages[cutoff:]]
+
+
+def history_for_state(state: dict) -> list:
+    from app.agent.context import projected_history
+
+    messages, _ = projected_history(state.get("messages", []))
+    if summary := state.get("summary_text"):
+        messages.insert(0, {"role": "user", "content": f"<此前对话摘要>\n{summary}\n</此前对话摘要>"})
+    return messages
+
+
+def state_instructions(state: dict) -> str:
+    return "\n".join(str(message.content) for message in state.get("messages", [])
+                     if isinstance(message, SystemMessage))
+
+
+async def _expand_archived(runtime, history: list, previous: str, budget: int) -> list:
+    from app.agent.tool_output import read_reference
+
+    result = deepcopy(history)
+    body = f"<已有摘要>\n{previous}\n</已有摘要>\n<对话稿>\n{build_transcript(result)}\n</对话稿>"
+    remaining = budget - await runtime.run_tool(estimate_request_tokens, COMPACT_PROMPT,
+                                                [{"role": "user", "content": body}], [])
+    for message in result:
+        if not isinstance(message.get("content"), list):
+            continue
+        for block in message["content"]:
+            content = block.get("content")
+            if (block.get("type") != "tool_result" or not isinstance(content, str)
+                    or "[完整工具结果：" not in content or remaining <= 0):
+                continue
+            original = await runtime.run_tool(read_reference, content, max_chars=max(1, remaining * 4))
+            if original is None:
+                continue
+            footer = content[content.rfind("[完整工具结果："):]
+            replacement = f"{original}\n{footer}"
+            delta = await runtime.run_tool(lambda: estimate_tokens(replacement) - estimate_tokens(content))
+            if delta < remaining:
+                block["content"] = replacement
+                remaining -= max(0, delta)
+    return result
+
+
+async def compact_state(runtime, state: dict, context: dict, assemble, *, force: bool = False) -> dict | None:
     from app.agent.context import projected_history
     from app.config import settings
 
-    source = state.get("messages", [])
-    messages, identities = projected_history(source)
-    if summary := state.get("summary_text"):
-        messages.insert(0, {"role": "user", "content": f"<此前对话摘要>\n{summary}\n</此前对话摘要>"})
-        identities.insert(0, [])
+    system, full_messages, tools = assemble(state, context)
+    tokens = await runtime.run_tool(request_tokens, context, system, full_messages, tools,
+                                    getattr(runtime.client, "model", ""))
+    messages = state.get("messages", [])
+    count = len(messages) + bool(state.get("summary_text"))
+    if not force and not needs_compact(settings, count, tokens):
+        return None
 
-    async def save_summary(cutoff: int, summary: str) -> None:
-        ids = [identity for group in identities[:cutoff] for identity in group]
-        if not ids:
-            raise ValueError("上下文摘要没有可移除的消息")
-        context["compacted_context"] = {"ids": ids, "summary": summary}
-        flush = context.get("flush_memory")
-        if flush:
-            try:
-                await flush([message for message in source if message.id in ids])
-            except Exception:
-                logger.exception("压缩前长期记忆提取提交失败")
+    keep = max(0, settings.compact_keep_messages)
+    old, preserved = select_messages(messages, keep)
+    while keep:
+        next_state = {**state, "messages": preserved, "summary_text": ""}
+        next_system, next_messages, next_tools = assemble(next_state, context)
+        summary_reserve = min(max(1, settings.max_tokens), max(1, context_budget(settings) // 4))
+        next_tokens = await runtime.run_tool(estimate_request_tokens, next_system, next_messages, next_tools)
+        if next_tokens + summary_reserve < context_budget(settings):
+            break
+        keep -= 1
+        old, preserved = select_messages(messages, keep)
+    if not old and (force or tokens >= context_budget(settings)):
+        old, preserved = select_messages(messages, 0)
+    if not old:
+        if force or tokens >= context_budget(settings):
+            raise ContextCompactionError("上下文过长且没有可压缩的历史，请缩短输入。")
+        return None
+    if any(not message.id for message in old):
+        raise ContextCompactionError("上下文消息无法安全压缩，请稍后重试。")
 
-    return await prepare_history(runtime.client, messages, settings, on_summary=save_summary)
+    history, _ = projected_history(old)
+    previous = state.get("summary_text") or ""
+    history = await _expand_archived(runtime, history, previous, context_budget(settings))
+    summary_input = f"<已有摘要>\n{previous}\n</已有摘要>\n<对话稿>\n{build_transcript(history)}\n</对话稿>"
+    summary_tokens = await runtime.run_tool(estimate_request_tokens, COMPACT_PROMPT,
+                                            [{"role": "user", "content": summary_input}], [])
+    if summary_tokens >= context_budget(settings):
+        raise ContextCompactionError("待压缩上下文过长，无法一次性摘要，请缩短输入。")
+    try:
+        summary = await asyncio.wait_for(summarize_history(runtime.client, history, previous), timeout=120)
+    except ContextCompactionError:
+        raise
+    except Exception as exc:
+        raise ContextCompactionError("上下文摘要失败，请稍后重试。") from exc
+    source_tokens = await runtime.run_tool(estimate_tokens, previous + build_transcript(history))
+    if not summary or estimate_tokens(summary) >= source_tokens:
+        raise ContextCompactionError("上下文摘要无效，已保留原始记录。")
+    new_state = {**state, "messages": preserved, "summary_text": summary}
+    next_system, next_messages, next_tools = assemble(new_state, context)
+    next_tokens = await runtime.run_tool(estimate_request_tokens, next_system, next_messages, next_tools)
+    if next_tokens >= context_budget(settings):
+        raise ContextCompactionError("压缩后上下文仍然过长，请缩短输入。")
+    if flush := context.get("flush_memory"):
+        try:
+            await flush(old)
+        except Exception:
+            logger.exception("压缩前长期记忆提取提交失败")
+    context.pop("compact_usage", None)
+    return {"messages": [RemoveMessage(id=message.id) for message in old], "summary_text": summary}

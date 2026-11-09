@@ -161,6 +161,21 @@ def test_api_errors_do_not_expose_key_and_keep_context_limit(status, code):
     asyncio.run(run())
 
 
+def test_context_error_type_survives_provider_error_wrapping():
+    async def run():
+        client = make_client(lambda _request: httpx.Response(
+            400, json={"error": {"message": "too long", "type": "prompt_too_long"}}))
+        try:
+            with pytest.raises(RuntimeError) as caught:
+                async for _event in client.stream(system="", messages=[], tools=[]):
+                    pass
+            assert is_context_limit_error(caught.value)
+        finally:
+            await client._client.close()
+
+    asyncio.run(run())
+
+
 def test_invalid_call_in_batch_does_not_emit_other_calls():
     parts = [chunk({"tool_calls": [
         {"index": 0, "id": "first", "type": "function",

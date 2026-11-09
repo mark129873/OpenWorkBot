@@ -19,8 +19,6 @@ from app.sandbox.search import GrepMatch, ignored, path_matches
 
 
 _REQUEST = {"timeout_in_seconds": 5, "max_retries": 0}
-_OUTPUT_LIMIT = 20000
-_OUTPUT_MARKER = "\n...（输出过长，中段已截断）...\n"
 
 
 @dataclass
@@ -41,14 +39,6 @@ class _Scope:
     session_id: str | None = None
     lock: threading.RLock = field(default_factory=threading.RLock)
     cancelled: threading.Event = field(default_factory=threading.Event)
-
-
-def _preview(text: str) -> str:
-    if len(text) <= _OUTPUT_LIMIT:
-        return text
-    remaining = _OUTPUT_LIMIT - len(_OUTPUT_MARKER)
-    head = remaining // 2
-    return text[:head] + _OUTPUT_MARKER + text[-(remaining - head):]
 
 
 class AioSandbox(Sandbox):
@@ -101,14 +91,14 @@ class AioSandbox(Sandbox):
                                  timeout: float | None = None, *, scope_id: str | None = None) -> str:
         result = self.execute_command_result_in_scope(command, env=env, timeout=timeout, scope_id=scope_id)
         if result.ok:
-            return _preview(result.output) or "(无输出)"
+            return result.output or "(无输出)"
         if result.status == "unknown":
-            return _preview(f"Error: 命令结果未知，请先核查；{result.output}")
+            return f"Error: 命令结果未知，请先核查；{result.output}"
         if result.status == "cancelled":
-            return _preview(f"Error: 命令已停止；{result.output}")
+            return f"Error: 命令已停止；{result.output}"
         if result.status == "timeout":
-            return _preview(f"Error: 命令超时；{result.output}")
-        return _preview(f"Error: 命令退出码 {result.exit_code}；{result.output}")
+            return f"Error: 命令超时；{result.output}"
+        return f"Error: 命令退出码 {result.exit_code}；{result.output}"
 
     def execute_command_result_in_scope(self, command: str, env: dict[str, str] | None = None,
                                         timeout: float | None = None, *, scope_id: str | None = None) -> CommandResult:
@@ -134,6 +124,7 @@ class AioSandbox(Sandbox):
                 result = self._client.shell.exec_command(id=session_id, command=prepared, async_mode=True,
                                                          hard_timeout=duration,
                                                          no_change_timeout=max(600, math.ceil(duration + 5)),
+                                                         truncate=False,
                                                          request_options=_REQUEST)
                 if not result.success or not result.data:
                     raise RuntimeError("沙箱未确认命令受理")
@@ -157,11 +148,11 @@ class AioSandbox(Sandbox):
                         raise RuntimeError("沙箱未返回当前命令结果")
                     if data.status in {"hard_timeout", "no_change_timeout", "terminated"}:
                         self._stop_scope(scope)
-                        return CommandResult(_preview(output), "timeout" if data.status == "hard_timeout" else "unknown",
+                        return CommandResult(output, "timeout" if data.status == "hard_timeout" else "unknown",
                                              getattr(data, "exit_code", None))
                     if data.status != "completed" or getattr(data, "exit_code", None) is None:
                         raise RuntimeError("沙箱命令状态不完整")
-                    return CommandResult(_preview(output), "completed", data.exit_code)
+                    return CommandResult(output, "completed", data.exit_code)
             except Exception:
                 self._uncertain("命令执行结果未知")
                 return CommandResult("", "unknown", None)
@@ -202,7 +193,7 @@ class AioSandbox(Sandbox):
                 if not response.success or not response.data:
                     raise RuntimeError("沙箱命令结果不可用")
                 data = response.data
-                output = _preview(output + (data.stdout or "") + (data.stderr or ""))
+                output += (data.stdout or "") + (data.stderr or "")
                 offset, error_offset = data.offset, data.stderr_offset
                 if data.command and data.command.status not in {"pending", "running"}:
                     status = data.command.status

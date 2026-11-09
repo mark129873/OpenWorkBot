@@ -28,7 +28,7 @@ async def _tool_call(worker, call, context):
     return await worker.process_execution(execution["id"])
 
 
-async def _invoke(worker, before_model, model_call, after_model=None, *, group_id=None, completed_calls=None):
+async def _invoke(worker, before_model, model_call, after_model=None, *, group_id=None, completed_calls=None, assemble=None):
     runtime = worker.runtime
     async with runtime.graph.write_lock:
         thread_id = runtime.graph.thread_id(f"{worker.context_id}:loop", parent_context=worker.context_id)
@@ -95,10 +95,44 @@ async def _invoke(worker, before_model, model_call, after_model=None, *, group_i
     async def acknowledge(identities):
         await agent_context.acknowledge(runtime, worker.context_id, identities)
 
+    async def compact_before_model(state, context):
+        from app.agent.worker import AgentWaiting
+
+        async def ensure_running():
+            if worker.stop.is_set() or worker.task().get("stop_requested"):
+                await worker.finish("stopped", "任务已停止；已开始的操作可能已产生副作用。")
+                raise AgentWaiting
+
+        await ensure_running()
+        result = await compact.compact_state(runtime, state, context, assemble, force=context.pop("force_compact", False))
+        await ensure_running()
+        if result:
+            if not await worker.deliver_messages():
+                context["retain_on_error"] = True
+                raise AgentWaiting
+            await ensure_running()
+            if not worker.helper_id:
+                def pause(session):
+                    current = store.get(session, f"task:{worker.task_id}")
+                    if not current or not current.get("dependency"):
+                        return False
+                    current["status"] = "waiting_dependency"
+                    store.put(session, f"task:{worker.task_id}", current)
+                    return True
+                if await runtime.change(pause):
+                    context["retain_on_error"] = True
+                    raise AgentWaiting
+            records = agent_context.pending(worker.context_id)
+            if records:
+                context["pending_context_records"] = records
+                result["messages"] += agent_context.messages_from_records(records)
+        return result
+
     context.update(before_model=before_model, model_call=model_call, tool_call=tool_call, skip_tool_call=skip_tool_call,
                    after_model=after_model, group_id=group_id,
                    completed_calls=completed_calls or {},
-                   collect_pending=lambda: agent_context.pending(worker.context_id), acknowledge_pending=acknowledge)
+                   collect_pending=lambda: agent_context.pending(worker.context_id), acknowledge_pending=acknowledge,
+                   compact_before_model=compact_before_model if assemble else None)
     await runtime.graph.invoke_loop(runtime.agent_loop, thread_id, context)
 
 
@@ -173,15 +207,23 @@ async def run(worker):
             current["steps"] += 1
             store.put(session, key, current)
             return current["steps"]
-        context["step_number"] = await runtime.change(step)
+        if not context.pop("reactive_retry", False):
+            context["step_number"] = await runtime.change(step)
+
+    def assemble(state, context):
+        history = todo.remind(compact.history_for_state(state), state)
+        system = _PROMPT + skills.skill_prompt() + "\n" + todo.PROMPT + "\n" + compact.state_instructions(state)
+        return system, history, WORKER_TOOLS
 
     async def model_call(state, context):
-        history = todo.remind(await compact.context_history(runtime, state, context), state)
+        system, history, _ = assemble(state, context)
         deps = SimpleNamespace(client=runtime.client, recorder=SimpleNamespace(session_id="main", turn_id=worker.run_id))
-        system = _PROMPT + skills.skill_prompt() + "\n" + todo.PROMPT
         with record_model_step(deps, system, history, WORKER_TOOLS, subtask_id=worker.task_id) as reply:
             async for event in runtime.client.stream(system=system, messages=history, tools=WORKER_TOOLS):
                 reply.accept(event)
+        await runtime.run_tool(compact.record_usage, context, system, history, WORKER_TOOLS, reply.usage,
+                               getattr(runtime.client, "model", ""),
+                               separate_cache=type(runtime.client).__name__ == "AnthropicStreamClient")
         if reply.stop_reason == "max_tokens":
             await worker.finish("failed", "模型输出达到上限，本轮未完成。")
             return AIMessage(content="模型输出达到上限")
@@ -244,7 +286,7 @@ async def run(worker):
 
     try:
         await worker.resume_groups()
-        await _invoke(worker, before_model, model_call, after_model)
+        await _invoke(worker, before_model, model_call, after_model, assemble=assemble)
     except AgentWaiting:
         raise
     except BaseException:
