@@ -437,9 +437,11 @@ def test_reset_resumes_after_restart_during_deletion(tmp_path, monkeypatch):
         db.dispose_engine()
 
 
-def test_shared_state_and_publish_snapshot(tmp_path, monkeypatch):
-    from app.agent import coordination
+def test_publish_snapshot_and_removed_state_tools(tmp_path, monkeypatch):
+    from app.agent import coordination, shared_state
     from app.agent.runtime import Runtime
+    from app.agent.task_tools import MAIN_TOOLS, SHARED_TOOLS, WORKER_TOOLS
+    from app.agent.worker import Worker
 
     monkeypatch.setattr(settings, "data_dir", tmp_path / "data")
     monkeypatch.setattr(settings, "workspaces_dir", tmp_path / "workspaces")
@@ -461,22 +463,19 @@ def test_shared_state_and_publish_snapshot(tmp_path, monkeypatch):
             assert coordination.call(session, "agent_publish", {"topic": "进展", "content": "消息"},
                                      actor=first["context_id"], task_id=first["id"], request_id="publish") == sent
             assert len(chat_store.records(session, "agent_message")) == 2
-            created = json.loads(coordination.call(session, "state_write", {
-                "kind": "finding", "content": "初始", "expected_version": 0},
-                actor=first["context_id"], task_id=first["id"], request_id="state-1"))
-            state_id = created["state"]["id"]
-            updated = json.loads(coordination.call(session, "state_write", {
-                "state_id": state_id, "kind": "finding", "content": "更新", "expected_version": 1},
-                actor=second["context_id"], task_id=second["id"], request_id="state-2"))
-            conflict = json.loads(coordination.call(session, "state_write", {
-                "state_id": state_id, "kind": "finding", "content": "覆盖", "expected_version": 1},
-                actor="main", task_id=None, request_id="state-3"))
-            assert updated["state"]["version"] == 2 and conflict["conflict"]
+            removed = {"state_write", "state_read", "state_list"}
+            assert not removed.intersection(tool["name"] for tool in MAIN_TOOLS + SHARED_TOOLS + WORKER_TOOLS)
+            for name in removed:
+                assert coordination.call(session, name, {}, actor="main", task_id=None,
+                                         request_id="removed").startswith("Error:")
+            shared_state.replace(session, "main", None, "run", [{"content": "用户甲", "status": "in_progress"}])
             session.commit()
+        with bind_user("a" * 32):
+            worker = Worker(runtime, first["id"])
+            assert asyncio.run(worker.execute({"name": "state_write", "input": {}})).startswith("Error:")
         with bind_user("b" * 32), db.new_session() as session:
             chat_store.initialize(session, settings.data_dir)
-            assert coordination.call(session, "state_read", {"state_id": state_id},
-                                     actor="main", task_id=None, request_id="read").startswith("Error:")
+            assert shared_state.snapshot(session) == []
     finally:
         db.dispose_engine()
 

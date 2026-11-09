@@ -51,6 +51,9 @@ class _Model(BaseChatModel):
 class _LoopMiddleware(AgentMiddleware):
     @hook_config(can_jump_to=["tools", "end"])
     async def abefore_model(self, state, runtime):
+        confirm = runtime.context.get("confirm_todos")
+        if confirm:
+            await confirm(state.get("todos"))
         before = runtime.context.get("before_model")
         result = (await before(state, runtime.context) if before else None) or {}
         collect = runtime.context.get("collect_pending")
@@ -102,6 +105,10 @@ class _LoopMiddleware(AgentMiddleware):
                 if error:
                     return ToolMessage(content=error, tool_call_id=request.tool_call["id"], id=identity,
                                        name=request.tool_call["name"], status="error")
+            sync = request.runtime.context.get("sync_todos")
+            if sync:
+                await sync(result.update["todos"], request.tool_call)
+            if apply_todos:
                 return result.update["messages"][0]
             return result
         return ToolMessage(content=output, tool_call_id=request.tool_call["id"], id=identity, name=request.tool_call["name"],

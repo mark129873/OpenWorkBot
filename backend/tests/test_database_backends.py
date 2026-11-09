@@ -14,7 +14,7 @@ from sqlalchemy import make_url, select
 from sqlalchemy.exc import OperationalError
 
 from app import db
-from app.agent import agent_bus, coordination
+from app.agent import agent_bus, shared_state
 from app.agent.checkpoint import _open_manager, _run_io, open_saver
 from app.agent.runtime import Runtime, _task_context
 from app.agent.worker import Worker
@@ -156,12 +156,8 @@ def test_approval_and_task_queries(database):
                 result = runtime._main_tool(session, {"id": "inspect", "name": "task_inspect",
                                                      "input": {"task_id": task["id"]}}, None)
                 assert json.loads(result)["reports"][0]["content"] == "结果"
-                coordination.call(session, "state_write", {"kind": "note", "content": "共享",
-                                  "task_id": task["id"], "expected_version": 0},
-                                  actor="main", task_id=None, request_id="write")
-                result = coordination.call(session, "state_list", {"kind": "note", "task_id": task["id"]},
-                                           actor="main", task_id=None, request_id="list")
-                assert json.loads(result)["items"][0]["content"] == "共享"
+                shared_state.replace(session, "main", None, "test-run", [{"content": "共享", "status": "in_progress"}])
+                assert shared_state.snapshot(session)[0]["todo"] == "共享"
                 session.commit()
             await runtime.decide(request_id, "deny", assistant_id=assistant_id)
             assert not (await approval)["approved"]
@@ -278,6 +274,78 @@ def test_checkpoint_restart_and_reset(database):
     asyncio.run(run())
 
 
+@pytest.mark.parametrize("journal", [False, True])
+def test_waiting_board_recovers_completed_todo_before_checkpoint(database, journal):
+    async def run():
+        async with open_saver(settings.data_dir) as saver:
+            runtime = Runtime(client=Model(), checkpointer=saver, memory=Memory())
+            runtime.client = None
+            await runtime.start()
+            try:
+                def create(session):
+                    task = runtime.create_task(session, "等待中的工作", 1)
+                    task.update(status="waiting_agent", run_id="run-one")
+                    store.put(session, f"task:{task['id']}", task)
+                    return task
+                task = await runtime.change(create)
+                thread = runtime.graph.thread_id(f"{task['context_id']}:loop", parent_context=task["context_id"])
+                await runtime.agent_loop.graph.aupdate_state({"configurable": {"thread_id": thread}}, {
+                    "todos": [{"content": "旧检查点", "status": "in_progress"}]})
+                items = [{"content": "等待期间的工作", "status": "in_progress"}]
+                def update(session):
+                    store.put(session, "execution:todo", {"type": "tool_execution", "id": "todo",
+                              "name": "write_todos", "status": "completed", "output": "已更新",
+                              "input": {"todos": items}, "task_id": task["id"], "context_id": task["context_id"],
+                              "run_id": "run-one"})
+                    if journal:
+                        shared_state.replace(session, task["context_id"], task["id"], "run-one", items,
+                                             thread_id=thread, execution_id="todo")
+                    else:
+                        store.put(session, "group:todo", {"type": "tool_group", "id": "todo",
+                                  "context_id": task["context_id"], "calls": ["todo"], "status": "pending"})
+                await runtime.change(update)
+            finally:
+                await runtime.close()
+            resumed = Runtime(client=Model(), checkpointer=saver, memory=Memory())
+            resumed.client = None
+            await resumed.start()
+            try:
+                with db.new_session() as session:
+                    assert [(item["todo"], item["status"]) for item in shared_state.snapshot(session)] == [
+                        ("等待期间的工作", "waiting_agent")]
+                    assert not store.records(session, "todo_sync")
+            finally:
+                await resumed.close()
+    asyncio.run(run())
+
+
+def test_main_todo_checkpoint_recovers_interrupted_tool_group(database):
+    async def run():
+        items = [{"content": "主助手待恢复工作", "status": "in_progress"}]
+        async with open_saver(settings.data_dir) as saver:
+            runtime = Runtime(client=Model(), checkpointer=saver, memory=Memory())
+            runtime.client = None
+            await runtime.start()
+            try:
+                thread = runtime.graph.thread_id("main:loop", parent_context="main")
+                await runtime.agent_loop.graph.aupdate_state({"configurable": {"thread_id": thread}}, {"todos": []})
+                await runtime.change(lambda session: store.put(session, "group:main:old", {
+                    "type": "main_tool_group", "id": "main:old", "context_id": "main", "status": "pending",
+                    "calls": [{"id": "todo", "name": "write_todos", "input": {"todos": items}}],
+                    "outputs": {"todo": "已更新 TODO。"}}))
+            finally:
+                await runtime.close()
+            resumed = Runtime(client=Model(), checkpointer=saver, memory=Memory())
+            resumed.client = None
+            await resumed.start()
+            try:
+                state = await resumed.agent_loop.graph.aget_state({"configurable": {"thread_id": thread}})
+                assert state.values["todos"] == items
+            finally:
+                await resumed.close()
+    asyncio.run(run())
+
+
 def test_task_cleanup_waits_for_delivery_before_deleting_checkpoint(database):
     async def run():
         async with open_saver(settings.data_dir) as saver:
@@ -369,6 +437,20 @@ def test_old_schema_is_rejected_without_deleting_data(tmp_path):
         db.init_db(tmp_path)
     with sqlite3.connect(path) as connection:
         assert connection.execute("SELECT id FROM session").fetchone() == ("old-data",)
+
+
+def test_old_part_layout_is_rejected_without_creating_new_tables(tmp_path):
+    db.dispose_engine()
+    path = tmp_path / "app.db"
+    with sqlite3.connect(path) as connection:
+        connection.execute("CREATE TABLE part (session_id TEXT, key TEXT, sequence INTEGER, type TEXT, context_id TEXT, data TEXT)")
+        connection.execute("INSERT INTO part VALUES ('user', 'task', 1, 'task_state', NULL, '{}')")
+    with pytest.raises(RuntimeError, match="旧数据库结构"):
+        db.init_db(tmp_path)
+    with sqlite3.connect(path) as connection:
+        assert connection.execute("SELECT key FROM part").fetchone() == ("task",)
+        names = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        assert not {"shared_state", "agent_message"}.intersection(names)
 
 
 def test_checkpoint_cancellation_waits_for_io_and_closes_connection():

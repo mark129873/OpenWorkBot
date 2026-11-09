@@ -1136,6 +1136,8 @@ def test_waiting_agents_release_slots_and_resume_after_restart(isolated):
                 if self.waiters_started == 3:
                     self.all_started.set()
                 await self.release_waiters.wait()
+                yield {"type": "tool_use", "id": "todo", "name": "write_todos",
+                       "input": {"todos": [{"content": f"{goal} 的工作", "status": "in_progress"}]}}
                 yield {"type": "tool_use", "id": "wait", "name": "agent_wait",
                        "input": {"context_id": self.contexts["D"]}}
             elif goal == "D" and not results:
@@ -1169,9 +1171,12 @@ def test_waiting_agents_release_slots_and_resume_after_restart(isolated):
                     return all(store.get(session, f"task:{tasks[name]['id']}")["status"] == "waiting_agent" for name in "ABC")
             await wait_for(all_waiting)
             with db.new_session() as session:
+                from app.agent import shared_state
                 assert all(store.get(session, f"task:{tasks[name]['id']}")["status"] == "waiting_agent" for name in "ABC")
                 runs = {name: store.get(session, f"task:{tasks[name]['id']}")["run_id"] for name in "ABC"}
                 assert len([w for w in store.records(session, "agent_wait") if w["status"] == "waiting"]) == 3
+                assert {(item["todo"], item["status"]) for item in shared_state.snapshot(session)} == {
+                    (f"{name} 的工作", "waiting_agent") for name in "ABC"}
         finally:
             await runtime.close()
         second = WaitModel(contexts)
@@ -1179,6 +1184,9 @@ def test_waiting_agents_release_slots_and_resume_after_restart(isolated):
         await runtime.start()
         try:
             await asyncio.wait_for(second.d_started.wait(), 8)
+            with db.new_session() as session:
+                assert {(item["todo"], item["status"]) for item in shared_state.snapshot(session)} == {
+                    (f"{name} 的工作", "waiting_agent") for name in "ABC"}
             second.release_d.set()
             def resumed():
                 with db.new_session() as session:
@@ -1195,10 +1203,11 @@ def test_waiting_agents_release_slots_and_resume_after_restart(isolated):
                         history = await checkpoint_history(runtime, contexts[name])
                         results = [block for message in history if isinstance(message["content"], list)
                                    for block in message["content"] if block.get("type") == "tool_result"]
-                        if results:
+                        if any(f"给 {name} 的回复" in block["content"] for block in results):
                             break
                         await asyncio.sleep(0.02)
-                assert len(results) == 1 and f"给 {name} 的回复" in results[0]["content"]
+                replies = [block for block in results if block.get("tool_use_id") == "wait"]
+                assert len(replies) == 1 and f"给 {name} 的回复" in replies[0]["content"]
         finally:
             await runtime.close()
     asyncio.run(run())

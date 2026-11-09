@@ -89,6 +89,36 @@ class Part(Base):
     time_updated: Mapped[int] = mapped_column(BigInteger, default=now_ms)
 
 
+class SharedState(Base):
+    __tablename__ = 'shared_state'
+    __table_args__ = (Index('shared_state_task_idx', 'session_id', 'task_id'),)
+    session_id: Mapped[str] = mapped_column(Text, ForeignKey('session.id', ondelete='CASCADE'), primary_key=True)
+    context_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    position: Mapped[int] = mapped_column(Integer, primary_key=True)
+    task_id: Mapped[str | None] = mapped_column(Text)
+    run_id: Mapped[str | None] = mapped_column(Text)
+    content: Mapped[str] = mapped_column(Text)
+    time_updated: Mapped[int] = mapped_column(BigInteger, default=now_ms)
+
+
+class AgentMessage(Base):
+    __tablename__ = 'agent_message'
+    __table_args__ = (
+        UniqueConstraint('session_id', 'sequence'),
+        Index('agent_message_inbox_idx', 'session_id', 'context_id', 'delivery', 'sequence'),
+        Index('agent_message_task_idx', 'session_id', 'task_id', 'kind', 'sequence'),)
+    key: Mapped[str] = mapped_column(Text, primary_key=True)
+    session_id: Mapped[str] = mapped_column(Text, ForeignKey('session.id', ondelete='CASCADE'))
+    sequence: Mapped[int] = mapped_column(BigInteger)
+    context_id: Mapped[str | None] = mapped_column(Text)
+    task_id: Mapped[str | None] = mapped_column(Text)
+    kind: Mapped[str | None] = mapped_column(Text)
+    delivery: Mapped[str] = mapped_column(Text)
+    data: Mapped[dict] = mapped_column(JSON_DATA)
+    time_created: Mapped[int] = mapped_column(BigInteger, default=now_ms)
+    time_updated: Mapped[int] = mapped_column(BigInteger, default=now_ms)
+
+
 class LocalSetting(Base):
     __tablename__ = 'local_setting'
     __table_args__ = (Index('local_setting_scope_idx', 'scope', 'scope_id'),
@@ -99,17 +129,6 @@ class LocalSetting(Base):
     key: Mapped[str] = mapped_column(Text, primary_key=True)
     value: Mapped[str] = mapped_column(Text)
     schema_version: Mapped[int] = mapped_column(Integer, default=1)
-    time_created: Mapped[int] = mapped_column(BigInteger, default=now_ms)
-    time_updated: Mapped[int] = mapped_column(BigInteger, default=now_ms)
-
-
-class Todo(Base):
-    __tablename__ = 'todo'
-    __table_args__ = (Index('todo_session_idx', 'session_id'),)
-    session_id: Mapped[str] = mapped_column(Text, ForeignKey('session.id', ondelete='CASCADE'), primary_key=True)
-    position: Mapped[int] = mapped_column(Integer, primary_key=True)
-    content: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(Text)
     time_created: Mapped[int] = mapped_column(BigInteger, default=now_ms)
     time_updated: Mapped[int] = mapped_column(BigInteger, default=now_ms)
 

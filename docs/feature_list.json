@@ -106,9 +106,9 @@
     {
       "id": "Backend-10",
       "name": "助手内部 TODO",
-      "description": "各助手使用独立 LangGraph state，模型按复杂度判断使用 write_todos。",
+      "description": "各助手使用独立 LangGraph state，调用 write_todos 后同步进行中事项至共享看板。",
       "status": "passing",
-      "evidence": "提示词和工具说明更新后隔离专项 7 项通过，含模拟模型请求；此前覆盖 SQLite 持久化、用户重置及混合调用。未调用真实模型，异常重启恢复尚未设计。"
+      "evidence": "隔离空库测试覆盖模型请求、用户重置、混合调用及重启恢复；未调用真实模型或模拟真实断电。"
     },
     {
       "id": "Backend-11",
@@ -130,6 +130,13 @@
       "description": "整理 session、message、part 职责，业务表与检查点可选择 SQLite 或 PostgreSQL。",
       "status": "passing",
       "evidence": "隔离空库后端全量 291 项通过、2 项沙箱 Docker 跳过；SQLite 与 Docker PostgreSQL 17 专项 18 项通过，前端测试、构建和 lint 通过。"
+    },
+    {
+      "id": "Backend-14",
+      "name": "共享 TODO 看板与独立消息表",
+      "description": "共享看板仅保存用户内各 Agent 的进行中 TODO；内部消息使用独立表，保留现有通信与恢复行为。",
+      "status": "passing",
+      "evidence": "隔离空库和模拟模型覆盖多 Agent、等待、停止、重置及恢复；SQLite 与 Docker PostgreSQL 17 联合专项 183 项及模型调用回归 115 项通过。未调用真实模型或模拟真实断电。"
     }
   ]
 }

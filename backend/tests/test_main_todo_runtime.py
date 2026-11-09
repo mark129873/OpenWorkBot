@@ -40,6 +40,17 @@ def test_main_todo_is_written_to_agent_state(isolated):
             state = await runtime.agent_loop.graph.aget_state({"configurable": {"thread_id": thread}})
             assert state.values["todos"] == items
             assert any(message.type == "ai" for message in state.values["messages"])
+            from app.agent import shared_state
+            def board_empty():
+                with db.new_session() as session:
+                    return not shared_state.snapshot(session)
+            await wait_for(board_empty)
+            await accept(runtime, "simple", "简单问题", None)
+            def simple_completed():
+                with db.new_session() as session:
+                    return (store.get(session, "reply:simple") or {}).get("status") == "completed"
+            await wait_for(simple_completed)
+            assert board_empty()
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -168,7 +179,7 @@ def test_mixed_todo_updates_main_state_before_next_tool(isolated, monkeypatch):
 
     async def run(checkpointer):
         started, release = asyncio.Event(), asyncio.Event()
-        items = [{"content": "主助手事项", "status": "pending"}]
+        items = [{"content": "主助手事项", "status": "in_progress"}]
         model = Model([
             {"id": "todo", "name": "write_todos", "input": {"todos": items}},
             {"id": "bash", "name": "bash", "input": {"command": "pwd"}},
@@ -188,6 +199,15 @@ def test_mixed_todo_updates_main_state_before_next_tool(isolated, monkeypatch):
             thread = runtime.graph.thread_id("main:loop", parent_context="main")
             state = await runtime.agent_loop.graph.aget_state({"configurable": {"thread_id": thread}})
             assert state.values["todos"] == items
+            from app.agent import shared_state
+            with db.new_session() as session:
+                assert [(item["agent"], item["todo"]) for item in shared_state.snapshot(session)] == [
+                    ("main", "主助手事项")]
+            release.set()
+            def finished():
+                with db.new_session() as session:
+                    return not shared_state.snapshot(session)
+            await wait_for(finished)
         finally:
             release.set()
             await runtime.close()

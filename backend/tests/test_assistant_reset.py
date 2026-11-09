@@ -7,11 +7,12 @@ from fastapi import FastAPI
 from sqlalchemy import select
 
 from app import db
+from app.agent import shared_state
 from app.agent.runtime import Conflict, Runtime
 from app.agent.worker import Worker
 from app.api.chat import router
 from app.config import settings
-from app.models import Message, Part, Session, TurnUsage
+from app.models import AgentMessage, Message, Part, Session, SharedState, TurnUsage
 from app.sessions import chat_store as store
 from app.sessions import execution_state, session_permissions
 from app.user_context import scoped
@@ -80,6 +81,8 @@ def test_reset_waits_for_tool_and_deletes_old_context(isolated):
                 task = runtime.create_task(session, "旧任务", 1)
                 task.update(status="running", run_id="old-run")
                 store.put(session, f"task:{task['id']}", task)
+                shared_state.replace(session, task["context_id"], task["id"], "old-run",
+                                     [{"content": "旧工作", "status": "in_progress"}])
                 store.put(session, "helper:old", {"type": "agent_run", "context_id": "old", "task_id": task["id"], "status": "running"})
                 store.put(session, "bus:old", {"type": "agent_message", "id": "old", "context_id": "main", "task_id": task["id"],
                                                    "content": "旧报告", "delivery": "processed"})
@@ -137,6 +140,8 @@ def test_reset_waits_for_tool_and_deletes_old_context(isolated):
                 assert [row.id for row in session.scalars(select(Session))] == [scoped("main")]
                 assert session.get(Message, scoped("user:old")) is None
                 assert session.get(TurnUsage, (scoped("main"), "old")) is None
+                assert not list(session.scalars(select(AgentMessage).where(AgentMessage.session_id == scoped("main"))))
+                assert not list(session.scalars(select(SharedState).where(SharedState.session_id == scoped("main"))))
                 assert store.records(session, "context_pending", context_id="main") == []
                 assert store.records(session, "task_state") == []
                 assert store.get(session, "meta")["user_seq"] >= 1

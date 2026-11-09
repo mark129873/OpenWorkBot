@@ -10,11 +10,11 @@ from jsonschema import ValidationError, validate
 from sqlalchemy import BigInteger, cast, func, or_, select
 
 from app import db
-from app.agent import agent_bus
+from app.agent import agent_bus, shared_state
 from app.agent.llm import build_client
 from app.agent.task_tools import MAIN_TOOLS, SHARED_TOOLS
 from app.config import settings, validate_llm_config
-from app.models import LocalSetting, Part, User, new_id
+from app.models import AgentMessage, LocalSetting, Part, SharedState, User, new_id
 from app.sessions import chat_store as store
 from app.sessions import execution_state, session_permissions
 from app.user_context import require_user, scoped, unscoped
@@ -185,6 +185,7 @@ class Runtime:
                     store.put(session, "meta", meta)
                 store.bump(session)
                 session.commit()
+        await shared_state.recover(self)
         self.main_loop = asyncio.create_task(self._consume(), name="main-chat")
         self.scheduler = asyncio.create_task(self._schedule(), name="task-scheduler")
         if (meta.get("reset") or {}).get("status") in {"stopping", "deleting"}:
@@ -339,6 +340,7 @@ class Runtime:
         async with self.lock, self.graph.write_lock:
             with db.new_session() as session:
                 result = action(session)
+                shared_state.prune(session)
                 meta = store.bump(session)
                 session.commit()
                 for task in store.records(session, "task_state"):
@@ -1133,11 +1135,10 @@ class Runtime:
             offset, report_offset = args.get("offset", 0), args.get("report_offset", 0)
             if not _valid_offset(offset) or not _valid_offset(report_offset):
                 return "Error: 查询偏移量无效"
-            reports = list(session.scalars(select(Part).where(
-                Part.session_id == scoped("main"), Part.type == "agent_message",
-                Part.data["task_id"].as_string() == task_id,
-                Part.data["kind"].as_string().in_(["review", "result"])
-            ).order_by(Part.sequence.desc(), Part.id.desc()).offset(report_offset).limit(4)))
+            reports = list(session.scalars(select(AgentMessage).where(
+                AgentMessage.session_id == scoped("main"), AgentMessage.task_id == task_id,
+                AgentMessage.kind.in_(["review", "result"])
+            ).order_by(AgentMessage.sequence.desc(), AgentMessage.key.desc()).offset(report_offset).limit(4)))
             detail = {**task, "reports": [{"kind": item["kind"], "content": item["content"],
                                           "run_id": item.get("run_id")} for item in map(store.read, reports[:3])],
                       "reports_next_offset": report_offset + 3 if len(reports) > 3 else None}
@@ -1222,6 +1223,9 @@ class Runtime:
         return f"Error: 未知主助手工具 {name}"
 
     def _stop_task(self, session, task: dict) -> None:
+        for row in list(session.scalars(select(SharedState).where(SharedState.session_id == scoped("main"),
+                                                                   SharedState.task_id == task["id"]))):
+            shared_state.clear(session, row.context_id, task_id=task["id"])
         task["stop_requested"] = True
         root_wait = False
         for wait in store.records(session, "agent_wait"):
@@ -1362,10 +1366,6 @@ class Runtime:
             task = store.get(session, f"task:{task_id}")
             if not task or not task.get("cleanup"):
                 return
-            active_contexts = {item["context_id"] for item in store.records(session, "task_state")
-                               if item["id"] != task_id and item["status"] not in _TERMINAL}
-            active_contexts.update(item["context_id"] for item in store.records(session, "agent_run")
-                                   if item["task_id"] != task_id and item["status"] not in _TERMINAL)
             rows = list(session.scalars(select(Part).where(Part.session_id == scoped("main"))))
             for row in rows:
                 value = store.read(row)
@@ -1381,14 +1381,14 @@ class Runtime:
                 elif value.get("type") in {"publication", "coord_action"} and value.get("task_id") == task_id:
                     row.data = {"processed": True}
                     row.context_id = None
-                elif value.get("type") == "shared_state":
-                    owner = value.get("task_id")
-                    if owner and (owner == task_id or not store.get(session, f"task:{owner}")) and not active_contexts.intersection(value.get("readers", [])):
-                        session.delete(row)
                 elif (value.get("task_id") == task_id or value.get("context_id") in cleanup["contexts"]):
-                    if value.get("type") == "agent_message" and value.get("delivery") not in {"processed", "failed"}:
-                        continue
                     session.delete(row)
+            for row in session.scalars(select(AgentMessage).where(AgentMessage.session_id == scoped("main"))):
+                if (row.task_id == task_id or row.context_id in cleanup["contexts"]) and row.delivery in {"processed", "failed"}:
+                    session.delete(row)
+            for row in session.scalars(select(SharedState).where(SharedState.session_id == scoped("main"),
+                                                                  SharedState.task_id == task_id)):
+                session.delete(row)
         await self.change(remove)
 
     def _direct_done(self, group: str, call: asyncio.Task) -> None:
@@ -1481,6 +1481,7 @@ class Runtime:
                                     and not helper.get("resume_wait")):
                         helper["status"] = "stopped"
                         store.put(session, f"helper:{helper['context_id']}", helper)
+                        shared_state.prune(session)
                         session.commit()
                         return
                     helper_id = helper["context_id"]

@@ -5,7 +5,7 @@ from copy import deepcopy
 
 from sqlalchemy import delete, select, update
 
-from app.models import Message, Part, Session, TurnUsage, new_id, now_ms
+from app.models import AgentMessage, Message, Part, Session, SharedState, TurnUsage, new_id, now_ms
 from app.user_context import require_user, scoped, unscoped
 
 
@@ -16,7 +16,7 @@ def dump(value) -> str:
 def read(row) -> dict:
     if not row:
         return {}
-    value = {**deepcopy(row.data), "type": row.type}
+    value = {**deepcopy(row.data), "type": "agent_message" if isinstance(row, AgentMessage) else row.type}
     if row.context_id is not None:
         value["context_id"] = row.context_id
     return value
@@ -33,6 +33,8 @@ def initialize(db, data_dir) -> None:
 def clear(db) -> None:
     session_id = scoped("main")
     db.execute(delete(Part).where(Part.session_id == session_id))
+    db.execute(delete(AgentMessage).where(AgentMessage.session_id == session_id))
+    db.execute(delete(SharedState).where(SharedState.session_id == session_id))
     db.execute(delete(Message).where(Message.session_id == session_id))
     db.execute(delete(TurnUsage).where(TurnUsage.session_id == session_id))
 
@@ -45,7 +47,7 @@ def get(db, key: str) -> dict | None:
         return {**deepcopy(row.runtime_data), "type": "meta", "revision": row.revision, "user_seq": row.user_seq,
                 "assistant_id": row.assistant_id, "reset": deepcopy(row.reset_state),
                 "last_reset": deepcopy(row.last_reset)}
-    row = db.get(Part, scoped(key))
+    row = db.get(AgentMessage if key.startswith("bus:") else Part, scoped(key))
     return read(row) if row else None
 
 
@@ -61,14 +63,22 @@ def put(db, key: str, value: dict) -> None:
                                      if k not in {"type", "revision", "user_seq", "assistant_id", "reset", "last_reset"}})
         row.time_updated = now_ms()
     else:
-        row = db.get(Part, scoped(key))
+        model = AgentMessage if value.get("type") == "agent_message" else Part
+        if key.startswith("bus:") != (model is AgentMessage):
+            raise ValueError("内部消息键或类型无效")
+        row = db.get(model, scoped(key))
         payload = deepcopy({k: v for k, v in value.items() if k not in {"type", "context_id"}})
         if row is None:
-            row = Part(key=scoped(key), session_id=scoped("main"), sequence=_next(db, "next_part_sequence"),
-                       type=value["type"], context_id=value.get("context_id"), data=payload)
+            fields = ({"task_id": value.get("task_id"), "kind": value.get("kind"), "delivery": value["delivery"]}
+                      if model is AgentMessage else {"type": value["type"]})
+            row = model(key=scoped(key), session_id=scoped("main"), sequence=_next(db, "next_part_sequence"),
+                        context_id=value.get("context_id"), data=payload, **fields)
             db.add(row)
         else:
-            row.type = value["type"]
+            if model is AgentMessage:
+                row.task_id, row.kind, row.delivery = value.get("task_id"), value.get("kind"), value["delivery"]
+            else:
+                row.type = value["type"]
             row.context_id = value.get("context_id")
             row.data = payload
             row.time_updated = now_ms()
@@ -88,12 +98,16 @@ def next_display_order(db) -> int:
 
 def records(db, kind: str, *, context_id: str | None = None,
             delivery: str | None = None) -> list[dict]:
-    query = select(Part).where(Part.session_id == scoped("main"), Part.type == kind)
+    model = AgentMessage if kind == "agent_message" else Part
+    query = select(model).where(model.session_id == scoped("main"))
+    if model is Part:
+        query = query.where(Part.type == kind)
     if context_id is not None:
-        query = query.where(Part.context_id == context_id)
+        query = query.where(model.context_id == context_id)
     if delivery is not None:
-        query = query.where(Part.data["delivery"].as_string() == delivery)
-    return [read(row) for row in db.scalars(query.order_by(Part.sequence, Part.key))]
+        column = AgentMessage.delivery if model is AgentMessage else Part.data["delivery"].as_string()
+        query = query.where(column == delivery)
+    return [read(row) for row in db.scalars(query.order_by(model.sequence, model.key))]
 
 
 def add_visible(db, role: str, text: str, *, message_id: str | None = None,

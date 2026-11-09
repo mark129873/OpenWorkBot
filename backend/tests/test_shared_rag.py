@@ -383,7 +383,8 @@ def test_new_user_message_stops_write_during_staging(isolated, monkeypatch, mess
             else:
                 message = {"type": "agent_message", "id": "new", "task_id": worker.task_id,
                            "source": "main", "context_id": worker.context_id, "delivery": "pending"}
-            await runtime.change(lambda session: store.put(session, "input:new", message))
+            key = "input:new" if message_type == "user_event" else "bus:new"
+            await runtime.change(lambda session: store.put(session, key, message))
             release.set()
             assert "新的用户" in await asyncio.wait_for(pending, 3)
             assert calls == ["rag_list"] and not (rag.workspace / "new/note.txt").exists()

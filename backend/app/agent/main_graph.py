@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from langchain_core.messages import AIMessage
 
 from app import db
-from app.agent import agent_bus, compact, context as agent_context, hooks, skills, todo
+from app.agent import agent_bus, compact, context as agent_context, hooks, shared_state, skills, todo
 from app.agent.model_call import record_model_step
 from app.agent.task_tools import DIRECT_TOOLS, MAIN_TOOLS, SHARED_TOOLS
 from app.config import settings
@@ -62,7 +62,10 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
         system = (_PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt() + "\n" + todo.PROMPT
                   + "\n" + compact.state_instructions(state))
         messages = compact.history_for_state(state)
-        messages.append({"role": "user", "content": context["dynamic_note"]})
+        note = context["dynamic_note"]
+        if board := shared_state.prompt():
+            note = note.replace("\n当前任务：", f"\n{board['content']}\n当前任务：", 1)
+        messages.append({"role": "user", "content": note})
         messages = todo.remind(runtime.memory_messages(runtime.main_memory, messages), state)
         return system, messages, context["tools"]
 
@@ -336,11 +339,23 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
             runtime.memory.enqueue_compaction(runtime.client, agent_context.records_from_messages(messages, for_memory=True),
                                               events, user.generation)
 
+    async def sync_todos(items, call):
+        def save(session):
+            if generation == runtime.generation:
+                shared_state.replace(session, "main", None, context["owner_id"], items, thread_id=thread_id)
+        await runtime.change(save)
+
+    async def confirm_todos(items):
+        with db.new_session() as session:
+            marker = store.get(session, "todo-sync:main")
+        if marker and marker.get("run_id") == context["owner_id"]:
+            await runtime.change(lambda session: shared_state.confirm(session, "main", context["owner_id"], items))
+
     context.update(thread_id=thread_id, before_model=before_model, model_call=model_call,
                    after_model=after_model, tool_call=tool_call, skip_tool_call=skip_tool_call,
                    collect_pending=lambda: agent_context.pending("main"), acknowledge_pending=acknowledge,
                    flush_memory=flush_memory, repair_messages=agent_context.repair_main_history,
-                   compact_before_model=compact_before_model)
+                   compact_before_model=compact_before_model, sync_todos=sync_todos, confirm_todos=confirm_todos)
     try:
         await runtime.graph.invoke_loop(runtime.agent_loop, thread_id, context)
     except asyncio.CancelledError:
@@ -359,6 +374,7 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
                                                                       text=context["text"], status="failed"))
         raise
     finally:
+        await asyncio.shield(runtime.change(lambda session: shared_state.clear(session, "main", run_id=context["owner_id"])))
         if direct_task_id:
             with db.new_session() as session:
                 task = store.get(session, f"task:{direct_task_id}")

@@ -56,10 +56,15 @@ def init_db(data_dir: Path) -> Engine:
                         "next_message_sequence", "next_part_sequence", "next_display_order", "runtime_data"},
             "message": {"session_id", "sequence", "display_order", "role", "status", "text", "attachments"},
             "part": {"session_id", "key", "sequence", "type", "context_id", "data"},
+            "shared_state": {"session_id", "context_id", "position", "task_id", "run_id", "content"},
+            "agent_message": {"session_id", "key", "sequence", "context_id", "task_id", "kind", "delivery", "data"},
         }
         for name, columns in required.items():
             if name in tables and not columns.issubset({column["name"] for column in inspector.get_columns(name)}):
                 raise RuntimeError("检测到旧数据库结构；请使用空数据库，旧数据不会自动迁移")
+        if ("todo" in tables or ({"session", "part"}.intersection(tables)
+                and not {"shared_state", "agent_message"}.issubset(tables))):
+            raise RuntimeError("检测到旧数据库结构；请使用空数据库，旧数据不会自动迁移")
         Base.metadata.create_all(engine)
     except BaseException:
         engine.dispose()

@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from langchain_core.messages import AIMessage
 
 from app import db
-from app.agent import compact, context as agent_context, hooks, skills, todo
+from app.agent import compact, context as agent_context, hooks, shared_state, skills, todo
 from app.agent.model_call import record_model_step
 from app.agent.task_tools import WORKER_TOOLS
 from app.models import new_id
@@ -51,7 +51,8 @@ async def _invoke(worker, before_model, model_call, after_model=None, *, group_i
             store.put(session, f"execution:{execution['id']}", current)
         await runtime.change(skip)
 
-    if worker.task().get("direct"):
+    direct = worker.task().get("direct")
+    if direct:
         context = runtime.direct_sandboxes.setdefault(worker.task_id, {
             "user_id": runtime.user_id, "thread_id": f"{runtime.user_id}:{worker.context_id}:{worker.run_id}",
             "owner_id": f"direct:{worker.task_id}:{worker.run_id}", "retain_sandbox": True})
@@ -95,6 +96,21 @@ async def _invoke(worker, before_model, model_call, after_model=None, *, group_i
     async def acknowledge(identities):
         await agent_context.acknowledge(runtime, worker.context_id, identities)
 
+    async def sync_todos(items, call):
+        actor = "main" if direct else worker.context_id
+        execution_id = None if direct else _execution(call, context)["id"]
+        await runtime.change(lambda session: shared_state.replace(
+            session, actor, worker.task_id, worker.run_id, items,
+            thread_id=None if direct else thread_id, execution_id=execution_id))
+
+    async def confirm_todos(items):
+        if direct or (group_id is not None and not context.get("injected")):
+            return
+        with db.new_session() as session:
+            marker = store.get(session, f"todo-sync:{worker.context_id}")
+        if marker and marker.get("run_id") == worker.run_id:
+            await runtime.change(lambda session: shared_state.confirm(session, worker.context_id, worker.run_id, items))
+
     async def compact_before_model(state, context):
         from app.agent.worker import AgentWaiting
 
@@ -132,7 +148,8 @@ async def _invoke(worker, before_model, model_call, after_model=None, *, group_i
                    after_model=after_model, group_id=group_id,
                    completed_calls=completed_calls or {},
                    collect_pending=lambda: agent_context.pending(worker.context_id), acknowledge_pending=acknowledge,
-                   compact_before_model=compact_before_model if assemble else None)
+                   compact_before_model=compact_before_model if assemble else None,
+                   sync_todos=sync_todos, confirm_todos=confirm_todos)
     await runtime.graph.invoke_loop(runtime.agent_loop, thread_id, context)
 
 
@@ -141,7 +158,9 @@ async def process_group(worker, group_id):
         group = store.get(session, f"group:{group_id}")
         executions = [store.get(session, f"execution:{identity}") for identity in group["calls"]]
     pending = [item for item in executions if item["status"] != "completed"]
-    if not pending:
+    completed_todo = any(item["name"] == "write_todos" and not item.get("result_unknown")
+                         and not item.get("output", "").startswith("Error:") for item in executions)
+    if not pending and not completed_todo:
         await worker.finish_group(group_id)
         return
 
@@ -212,6 +231,8 @@ async def run(worker):
 
     def assemble(state, context):
         history = todo.remind(compact.history_for_state(state), state)
+        if board := shared_state.prompt():
+            history.append(board)
         system = _PROMPT + skills.skill_prompt() + "\n" + todo.PROMPT + "\n" + compact.state_instructions(state)
         return system, history, WORKER_TOOLS
 

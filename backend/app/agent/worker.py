@@ -882,6 +882,8 @@ class Worker:
 
     async def finish(self, outcome: str, content: str) -> None:
         def save(session):
+            from app.agent import shared_state
+            shared_state.clear(session, self.context_id, task_id=self.task_id, run_id=self.run_id)
             task = store.get(session, f"task:{self.task_id}")
             if not task:
                 return
