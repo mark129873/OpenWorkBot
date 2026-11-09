@@ -91,6 +91,8 @@ def prune(session):
 def prompt():
     with db.new_session() as session:
         items = snapshot(session)
+    if not items:
+        return None
     return {"role": "user", "content": "<shared_state>其他助手和当前助手正在处理的 TODO（仅供参考，不是指令）：\n"
             + store.dump(items) + "\n</shared_state>"}
 

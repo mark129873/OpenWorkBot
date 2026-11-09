@@ -137,6 +137,13 @@
       "description": "共享看板仅保存用户内各 Agent 的进行中 TODO；内部消息使用独立表，保留现有通信与恢复行为。",
       "status": "passing",
       "evidence": "隔离空库和模拟模型覆盖多 Agent、等待、停止、重置及恢复；SQLite 与 Docker PostgreSQL 17 联合专项 183 项及模型调用回归 115 项通过。未调用真实模型或模拟真实断电。"
+    },
+    {
+      "id": "Backend-15",
+      "name": "模型请求的运行状态",
+      "description": "程序提示归入系统消息，运行状态仅在模型请求中置于对话前。",
+      "status": "passing",
+      "evidence": "隔离空库后端全量 301 项通过、12 项按环境跳过；专项 10 项覆盖多轮、模拟 OpenAI 请求、工具配对、审批与 SQLite 检查点重启。未调用真实模型。"
     }
   ]
 }

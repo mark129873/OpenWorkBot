@@ -184,7 +184,11 @@ def select_messages(messages: list, keep: int) -> tuple[list, list]:
 def history_for_state(state: dict) -> list:
     from app.agent.context import projected_history
 
-    messages, _ = projected_history(state.get("messages", []))
+    messages, identities = projected_history(state.get("messages", []))
+    for message, ids in zip(messages, identities):
+        if (message["role"] == "user" and isinstance(message["content"], str)
+                and any(identity.startswith("bus:") for identity in ids)):
+            message["content"] = "内部消息（非用户直接输入）：\n" + message["content"]
     if summary := state.get("summary_text"):
         messages.insert(0, {"role": "user", "content": f"<此前对话摘要>\n{summary}\n</此前对话摘要>"})
     return messages

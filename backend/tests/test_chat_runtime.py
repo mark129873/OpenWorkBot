@@ -1,6 +1,7 @@
 import asyncio
 import json
 import socket
+from copy import deepcopy
 
 import pytest
 
@@ -32,18 +33,21 @@ class FakeModel:
             finally:
                 self.workers -= 1
         elif tool_choice and tool_choice["name"] == "task_review":
-            tasks = json.loads(messages[-1]["content"].split("当前任务：", 1)[1])
+            note = next(m["content"] for m in messages if isinstance(m.get("content"), str)
+                        and m["content"].startswith("运行状态（由系统提供，仅供参考）："))
+            tasks = json.loads(note.split("当前任务：", 1)[1])
             task = next(t for t in tasks if t["status"] == "reviewing")
             yield {"type": "tool_use", "id": new_id(), "name": "task_review",
                    "input": {"task_id": task["id"], "decision": "complete"}}
         else:
-            user_text = next((message["content"] for message in reversed(messages[:-1])
+            user_text = next((message["content"] for message in reversed(messages)
                               if message["role"] == "user" and isinstance(message["content"], str)
-                              and not message["content"].startswith(("以下是用户长期记忆", "<此前对话摘要>"))), "")
+                              and not message["content"].startswith(("以下是用户长期记忆", "<此前对话摘要>",
+                                                                      "运行状态（由系统提供，仅供参考）："))), "")
             created = any(block.get("name") == "task_create" and block.get("input", {}).get("goal") == user_text
                           for message in messages if isinstance(message.get("content"), list)
                           for block in message["content"] if isinstance(block, dict))
-            if (messages[-1]["content"].startswith("直接处理用户消息") and user_text.startswith("任务")
+            if ("直接处理用户消息" in system and user_text.startswith("任务")
                     and not created):
                 yield {"type": "tool_use", "id": new_id(), "name": "task_create",
                        "input": {"title": user_text[:40], "goal": user_text}}
@@ -271,7 +275,8 @@ def test_newer_approval_is_reconsidered_by_main_agent(isolated, conflict):
                     args["instruction"] = "change unrelated file"
                 yield {"type": "tool_use", "id": "first", "name": name, "input": args}
             elif self.calls == 2:
-                assert "later-approval" in json.dumps(messages, ensure_ascii=False)
+                assert messages[0]["content"].startswith("运行状态（由系统提供，仅供参考）：")
+                assert "later-approval" in messages[0]["content"]
                 if conflict:
                     yield {"type": "text_delta", "text": "newer decision applies"}
                 else:
@@ -343,7 +348,7 @@ def test_progress_cannot_offer_review_until_final_report(isolated):
 
     class ProgressModel(FakeModel):
         async def stream(self, *, system, messages, tools, tool_choice=None):
-            if not tool_choice and "旧轮或已判断" in messages[-1]["content"]:
+            if not tool_choice and "旧轮或已判断" in system:
                 assert "task_review" not in {tool["name"] for tool in tools}
                 yield {"type": "text_delta", "text": "进展已收到。"}
                 return
@@ -1705,9 +1710,9 @@ class DirectModel:
                 task = next(t for t in store.records(session, "task_state") if t.get("direct"))
             yield {"type": "tool_use", "id": new_id(), "name": "task_update",
                    "input": {"task_id": task["id"], "instruction": "不要写入"}}
-        elif messages[-1]["content"].startswith("请根据直接执行"):
-            report = next(m["content"] for m in reversed(messages[:-1])
-                          if isinstance(m.get("content"), str) and m["content"].startswith("直接执行【"))
+        elif "请根据直接执行" in system:
+            report = next(m["content"] for m in reversed(messages)
+                          if isinstance(m.get("content"), str) and "直接执行【" in m["content"])
             self.reports.append(report)
             yield {"type": "text_delta", "text": "已收到直接执行结果。"}
         elif not self.issued:
@@ -1770,7 +1775,7 @@ def test_direct_steps_preserve_file_version_check(isolated):
             self.read_done, self.continue_edit = asyncio.Event(), asyncio.Event()
 
         async def stream(self, *, system, messages, tools, tool_choice=None):
-            if messages[-1]["content"].startswith("请根据直接执行") and not self.reports:
+            if "请根据直接执行" in system and not self.reports:
                 self.reports.append("已读取")
                 self.read_done.set()
                 await self.continue_edit.wait()
@@ -1808,8 +1813,18 @@ def test_direct_steps_preserve_file_version_check(isolated):
 
 @pytest.mark.parametrize("option", ["allowOnce", "deny"])
 def test_direct_approval_does_not_block_chat(isolated, option):
+    class RecordingDirectModel(DirectModel):
+        def __init__(self):
+            super().__init__("write_file", {"path": "/mnt/user-data/workspace/quick.txt", "content": "内容"})
+            self.requests = []
+
+        async def stream(self, *, system, messages, tools, tool_choice=None):
+            self.requests.append(deepcopy(messages))
+            async for event in super().stream(system=system, messages=messages, tools=tools, tool_choice=tool_choice):
+                yield event
+
     async def run():
-        model = DirectModel("write_file", {"path": "/mnt/user-data/workspace/quick.txt", "content": "内容"})
+        model = RecordingDirectModel()
         runtime = Runtime(client=model)
         await runtime.start()
         try:
@@ -1823,10 +1838,19 @@ def test_direct_approval_does_not_block_chat(isolated, option):
                     return any(m["text"] == "已处理新消息。" for m in store.visible(session))
             await wait_for(answered)
             assert request_id in runtime.approval_events
+            question = next(messages for messages in model.requests if messages[-1].get("content") == "另一个问题")
+            assert question[0]["content"].startswith("运行状态（由系统提供，仅供参考）：")
+            assert request_id in question[0]["content"] and '"status":"requested"' in question[0]["content"]
             await decide(runtime, request_id, option)
             await wait_for(lambda: bool(model.reports))
+            await wait_for(lambda: runtime.main_call is None)
             assert (isolated / ("a" * 32) / "quick.txt").exists() == (option == "allowOnce")
             assert model.worker_calls == 0
+            assert model.reports[0].startswith("内部消息（非用户直接输入）：")
+            history = await checkpoint_history(runtime, "main")
+            assert "运行状态（由系统提供，仅供参考）：" not in json.dumps(history, ensure_ascii=False)
+            report = next(row for row in history if row["id"].startswith("bus:direct:"))
+            assert report["content"].startswith("直接执行【")
         finally:
             await runtime.close()
     asyncio.run(run())

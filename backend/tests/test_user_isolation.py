@@ -577,7 +577,9 @@ def test_main_and_worker_execute_through_graph_and_cleanup(tmp_path, monkeypatch
             if system.startswith("你是后台工作助手"):
                 yield {"type": "text_delta", "text": "工作完成"}
             elif tool_choice and tool_choice["name"] == "task_review":
-                tasks = json.loads(messages[-1]["content"].split("当前任务：", 1)[1])
+                note = next(m["content"] for m in messages if isinstance(m.get("content"), str)
+                            and m["content"].startswith("运行状态（由系统提供，仅供参考）："))
+                tasks = json.loads(note.split("当前任务：", 1)[1])
                 task = next(item for item in tasks if item["status"] == "reviewing")
                 yield {"type": "tool_use", "id": "review", "name": "task_review",
                        "input": {"task_id": task["id"], "decision": "complete"}}

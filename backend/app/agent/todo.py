@@ -108,14 +108,15 @@ class TodoMiddleware(TodoListMiddleware):
         return None
 
 
-def remind(messages: list, state: dict) -> list:
+REMINDER_PROMPT = "此前的 TODO 工具调用已离开上下文，请根据当前清单继续更新。"
+
+
+def reminder(messages: list, state: dict) -> str | None:
     todos = state.get("todos")
     if not todos or any(
         block.get("type") == "tool_use" and block.get("name") == "write_todos"
         for message in messages if isinstance(message.get("content"), list)
         for block in message["content"] if isinstance(block, dict)
     ):
-        return messages
-    return [*messages, {"role": "user", "content":
-            "<system_reminder>此前的 TODO 已离开上下文，当前清单：\n"
-            + json.dumps(todos, ensure_ascii=False) + "\n请根据工作进展继续更新。</system_reminder>"}]
+        return None
+    return "当前 TODO 清单：\n" + json.dumps(todos, ensure_ascii=False)

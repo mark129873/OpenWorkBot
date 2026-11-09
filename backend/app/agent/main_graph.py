@@ -46,8 +46,8 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
         task_note = ("部分任务已省略，请用 task_search 查找；" if omitted else "") + "任务为摘要，必要时用 task_inspect 查看详情。"
         if direct_task and direct_task.get("steps", 0) >= 40:
             task_note += "直接执行已达到 40 步上限，请停止并说明；后续工作可分配后台助手。"
-        context["dynamic_note"] = (f"{context['note']}\n{task_note}\n"
-                                   f"较新的用户操作：{store.dump(decisions)}\n审批：{store.dump(approvals)}\n当前任务：{store.dump(tasks)}")
+        context["system_note"] = f"{context['note']}\n{task_note}"
+        context["dynamic_state"] = {"decisions": decisions, "approvals": approvals, "tasks": tasks}
         dialog_tools = [tool for tool in MAIN_TOOLS if required_review or tool["name"] != "task_review"] + SHARED_TOOLS
         direct_available = allow_direct and (not direct_task_id or (direct_task and direct_task["status"] not in _TERMINAL
                                              and not direct_task.get("stop_requested") and direct_task.get("steps", 0) < 40))
@@ -60,13 +60,24 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
 
     def assemble(state, context):
         system = (_PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt() + "\n" + todo.PROMPT
-                  + "\n" + compact.state_instructions(state))
-        messages = compact.history_for_state(state)
-        note = context["dynamic_note"]
-        if board := shared_state.prompt():
-            note = note.replace("\n当前任务：", f"\n{board['content']}\n当前任务：", 1)
-        messages.append({"role": "user", "content": note})
-        messages = todo.remind(runtime.memory_messages(runtime.main_memory, messages), state)
+                  + "\n" + compact.state_instructions(state)
+                  + f"\n<system-reminder>\n{context['system_note']}\n</system-reminder>")
+        history = compact.history_for_state(state)
+        reminder = todo.reminder(history, state)
+        if reminder:
+            system += "\n" + todo.REMINDER_PROMPT
+        messages = runtime.memory_messages(runtime.main_memory, history)
+        dynamic = context["dynamic_state"]
+        board = shared_state.prompt()
+        if board or reminder or any(dynamic.values()):
+            note = (f"运行状态（由系统提供，仅供参考）：\n较新的用户操作：{store.dump(dynamic['decisions'])}\n"
+                    f"审批：{store.dump(dynamic['approvals'])}\n")
+            if board:
+                note += f"{board['content']}\n"
+            if reminder:
+                note += f"{reminder}\n"
+            note += f"当前任务：{store.dump(dynamic['tasks'])}"
+            messages.insert(0, {"role": "user", "content": note})
         return system, messages, context["tools"]
 
     async def compact_before_model(state, context):

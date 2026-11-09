@@ -230,10 +230,15 @@ async def run(worker):
             context["step_number"] = await runtime.change(step)
 
     def assemble(state, context):
-        history = todo.remind(compact.history_for_state(state), state)
-        if board := shared_state.prompt():
-            history.append(board)
+        history = compact.history_for_state(state)
+        reminder = todo.reminder(history, state)
+        board = shared_state.prompt()
+        notes = [item for item in (board["content"] if board else None, reminder) if item]
+        if notes:
+            history.insert(0, {"role": "user", "content": "\n".join(notes)})
         system = _PROMPT + skills.skill_prompt() + "\n" + todo.PROMPT + "\n" + compact.state_instructions(state)
+        if reminder:
+            system += "\n" + todo.REMINDER_PROMPT
         return system, history, WORKER_TOOLS
 
     async def model_call(state, context):

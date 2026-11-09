@@ -4,7 +4,7 @@ from langchain_core.messages import AIMessage
 from langgraph.checkpoint.memory import InMemorySaver
 
 from app.agent.langgraph_loop import LangGraphLoop
-from app.agent.todo import remind
+from app.agent.todo import reminder
 from app.agent.tools import TOOLS
 
 
@@ -38,11 +38,11 @@ def test_todos_are_graph_state_and_isolated_by_thread():
 def test_todo_reminder_uses_current_state_without_changing_history():
     state = {"todos": [{"content": "当前事项", "status": "pending"}]}
     history = [{"role": "user", "content": "继续"}]
-    result = remind(history, state)
-    assert len(result) == 2 and "当前事项" in result[-1]["content"]
+    result = reminder(history, state)
+    assert "当前事项" in result
     assert history == [{"role": "user", "content": "继续"}]
     history.append({"role": "assistant", "content": [{"type": "tool_use", "name": "write_todos"}]})
-    assert remind(history, state) is history
+    assert reminder(history, state) is None
 
 
 def test_duplicate_todo_calls_fail_without_running_later_tools():

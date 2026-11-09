@@ -53,7 +53,7 @@ def test_agents_receive_live_board_and_finished_worker_disappears(isolated):
         def __init__(self):
             self.worker_calls = 0
             self.started, self.release = asyncio.Event(), asyncio.Event()
-            self.main_messages, self.worker_messages = None, None
+            self.main_messages, self.worker_messages, self.main_system = None, None, None
 
         async def stream(self, *, system, messages, tools, **kwargs):
             if system.startswith("你是后台工作助手"):
@@ -69,6 +69,7 @@ def test_agents_receive_live_board_and_finished_worker_disappears(isolated):
                     yield {"type": "text_delta", "text": "完成"}
             else:
                 self.main_messages = messages
+                self.main_system = system
                 yield {"type": "text_delta", "text": "收到"}
             yield {"type": "stop_reason", "reason": "end_turn"}
 
@@ -79,15 +80,19 @@ def test_agents_receive_live_board_and_finished_worker_disappears(isolated):
         try:
             await accept(runtime, "empty", "简单问题", None)
             await wait_for(lambda: model.main_messages is not None)
-            assert any(isinstance(message.get("content"), str) and "\n[]\n</shared_state>" in message["content"]
-                       for message in model.main_messages)
+            assert model.main_messages == [{"role": "user", "content": "简单问题"}]
+            assert "直接处理用户消息" in model.main_system
             model.main_messages = None
             task = await runtime.change(lambda session: runtime.create_task(session, "后台任务", 1))
             await asyncio.wait_for(model.started.wait(), 8)
             await accept(runtime, "board", "查看进展", None)
             await wait_for(lambda: model.main_messages is not None)
+            assert model.main_messages[0]["content"].startswith("运行状态（由系统提供，仅供参考）：")
+            assert model.main_messages[-1] == {"role": "user", "content": "查看进展"}
+            assert model.worker_messages[0]["content"].startswith("<shared_state>")
             assert "后台正在工作" in json.dumps(model.worker_messages, ensure_ascii=False)
             assert "后台正在工作" in json.dumps(model.main_messages, ensure_ascii=False)
+            assert "后台正在工作" not in model.main_system
             assert "后台等待处理" not in json.dumps(model.main_messages, ensure_ascii=False)
             history = await checkpoint_history(runtime, "main")
             assert "<shared_state>" not in json.dumps(history, ensure_ascii=False)
