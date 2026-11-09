@@ -153,7 +153,8 @@ def test_delivery_failure_checks_checkpoint_and_pauses_if_unknown(tmp_path, monk
             current = chat_store.get(session, f"task:{task['id']}")
             if saved:
                 assert row["delivery"] == "delivered"
-                assert [item["content"] for item in chat_store.history(session, task["context_id"])].count("重要消息") == 1
+                pending = chat_store.records(session, "context_pending", context_id=task["context_id"])
+                assert [item["content"] for item in pending].count("重要消息") == 1
             else:
                 assert row["delivery"] == "unknown" and current["status"] == "waiting_user"
                 assert any("送达状态无法确定" in item["text"] for item in chat_store.visible(session))

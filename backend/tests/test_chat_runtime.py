@@ -67,6 +67,14 @@ async def decide(runtime, *args, **kwargs):
     return await runtime.decide(*args, assistant_id=(await runtime.snapshot())["assistant_id"], **kwargs)
 
 
+async def checkpoint_history(runtime, context_id):
+    from app.agent.context import records_from_messages
+    async with runtime.graph.write_lock:
+        thread = runtime.graph.thread_id(f"{context_id}:loop", parent_context=context_id)
+    state = await runtime.agent_loop.graph.aget_state({"configurable": {"thread_id": thread}})
+    return records_from_messages(state.values.get("messages", []))
+
+
 def test_memory_is_available_only_to_main_agent(isolated):
     from app.agent.memory_store import _read_files, _store, empty_memory
 
@@ -111,15 +119,19 @@ def test_memory_is_available_only_to_main_agent(isolated):
 
 @pytest.fixture
 def isolated(tmp_path, monkeypatch):
+    from langgraph.checkpoint.memory import InMemorySaver
     from app.sandbox.lease import SandboxLeaseManager
     from fake_sandbox import FakeProvider
 
     monkeypatch.setattr(settings, "data_dir", tmp_path)
     monkeypatch.setattr(settings, "modelio_dir", tmp_path / "modelio")
     original_init = Runtime.__init__
+    saver = InMemorySaver()
     def init(runtime, *args, **kwargs):
         if "sandbox_leases" not in kwargs:
             kwargs["sandbox_leases"] = SandboxLeaseManager(FakeProvider())
+        if "checkpointer" not in kwargs:
+            kwargs["checkpointer"] = saver
         original_init(runtime, *args, **kwargs)
     monkeypatch.setattr(Runtime, "__init__", init)
     (tmp_path / ("a" * 32)).mkdir()
@@ -391,13 +403,14 @@ def test_unavailable_tool_is_not_executed_or_retried_forever(isolated, repeat):
             store.put(session, f"task:{task['id']}", task)
             session.commit()
         await runtime._dialog("请根据进展回复用户。")
+        history = await checkpoint_history(runtime, "main")
         with db.new_session() as session:
             assert store.get(session, f"task:{task['id']}")["status"] == "reviewing"
             assert not store.records(session, "agent_action")
             assert store.visible(session)[-1]["status"] == ("failed" if repeat else "completed")
-            history = store.history(session, "main")
-            assert history[0]["content"][0]["name"] == "task_review"
-            assert history[1]["content"][0]["is_error"]
+        blocks = [block for row in history if isinstance(row["content"], list) for block in row["content"]]
+        assert any(block.get("name") == "task_review" for block in blocks)
+        assert any(block.get("type") == "tool_result" and block.get("is_error") for block in blocks)
         assert model.calls == 2
     task = None
     asyncio.run(run())
@@ -707,8 +720,9 @@ def test_helper_allocation_and_busy_message_delivery(isolated):
     asyncio.run(run())
 
 
-def test_compaction_preserves_raw_history_and_isolates_contexts(isolated, monkeypatch):
+def test_compaction_keeps_latest_message_and_isolates_contexts(isolated, monkeypatch):
     from app.agent import compact
+    from app.agent.context import messages_from_records
 
     async def run():
         monkeypatch.setattr(settings, "context_window", 700)
@@ -718,19 +732,19 @@ def test_compaction_preserves_raw_history_and_isolates_contexts(isolated, monkey
         with db.new_session() as session:
             store.initialize(session, isolated)
             for i in range(5):
-                store.append_history(session, "ctx-a", "user", f"请求{i}" + "文" * 500)
-                store.append_history(session, "ctx-a", "assistant", f"答复{i}" + "字" * 500)
-            store.append_history(session, "ctx-a", "user", "最新请求")
-            store.append_history(session, "ctx-b", "user", "独立任务")
+                store.stage_context(session, "ctx-a", "user", f"请求{i}" + "文" * 500)
+                store.stage_context(session, "ctx-a", "assistant", f"答复{i}" + "字" * 500)
+            store.stage_context(session, "ctx-a", "user", "最新请求")
+            store.stage_context(session, "ctx-b", "user", "独立任务")
             session.commit()
-        projected = await compact.context_history(runtime, "ctx-a")
+            first = messages_from_records(store.records(session, "context_pending", context_id="ctx-a"))
+            second = messages_from_records(store.records(session, "context_pending", context_id="ctx-b"))
+        compaction = {}
+        projected = await compact.context_history(runtime, {"messages": first}, compaction)
         assert "此前对话摘要" in projected[0]["content"]
         assert projected[-1]["content"] == "最新请求"
-        with db.new_session() as session:
-            assert len(store.history(session, "ctx-a")) == 11
-            assert store.history(session, "ctx-b") == [{"role": "user", "content": "独立任务"}]
-            assert store.get(session, "summary:ctx-a")["boundary_id"]
-            assert store.get(session, "summary:ctx-b") is None
+        assert len(compaction["compacted_context"]["ids"]) == 10
+        assert second[0].content == "独立任务"
     asyncio.run(run())
 
 
@@ -760,8 +774,9 @@ def test_restart_reissues_pending_approval(isolated):
             task.update(status="waiting_user", run_id="run", steps=1)
             store.put(session, f"task:{task['id']}", task)
             execution_id = f"{task['id']}:run:c1"
-            store.append_history(session, task["context_id"], "assistant", [{
-                "type": "tool_use", "id": "c1", "name": "write_file", "input": {"path": "/mnt/user-data/workspace/x", "content": "x"}}])
+            store.stage_context(session, task["context_id"], "assistant", [{
+                "type": "tool_use", "id": "c1", "name": "write_file", "input": {"path": "/mnt/user-data/workspace/x", "content": "x"}}],
+                                 key=f"step:{task['id']}:run:1")
             store.put(session, f"execution:{execution_id}", {"type": "tool_execution", "id": execution_id,
                       "task_id": task["id"], "context_id": task["context_id"], "run_id": "run", "call_id": "c1",
                       "name": "write_file", "input": {"path": "/mnt/user-data/workspace/x", "content": "x"}, "status": "pending"})
@@ -799,8 +814,9 @@ def test_started_external_tool_is_not_replayed_on_restart(isolated):
             task.update(status="running", run_id="run", steps=1)
             store.put(session, f"task:{task['id']}", task)
             identity = f"{task['id']}:run:c1"
-            store.append_history(session, task["context_id"], "assistant", [{
-                "type": "tool_use", "id": "c1", "name": "write_file", "input": {"path": "/mnt/user-data/workspace/x", "content": "x"}}])
+            store.stage_context(session, task["context_id"], "assistant", [{
+                "type": "tool_use", "id": "c1", "name": "write_file", "input": {"path": "/mnt/user-data/workspace/x", "content": "x"}}],
+                                 key=f"step:{task['id']}:run:1")
             store.put(session, f"execution:{identity}", {"type": "tool_execution", "id": identity,
                       "task_id": task["id"], "context_id": task["context_id"], "run_id": "run", "call_id": "c1",
                       "name": "write_file", "input": {"path": "/mnt/user-data/workspace/x", "content": "x"}, "status": "started"})
@@ -815,10 +831,8 @@ def test_started_external_tool_is_not_replayed_on_restart(isolated):
                     return store.get(session, f"group:{group_id}")["status"] == "completed"
             await wait_for(paired)
             with db.new_session() as session:
-                blocks = [block for message in store.history(session, task["context_id"])
-                          if isinstance(message["content"], list) for block in message["content"]]
-                result = next(block for block in blocks if block["type"] == "tool_result")
-                assert result["is_error"] and "结果未知" in result["content"]
+                execution = store.get(session, f"execution:{identity}")
+                assert execution["result_unknown"] and "结果未知" in execution["output"]
             assert not (isolated / ("a" * 32) / "x").exists()
         finally:
             await runtime.close()
@@ -1039,7 +1053,7 @@ def test_pending_reply_survives_missing_model_configuration(isolated):
     async def run():
         with db.new_session() as session:
             store.initialize(session, isolated)
-            store.append_history(session, "main", "user", "你好")
+            store.stage_context(session, "main", "user", "你好")
             store.put(session, "reply:pending", {"type": "main_reply", "id": "pending", "source_seq": 1,
                       "note": "继续回答", "status": "pending"})
             session.commit()
@@ -1173,10 +1187,16 @@ def test_waiting_agents_release_slots_and_resume_after_restart(isolated):
                 for name in "ABC":
                     task = store.get(session, f"task:{tasks[name]['id']}")
                     assert task["run_id"] == runs[name]
-                    results = [block for message in store.history(session, contexts[name])
-                               if isinstance(message["content"], list) for block in message["content"]
-                               if block.get("type") == "tool_result"]
-                    assert len(results) == 1 and f"给 {name} 的回复" in results[0]["content"]
+            for name in "ABC":
+                async with asyncio.timeout(4):
+                    while True:
+                        history = await checkpoint_history(runtime, contexts[name])
+                        results = [block for message in history if isinstance(message["content"], list)
+                                   for block in message["content"] if block.get("type") == "tool_result"]
+                        if results:
+                            break
+                        await asyncio.sleep(0.02)
+                assert len(results) == 1 and f"给 {name} 的回复" in results[0]["content"]
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -1202,7 +1222,7 @@ def test_wait_target_inherits_earliest_task_order(isolated, helper):
                 store.put(session, f"helper:{target_context}", {"type": "agent_run", "task_id": task["id"],
                           "context_id": target_context, "run_id": "helper-run", "caller": task["context_id"],
                           "status": "queued", "steps": 0})
-                store.append_history(session, target_context, "user", "协助任务：完成 A")
+                store.stage_context(session, target_context, "user", "协助任务：完成 A")
             else:
                 target = runtime.create_task(session, "依赖任务", 4)
                 target_context = target["context_id"]
@@ -1253,7 +1273,7 @@ def test_stopping_a_waiting_agent_completes_its_tool_call(isolated, helper, read
                           "context_id": context, "run_id": "run", "caller": task["context_id"],
                           "status": "running", "steps": 1})
             call = {"type": "tool_use", "id": "call", "name": "agent_wait", "input": {"context_id": target["context_id"]}}
-            store.append_history(session, context, "assistant", [call])
+            store.stage_context(session, context, "assistant", [call], key="step:wait")
             store.put(session, "execution:wait", {"type": "tool_execution", "id": "wait", "call_id": "call",
                       "task_id": task["id"], "context_id": context, "run_id": "run", "name": "agent_wait",
                       "input": call["input"], "status": "pending"})
@@ -1289,8 +1309,8 @@ def test_stopping_a_waiting_agent_completes_its_tool_call(isolated, helper, read
             with db.new_session() as session:
                 assert store.get(session, "agent-wait:wait")["status"] == "completed"
                 assert store.get(session, "group:wait")["status"] == "completed"
-                result = store.history(session, context)[-1]["content"][0]
-                assert result["is_error"] and "停止" in result["content"]
+                result = store.get(session, "execution:wait")["output"]
+                assert result.startswith("Error:") and "停止" in result
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -1328,12 +1348,11 @@ def test_waiting_agent_resumes_on_user_update_and_detects_wait_cycle(isolated):
         await runtime._schedule_once()
         try:
             await asyncio.wait_for(runtime.client.worker_started.wait(), 4)
-            with db.new_session() as session:
-                result = next(block for message in store.history(session, a["context_id"])
-                              if isinstance(message["content"], list) for block in message["content"]
-                              if block.get("type") == "tool_result")
-                assert result["is_error"] and "新要求" in result["content"]
-                assert any(message["content"] == "修改后的要求" for message in store.history(session, a["context_id"]))
+            history = await checkpoint_history(runtime, a["context_id"])
+            result = next(block for message in history if isinstance(message["content"], list)
+                          for block in message["content"] if block.get("type") == "tool_result")
+            assert result["is_error"] and "新要求" in result["content"]
+            assert any(message["content"] == "修改后的要求" for message in history)
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -1373,8 +1392,8 @@ def test_report_delivery_failure_retries_without_duplicate_context(isolated, mon
                 with db.new_session() as session:
                     return store.get(session, "bus:retry")["delivery"] == "processed"
             await wait_for(processed, timeout=8)
+            records = await checkpoint_history(runtime, "main")
             with db.new_session() as session:
-                records = store.records(session, "agent_context", context_id="main")
                 assert sum(1 for r in records if r["id"] == "bus:retry") == 1
                 assert store.get(session, f"task:{task['id']}")["status"] == "completed"
         finally:
@@ -1417,10 +1436,10 @@ def test_invalid_main_tool_keeps_pending_approval_and_does_not_act(isolated):
             with db.new_session() as session:
                 assert store.get(session, "approval:pending")["status"] == "requested"
                 assert not store.get(session, f"task:{task['id']}")["stop_requested"]
-                results = [block for message in store.history(session, "main")
-                           if isinstance(message["content"], list) for block in message["content"]
-                           if block.get("type") == "tool_result"]
-                assert results[0].get("is_error")
+            history = await checkpoint_history(runtime, "main")
+            results = [block for message in history if isinstance(message["content"], list)
+                       for block in message["content"] if block.get("type") == "tool_result"]
+            assert results[0].get("is_error")
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -1647,8 +1666,8 @@ def test_worker_rejects_host_commands(isolated, monkeypatch):
         monkeypatch.setattr(worker, "authorize", allow)
         await worker.process_group("one")
         with db.new_session() as session:
-            result = store.history(session, worker.context_id)[-1]["content"][0]
-        assert result.get("is_error") and "禁止宿主命令" in result["content"]
+            result = store.get(session, "execution:one")["output"]
+        assert result.startswith("Error:") and "禁止宿主命令" in result
         assert states == ["error"] and not calls
     asyncio.run(run())
 
@@ -1864,8 +1883,9 @@ def test_direct_started_tool_is_not_replayed_after_restart(isolated, monkeypatch
             identity = f"{task['id']}:run:call"
             task.update(status="running", run_id="run", direct=True, direct_phase="executing", direct_group=group)
             store.put(session, f"task:{task['id']}", task)
-            store.append_history(session, task["context_id"], "assistant", [{
-                "type": "tool_use", "id": "call", "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}])
+            store.stage_context(session, task["context_id"], "assistant", [{
+                "type": "tool_use", "id": "call", "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}}],
+                                 key=f"step:{group}")
             store.put(session, f"execution:{identity}", {"type": "tool_execution", "id": identity,
                       "task_id": task["id"], "context_id": task["context_id"], "run_id": "run", "call_id": "call",
                       "name": "read_file", "input": {"path": "/mnt/user-data/workspace/note.txt"}, "status": "started"})
@@ -1895,7 +1915,7 @@ def test_direct_pending_approval_is_reissued_after_restart(isolated):
             store.put(session, f"task:{task['id']}", task)
             call = {"type": "tool_use", "id": "call", "name": "write_file",
                     "input": {"path": "/mnt/user-data/workspace/recovered.txt", "content": "ok"}}
-            store.append_history(session, task["context_id"], "assistant", [call])
+            store.stage_context(session, task["context_id"], "assistant", [call], key=f"step:{group}")
             store.put(session, f"execution:{identity}", {"type": "tool_execution", "id": identity,
                       "task_id": task["id"], "context_id": task["context_id"], "run_id": "run", "call_id": "call",
                       "name": call["name"], "input": call["input"], "status": "pending"})
@@ -1939,6 +1959,11 @@ def test_direct_step_limit_does_not_execute_unavailable_tool(isolated, monkeypat
 
     async def run():
         runtime = Runtime(client=LimitModel())
+
+        async def keep_records():
+            pass
+
+        monkeypatch.setattr(runtime, "_cleanup_finished", keep_records)
         with db.new_session() as session:
             store.initialize(session, isolated)
             task = runtime.create_task(session, "达到上限", 1)
@@ -2029,12 +2054,11 @@ def test_first_action_reads_file_in_two_model_calls(isolated):
             await wait_for(lambda: bool(model.reply_messages))
             assert model.calls == ["first", "reply"]
             assert "workspace" in json.dumps(model.reply_messages, ensure_ascii=False)
-            with db.new_session() as session:
-                history = store.history(session, "main")
-                action = next(block for entry in history if isinstance(entry["content"], list)
-                              for block in entry["content"] if block.get("type") == "tool_use")
-                assert action["name"] == "read_file"
-                assert action["input"] == {"path": "/mnt/user-data/workspace/note.txt"}
+            history = await checkpoint_history(runtime, "main")
+            action = next(block for entry in history if isinstance(entry["content"], list)
+                          for block in entry["content"] if block.get("type") == "tool_use")
+            assert action["name"] == "read_file"
+            assert action["input"] == {"path": "/mnt/user-data/workspace/note.txt"}
         finally:
             await runtime.close()
     asyncio.run(run())

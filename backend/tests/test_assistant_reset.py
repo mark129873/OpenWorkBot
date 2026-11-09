@@ -137,7 +137,7 @@ def test_reset_waits_for_tool_and_deletes_old_context(isolated):
                 assert not list(session.scalars(select(Session).where(Session.time_archived.is_not(None))))
                 assert session.get(Message, scoped("user:old")) is None
                 assert session.get(TurnUsage, (scoped("main"), "old")) is None
-                assert store.history(session, "main") == []
+                assert store.records(session, "context_pending", context_id="main") == []
                 assert store.records(session, "task_state") == []
                 assert store.get(session, "meta")["user_seq"] >= 1
             accepted = await runtime.accept("old", "新助手消息", "build", assistant_id=after["assistant_id"])

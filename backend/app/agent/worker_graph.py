@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from langchain_core.messages import AIMessage
 
 from app import db
-from app.agent import compact, hooks, skills, todo
+from app.agent import compact, context as agent_context, hooks, skills, todo
 from app.agent.model_call import record_model_step
 from app.agent.task_tools import WORKER_TOOLS
 from app.models import new_id
@@ -28,7 +28,7 @@ async def _tool_call(worker, call, context):
     return await worker.process_execution(execution["id"])
 
 
-async def _invoke(worker, before_model, model_call, after_model=None, *, group_id=None):
+async def _invoke(worker, before_model, model_call, after_model=None, *, group_id=None, completed_calls=None):
     runtime = worker.runtime
     async with runtime.graph.write_lock:
         thread_id = runtime.graph.thread_id(f"{worker.context_id}:loop", parent_context=worker.context_id)
@@ -90,8 +90,15 @@ async def _invoke(worker, before_model, model_call, after_model=None, *, group_i
     context.pop("injected", None)
     context.pop("retain_on_error", None)
     context.pop("_ordered_tool_groups", None)
+    context.pop("compacted_context", None)
+
+    async def acknowledge(identities):
+        await agent_context.acknowledge(runtime, worker.context_id, identities)
+
     context.update(before_model=before_model, model_call=model_call, tool_call=tool_call, skip_tool_call=skip_tool_call,
-                   after_model=after_model, group_id=group_id)
+                   after_model=after_model, group_id=group_id,
+                   completed_calls=completed_calls or {},
+                   collect_pending=lambda: agent_context.pending(worker.context_id), acknowledge_pending=acknowledge)
     await runtime.graph.invoke_loop(runtime.agent_loop, thread_id, context)
 
 
@@ -110,13 +117,14 @@ async def process_group(worker, group_id):
             return {"jump_to": "end"}
         context["injected"] = True
         calls = [{"id": item["call_id"], "name": item["name"], "args": item["input"], "type": "tool_call"}
-                 for item in pending]
-        return {"messages": [AIMessage(content="", tool_calls=calls)], "jump_to": "tools"}
+                 for item in executions]
+        return {"messages": [AIMessage(content="", id=f"step:{group_id}", tool_calls=calls)], "jump_to": "tools"}
 
     async def model_call(state, context):
         raise RuntimeError("已保存的工具调用不能再次请求模型")
 
-    await _invoke(worker, before_model, model_call, group_id=group_id)
+    completed = {item["call_id"]: item["output"] for item in executions if item["status"] == "completed"}
+    await _invoke(worker, before_model, model_call, group_id=group_id, completed_calls=completed)
 
 
 async def run(worker):
@@ -168,7 +176,7 @@ async def run(worker):
         context["step_number"] = await runtime.change(step)
 
     async def model_call(state, context):
-        history = todo.remind(await compact.context_history(runtime, worker.context_id), state)
+        history = todo.remind(await compact.context_history(runtime, state, context), state)
         deps = SimpleNamespace(client=runtime.client, recorder=SimpleNamespace(session_id="main", turn_id=worker.run_id))
         system = _PROMPT + skills.skill_prompt() + "\n" + todo.PROMPT
         with record_model_step(deps, system, history, WORKER_TOOLS, subtask_id=worker.task_id) as reply:
@@ -182,7 +190,9 @@ async def run(worker):
             await worker.finish("failed", "模型没有返回内容，本轮未完成。")
             return AIMessage(content="模型没有返回内容")
         if not reply.tool_uses:
-            await runtime.change(lambda session: store.append_history(session, worker.context_id, "assistant", blocks))
+            step_id = f"step:{worker.task_id}:{worker.run_id}:{context['step_number']}"
+            await runtime.change(lambda session: store.stage_context(session, worker.context_id, "assistant", blocks,
+                                                                       key=step_id))
             with db.new_session() as session:
                 incoming = store.records(session, "agent_message", context_id=worker.context_id, delivery="pending")
             if incoming or worker.stop.is_set() or worker.task().get("dependency"):
@@ -191,11 +201,11 @@ async def run(worker):
                 injection = hooks.trigger("Stop", {"turn_id": worker.run_id, "task_id": worker.task_id,
                                                    "steps": context["step_number"]})
                 if isinstance(injection, str) and injection:
-                    await runtime.change(lambda session: store.append_history(session, worker.context_id, "user", injection))
+                    await runtime.change(lambda session: store.stage_context(session, worker.context_id, "user", injection))
                     context["retry"] = True
                 else:
                     await worker.finish("result", reply.text or "助手未提供结果。")
-            return AIMessage(content=reply.text)
+            return AIMessage(content=reply.text, id=step_id)
 
         group_id = f"{worker.task_id}:{worker.run_id}:{context['step_number']}"
         ids = [call.get("id") for call in reply.tool_uses]
@@ -204,7 +214,7 @@ async def run(worker):
             return AIMessage(content="模型返回了无效的工具调用")
 
         def save_group(session):
-            store.append_history(session, worker.context_id, "assistant", blocks, key=f"step:{group_id}")
+            store.stage_context(session, worker.context_id, "assistant", blocks, key=f"step:{group_id}")
             calls = []
             for call in reply.tool_uses:
                 identity = f"{worker.task_id}:{worker.run_id}:{call['id']}"
@@ -223,7 +233,7 @@ async def run(worker):
                       "context_id": worker.context_id, "calls": calls, "status": "pending"})
         await runtime.change(save_group)
         context["group_id"] = group_id
-        return AIMessage(content=reply.text, tool_calls=[{"id": call["id"], "name": call["name"],
+        return AIMessage(content=reply.text, id=f"step:{group_id}", tool_calls=[{"id": call["id"], "name": call["name"],
                          "args": call.get("input") or {}, "type": "tool_call"} for call in reply.tool_uses])
 
     async def after_model(state, context):

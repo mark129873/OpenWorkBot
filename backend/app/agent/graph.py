@@ -9,9 +9,7 @@ from app.sessions import chat_store as store
 from app.user_context import require_user
 
 
-class AgentState(TypedDict, total=False):
-    history: list[dict]
-    memory: str
+class DeliveryState(TypedDict, total=False):
     incoming: dict | None
     deliveries: dict[str, dict]
 
@@ -20,7 +18,7 @@ class AgentContext(TypedDict):
     action: Callable[[], Awaitable[Any]] | None
 
 
-def _receive(state: AgentState) -> dict:
+def _receive(state: DeliveryState) -> dict:
     message = state.get("incoming")
     if not message:
         return {}
@@ -32,7 +30,7 @@ def _receive(state: AgentState) -> dict:
     return {"deliveries": deliveries, "incoming": None}
 
 
-async def _act(state: AgentState, runtime: GraphRuntime[AgentContext]) -> dict:
+async def _act(state: DeliveryState, runtime: GraphRuntime[AgentContext]) -> dict:
     action = runtime.context.get("action")
     if action is not None:
         await action()
@@ -42,7 +40,7 @@ async def _act(state: AgentState, runtime: GraphRuntime[AgentContext]) -> dict:
 class AgentGraph:
     def __init__(self, checkpointer) -> None:
         self.write_lock = getattr(checkpointer, "write_lock", asyncio.Lock())
-        builder = StateGraph(AgentState, context_schema=AgentContext)
+        builder = StateGraph(DeliveryState, context_schema=AgentContext)
         builder.add_node("receive", _receive)
         builder.add_node("act", _act)
         builder.add_edge(START, "receive")
@@ -72,16 +70,11 @@ class AgentGraph:
             return await loop.invoke(context, thread_id=thread_id)
 
     async def invoke(self, context_id: str, *, incoming: dict | None = None,
-                     history: list[dict] | None = None, memory: str | None = None,
                      action: Callable[[], Awaitable[Any]] | None = None) -> None:
         async with self.write_lock:
             thread_id = self.thread_id(context_id)
         config = {"configurable": {"thread_id": thread_id}}
-        data: AgentState = {"incoming": incoming}
-        if history is not None:
-            data["history"] = history
-        if memory is not None:
-            data["memory"] = memory
+        data: DeliveryState = {"incoming": incoming}
         async with self.locks.setdefault(thread_id, asyncio.Lock()):
             await self.graph.ainvoke(data, config, context={"action": action}, durability="sync")
 

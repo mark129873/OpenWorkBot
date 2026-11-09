@@ -4,7 +4,7 @@ from app import db
 from app.agent.runtime import Runtime
 from app.agent.worker import Worker
 from app.sessions import chat_store as store
-from test_chat_runtime import accept, isolated, wait_for
+from test_chat_runtime import accept, checkpoint_history, isolated, wait_for
 
 
 class Model:
@@ -39,8 +39,7 @@ def test_main_todo_is_written_to_agent_state(isolated):
             thread = runtime.graph.thread_id("main:loop", parent_context="main")
             state = await runtime.agent_loop.graph.aget_state({"configurable": {"thread_id": thread}})
             assert state.values["todos"] == items
-            with db.new_session() as session:
-                assert store.history(session, "main")[-1]["role"] == "assistant"
+            assert any(message.type == "ai" for message in state.values["messages"])
         finally:
             await runtime.close()
     asyncio.run(run())
@@ -84,9 +83,10 @@ def test_failed_main_action_skips_later_actions(isolated):
             await wait_for(lambda: model.count >= 2)
             with db.new_session() as session:
                 assert not store.records(session, "task_state")
-                results = [block for row in store.history(session, "main") if isinstance(row["content"], list)
-                           for block in row["content"] if block.get("type") == "tool_result"]
-                assert "不存在" in results[0]["content"] and "未执行" in results[1]["content"]
+            history = await checkpoint_history(runtime, "main")
+            results = [block for row in history if isinstance(row["content"], list)
+                       for block in row["content"] if block.get("type") == "tool_result"]
+            assert "不存在" in results[0]["content"] and "未执行" in results[1]["content"]
         finally:
             await runtime.close()
     asyncio.run(run())

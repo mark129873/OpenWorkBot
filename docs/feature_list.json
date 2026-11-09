@@ -116,6 +116,13 @@
       "description": "新账号复制 code-review 模板；技能发现、加载和沙箱按用户隔离。",
       "status": "passing",
       "evidence": "隔离空库后端全量 231 项通过、2 项 Docker 默认跳过；真实 Docker 双用户隔离与只读专项 1 项、最终技能专项 5 项通过。未调用真实模型。"
+    },
+    {
+      "id": "Backend-12",
+      "name": "检查点短期上下文",
+      "description": "各 Agent 以 full 检查点保存上下文，主助手从 state 尽力提取长期记忆。",
+      "status": "passing",
+      "evidence": "隔离空库后端全量 249 项通过、2 项 Docker 跳过；检查点、记忆与 TODO 专项 49 项通过。未调用真实模型或模拟真实断电。"
     }
   ]
 }

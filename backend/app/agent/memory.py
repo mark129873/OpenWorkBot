@@ -201,6 +201,7 @@ def _apply(summary: dict, facts: list[dict], result: dict) -> tuple[dict, list[d
 class Memory:
     def __init__(self) -> None:
         self.pending: dict[str, dict] = {}
+        self.compactions: list[tuple[str, dict]] = []
         self.event = asyncio.Event()
         self.worker: asyncio.Task | None = None
         self.draining = False
@@ -234,8 +235,19 @@ class Memory:
         if self.worker is None or self.worker.done():
             self.worker = asyncio.create_task(self._worker())
 
+    def enqueue_compaction(self, client, records: list[dict], events: dict[str, dict], generation: int) -> None:
+        if self.draining:
+            return
+        user_id = require_user()
+        self.compactions.append((user_id, {"client": client, "generation": generation, "records": records,
+                                           "events": events, "signals": _signals(_conversation(records, events, {}))}))
+        self.event.set()
+        if self.worker is None or self.worker.done():
+            self.worker = asyncio.create_task(self._worker())
+
     def discard_pending(self, user_id: str) -> None:
         self.pending.pop(user_id, None)
+        self.compactions = [item for item in self.compactions if item[0] != user_id]
         self.event.set()
 
     async def clear(self) -> None:
@@ -247,7 +259,7 @@ class Memory:
     async def close(self) -> None:
         self.draining = True
         self.event.set()
-        if self.pending and (self.worker is None or self.worker.done()):
+        if (self.pending or self.compactions) and (self.worker is None or self.worker.done()):
             self.worker = asyncio.create_task(self._worker())
         if self.worker is not None:
             try:
@@ -257,32 +269,38 @@ class Memory:
                 await asyncio.gather(self.worker, return_exceptions=True)
 
     async def _worker(self) -> None:
-        while self.pending:
+        while self.pending or self.compactions:
             self.event.clear()
             now = time.monotonic()
             due = [user_id for user_id, item in self.pending.items() if self.draining or item["due"] <= now]
-            if not due:
+            if not due and not self.compactions:
                 wait = max(0, min(item["due"] for item in self.pending.values()) - now)
                 try:
                     await asyncio.wait_for(self.event.wait(), timeout=wait)
                 except asyncio.TimeoutError:
                     pass
                 continue
-            batches = [(user_id, self.pending.pop(user_id)) for user_id in due]
-            for user_id, batch in batches:
+            batches = [(user_id, batch, True) for user_id, batch in self.compactions]
+            self.compactions = []
+            batches.extend((user_id, self.pending.pop(user_id), False) for user_id in due)
+            for user_id, batch, bypass in batches:
                 try:
                     with bind_user(user_id):
-                        await self._extract(user_id, batch["client"], batch["records"], batch["events"],
-                                            batch["generation"], batch["signals"])
+                        args = (user_id, batch["client"], batch["records"], batch["events"],
+                                batch["generation"], batch["signals"])
+                        if bypass:
+                            await self._extract(*args, bypass_watermark=True)
+                        else:
+                            await self._extract(*args)
                 except asyncio.CancelledError:
                     raise
                 except Exception:
                     logger.exception("长期记忆提取失败 user=%s", user_id)
-                if len(due) > 1 and not self.draining:
+                if len(batches) > 1 and not self.draining:
                     await asyncio.sleep(_BATCH_DELAY)
 
     async def _extract(self, user_id: str, client, records: list[dict], events: dict[str, dict], generation: int,
-                       signals: set[str] | frozenset[str] = frozenset()) -> None:
+                       signals: set[str] | frozenset[str] = frozenset(), *, bypass_watermark: bool = False) -> None:
         with db.new_session() as session:
             user = session.get(User, user_id)
             if not user or user.generation != generation:
@@ -293,7 +311,7 @@ class Memory:
         conversation = _conversation(records, events, {})
         if not {"user", "assistant"}.issubset({item["role"] for item in conversation}):
             return
-        messages = _conversation(records, events, state)
+        messages = _conversation(records, events, {} if bypass_watermark else state)
         if not messages:
             return
         content = json.dumps({"memory": {**summary, "facts": facts},
@@ -324,4 +342,5 @@ class Memory:
                     if attempt == 2:
                         raise
                     summary, facts = await _io(_read_files, user_id)
-            await _io(_advance, user_id, messages[-1]["id"])
+            if not bypass_watermark:
+                await _io(_advance, user_id, messages[-1]["id"])

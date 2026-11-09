@@ -48,7 +48,7 @@ def archive(db) -> str:
                        time_updated=message.time_updated, data=message.data))
     db.flush()
     for part in db.scalars(select(Part).where(Part.session_id == session_id)):
-        if part.message_id == control_id and read(part).get("type") in {"meta", "agent_context", "agent_summary"}:
+        if part.message_id == control_id and read(part).get("type") in {"meta", "context_pending"}:
             continue
         db.add(Part(id=scoped(f"{archive_id}:{unscoped(part.id)}"),
                     message_id=scoped(f"{archive_id}:{unscoped(part.message_id)}"),
@@ -156,21 +156,24 @@ def visible_page(db, limit: int, before: int | None = None) -> tuple[list[dict],
     return _visible_rows(page), page[0][0].sequence if len(rows) > limit and page else None
 
 
-def append_history(db, context_id: str, role: str, content, *, key: str | None = None) -> str:
+def stage_context(db, context_id: str, role: str, content, *, key: str | None = None) -> str:
     key = key or new_id()
-    existing = get(db, f"history:{key}")
-    value = {"type": "agent_context", "id": key, "context_id": context_id,
+    existing = get(db, f"context-pending:{key}")
+    value = {"type": "context_pending", "id": key, "context_id": context_id,
              "role": role, "content": content}
     if existing is not None and existing != value:
         raise ValueError("相同上下文消息 ID 的内容不一致")
     if existing is None:
-        put(db, f"history:{key}", value)
+        put(db, f"context-pending:{key}", value)
     return key
 
 
-def history(db, context_id: str) -> list[dict]:
-    return [{"role": row["role"], "content": row["content"]}
-            for row in records(db, "agent_context", context_id=context_id)]
+def clear_pending(db, context_id: str, identities: list[str]) -> None:
+    for identity in identities:
+        row = db.get(Part, scoped(f"context-pending:{identity}"))
+        value = read(row)
+        if value.get("type") == "context_pending" and value.get("context_id") == context_id:
+            db.delete(row)
 
 
 def bump(db, *, user_event: bool = False) -> dict:

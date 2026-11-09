@@ -34,7 +34,8 @@ def test_chat_records_and_cycle_detection(tmp_path, monkeypatch):
             agent_bus.deliver(session, msg)
             session.commit()
             assert chat_store.visible(session)[0]["text"] == "你好"
-            assert chat_store.history(session, "main") == [{"role": "user", "content": "报告"}]
+            pending = chat_store.records(session, "context_pending", context_id="main")
+            assert [(row["role"], row["content"]) for row in pending] == [("user", "报告")]
             with pytest.raises(ValueError):
                 agent_bus.send(session, source="a", target="main", task_id="task", content="别的", message_id="m1")
         assert agent_bus.find_cycles([("A", "B"), ("B", "C"), ("C", "A")]) == [["A", "B", "C", "A"]]

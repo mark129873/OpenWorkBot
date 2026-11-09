@@ -188,7 +188,7 @@ class Worker:
                     if wait:
                         wait["status"] = "completed"
                         store.put(session, f"agent-wait:{identity}", wait)
-            store.append_history(session, self.context_id, "user", outputs, key=f"result:{group_id}")
+            store.stage_context(session, self.context_id, "user", outputs, key=f"result:{group_id}")
             current["status"] = "completed"
             store.put(session, f"group:{group_id}", current)
         await self.runtime.change(finish_group)
@@ -760,7 +760,7 @@ class Worker:
                           "status": "queued", "steps": 0}
                 store.put(session, f"helper:{context_id}", helper)
                 store.put(session, f"help-action:{identity}", {"type": "help_action", "context_id": context_id})
-                store.append_history(session, context_id, "user", f"协助任务：{goal}", key=f"help:{context_id}")
+                store.stage_context(session, context_id, "user", f"协助任务：{goal}", key=f"help:{context_id}")
                 return context_id
             helper_id = await self.runtime.change(allocate)
             return f"协助已受理，助手 ID：{helper_id}" if helper_id else "没有空闲助手，未分配协助"

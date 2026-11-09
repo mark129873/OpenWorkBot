@@ -44,13 +44,23 @@ class OrderedToolMiddleware(AgentMiddleware):
                         raise AgentWaiting
                     duplicate = (request.tool_call.get("name") == "write_todos"
                                  and sum(call.get("name") == "write_todos" for call in calls) > 1)
+                    cached = context.get("completed_calls", {})
+                    if call_id in cached and request.tool_call.get("name") != "write_todos":
+                        output = cached[call_id]
+                        is_error = output.startswith("Error:")
+                        group["failed"] = group["failed"] or is_error
+                        identity = f"result:{context['group_id']}:{call_id}"
+                        return ToolMessage(content=output, tool_call_id=call_id, id=identity,
+                                           name=request.tool_call["name"], status="error" if is_error else "success")
                     if group["failed"] or duplicate:
                         output = "Error: 同一轮不能多次调用 write_todos。" if duplicate else "Error: 前一项工具失败，本项未执行。"
                         skip = context.get("skip_tool_call")
                         if skip:
                             await skip(request.tool_call, context, output)
                         group["failed"] = True
-                        return ToolMessage(content=output, tool_call_id=call_id, name=request.tool_call["name"], status="error")
+                        identity = f"result:{context['group_id']}:{call_id}" if context.get("group_id") else None
+                        return ToolMessage(content=output, tool_call_id=call_id, id=identity,
+                                           name=request.tool_call["name"], status="error")
                     result = await handler(request)
                     if isinstance(result, ToolMessage) and (result.status == "error" or str(result.content).startswith("Error:")):
                         group["failed"] = True

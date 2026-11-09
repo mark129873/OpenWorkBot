@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from langchain_core.messages import AIMessage
 
 from app import db
-from app.agent import agent_bus, compact, hooks, skills, todo
+from app.agent import agent_bus, compact, context as agent_context, hooks, skills, todo
 from app.agent.model_call import record_model_step
 from app.agent.task_tools import DIRECT_TOOLS, MAIN_TOOLS, SHARED_TOOLS
 from app.config import settings
@@ -30,7 +30,7 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
                 group = store.get(session, f"group:{context['group_id']}")
                 group["status"] = "completed"
                 store.put(session, f"group:{context['group_id']}", group)
-                store.append_history(session, "main", "user", outputs, key=f"result:{context['group_id']}")
+                store.stage_context(session, "main", "user", outputs, key=f"result:{context['group_id']}")
             await runtime.change(save)
             context["note"] = "继续根据工具结果处理；不要重复创建已受理的任务。"
         if context["step"] >= 40:
@@ -43,17 +43,16 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
                          if source_seq is not None and event["user_seq"] > source_seq]
             approvals = [item for item in store.records(session, "approval")
                          if item["status"] in {"requested", "resolved"}]
-        messages = await compact.context_history(runtime, "main")
         task_note = ("部分任务已省略，请用 task_search 查找；" if omitted else "") + "任务为摘要，必要时用 task_inspect 查看详情。"
         if direct_task and direct_task.get("steps", 0) >= 40:
             task_note += "直接执行已达到 40 步上限，请停止并说明；后续工作可分配后台助手。"
-        messages.append({"role": "user", "content": f"{context['note']}\n{task_note}\n"
-                         f"较新的用户操作：{store.dump(decisions)}\n审批：{store.dump(approvals)}\n当前任务：{store.dump(tasks)}"})
+        context["dynamic_note"] = (f"{context['note']}\n{task_note}\n"
+                                   f"较新的用户操作：{store.dump(decisions)}\n审批：{store.dump(approvals)}\n当前任务：{store.dump(tasks)}")
         dialog_tools = [tool for tool in MAIN_TOOLS if required_review or tool["name"] != "task_review"] + SHARED_TOOLS
         if allow_direct and (not direct_task_id or (direct_task and direct_task["status"] not in _TERMINAL
                             and not direct_task.get("stop_requested") and direct_task.get("steps", 0) < 40)):
             dialog_tools += DIRECT_TOOLS
-        context.update(messages=messages, tools=dialog_tools, message_id=None, text="", saved_length=0,
+        context.update(tools=dialog_tools, message_id=None, text="", saved_length=0,
                        last_update=0.0, turn_id=new_id())
 
     async def model_call(state, context):
@@ -62,7 +61,9 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
         deps = SimpleNamespace(client=runtime.client,
                                recorder=SimpleNamespace(session_id="main", turn_id=context["turn_id"]))
         system = _PROMPT_PATH.read_text(encoding="utf-8") + skills.skill_prompt() + "\n" + todo.PROMPT
-        messages = todo.remind(runtime.memory_messages(runtime.main_memory, context["messages"]), state)
+        messages = await compact.context_history(runtime, state, context)
+        messages.append({"role": "user", "content": context["dynamic_note"]})
+        messages = todo.remind(runtime.memory_messages(runtime.main_memory, messages), state)
         choice = {"tool_choice": {"type": "tool", "name": "task_review"}} if required_review and step == 0 else {}
         with record_model_step(deps, system, messages, context["tools"]) as reply:
             async for event in runtime.client.stream(system=system, messages=messages,
@@ -84,7 +85,11 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
         if generation != runtime.generation:
             raise asyncio.CancelledError
         context["reply"] = reply
-        return AIMessage(content=reply.text, tool_calls=[{"id": call["id"], "name": call["name"],
+        call_ids = [call.get("id") for call in reply.tool_uses]
+        if any(not isinstance(identity, str) or not identity for identity in call_ids) or len(call_ids) != len(set(call_ids)):
+            raise ValueError("模型返回了无效或重复的工具调用 ID")
+        return AIMessage(content=reply.text, id=f"step:{context['turn_id']}",
+                         additional_kwargs={"memory_status": "pending"}, tool_calls=[{"id": call["id"], "name": call["name"],
                          "args": call.get("input") or {}, "type": "tool_call"} for call in reply.tool_uses])
 
     async def after_model(state, context):
@@ -104,14 +109,15 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
             def unavailable(session):
                 if message_id:
                     store.update_visible(session, message_id, text=text, status="interrupted")
-                store.append_history(session, "main", "assistant", blocks)
-                store.append_history(session, "main", "user", results)
+                store.stage_context(session, "main", "assistant", blocks, key=f"step:{context['turn_id']}")
+                store.stage_context(session, "main", "user", results, key=f"result:unavailable:{context['turn_id']}")
             await runtime.change(unavailable)
             if context["unavailable"] >= 2:
+                failed_id = f"failed:{new_id()}"
                 def acknowledge(session):
                     text = "这条回复暂时无法完成，请重试。"
                     store.add_visible(session, "assistant", text, status="failed")
-                    store.append_history(session, "main", "assistant", text, key=f"failed:{new_id()}")
+                    store.stage_context(session, "main", "assistant", text, key=failed_id)
                     if reply_id:
                         row = store.get(session, f"reply:{reply_id}")
                         if row and row["status"] == "pending":
@@ -130,7 +136,9 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
                         if direct_report_id:
                             agent_bus.processed(session, store.get(session, f"bus:{direct_report_id}"))
                 await runtime.change(acknowledge)
-                return {"jump_to": "end"}
+                recorded = [{"id": f"result:unavailable:{context['turn_id']}", "role": "user", "content": results},
+                            {"id": failed_id, "role": "assistant", "content": "这条回复暂时无法完成，请重试。"}]
+                return {"jump_to": "end", "messages": agent_context.messages_from_records(recorded)}
             context["note"] = "刚才的工具调用没有执行，请直接回复用户；任务结果由系统送达后再判断。"
             return {"jump_to": "model"}
 
@@ -152,7 +160,7 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
                     return False
                 if message_id:
                     store.update_visible(session, message_id, text=text, status="completed")
-                store.append_history(session, "main", "assistant", blocks)
+                store.stage_context(session, "main", "assistant", blocks, key=f"step:{context['turn_id']}")
                 if reply_id and not (isinstance(injection, str) and injection):
                     row["status"] = "completed"
                     store.put(session, f"reply:{reply_id}", row)
@@ -173,18 +181,25 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
                         agent_bus.processed(session, store.get(session, f"bus:{direct_report_id}"))
                 return True
             if not await runtime.change(finish_reply):
+                context["memory_status"] = "interrupted"
                 return {"jump_to": "end"}
             if isinstance(injection, str) and injection:
-                await runtime.change(lambda session: store.append_history(session, "main", "user", injection))
+                await runtime.change(lambda session: store.stage_context(session, "main", "user", injection))
                 return {"jump_to": "model"}
             return {"jump_to": "end"}
         if message_id:
             await runtime.change(lambda session: store.update_visible(session, message_id, text=text, status="completed"))
         if any(call.get("name") in {tool["name"] for tool in DIRECT_TOOLS} for call in reply.tool_uses):
-            await runtime.change(lambda session: runtime._queue_direct(
+            group_id = await runtime.change(lambda session: runtime._queue_direct(
                 session, blocks, reply.tool_uses, source_seq, reply_id, direct_task_id, direct_report_id,
-                context["decision_seq"]))
-            return {"jump_to": "end"}
+                context["decision_seq"], main_step_id=f"step:{context['turn_id']}"))
+            if not group_id:
+                context["memory_status"] = "interrupted"
+                return {"jump_to": "end"}
+            results = [{"type": "tool_result", "tool_use_id": call["id"], "content": "工具已登记，结果随后送达。"}
+                       for call in reply.tool_uses]
+            recorded = [{"id": f"result:direct:{group_id}", "role": "user", "content": results}]
+            return {"jump_to": "end", "messages": agent_context.messages_from_records(recorded)}
         ids = [call.get("id") for call in reply.tool_uses]
         if any(not isinstance(identity, str) or not identity for identity in ids) or len(ids) != len(set(ids)):
             raise ValueError("模型返回了无效或重复的工具调用 ID")
@@ -200,7 +215,7 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
                     store.put(session, f"input:{reply_id}", event)
             store.put(session, f"group:{context['group_id']}", {"type": "main_tool_group", "context_id": "main",
                       "id": context["group_id"], "calls": reply.tool_uses, "outputs": {}, "status": "pending"})
-            store.append_history(session, "main", "assistant", blocks, key=f"step:{context['group_id']}")
+            store.stage_context(session, "main", "assistant", blocks, key=f"step:{context['turn_id']}")
             return True
         if not await runtime.change(register):
             context.pop("pending_calls")
@@ -255,15 +270,31 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
                 output = group["outputs"].get(call["id"], "Error: 回复已中断，工具未执行。")
                 outputs.append({"type": "tool_result", "tool_use_id": call["id"], "content": output,
                                 **({"is_error": True} if output.startswith("Error:") else {})})
-            store.append_history(session, "main", "user", outputs, key=f"result:{context['group_id']}")
+            store.stage_context(session, "main", "user", outputs, key=f"result:{context['group_id']}")
             group["status"] = "completed"
             store.put(session, f"group:{context['group_id']}", group)
         await runtime.change(save)
 
     async with runtime.graph.write_lock:
         thread_id = runtime.graph.thread_id("main:loop", parent_context="main")
+
+    async def acknowledge(identities):
+        await agent_context.acknowledge(runtime, "main", identities)
+
+    async def flush_memory(messages):
+        from app.models import User
+        with db.new_session() as session:
+            user = session.get(User, runtime.user_id)
+            events = {event["id"]: event for event in store.records(session, "user_event")
+                      if event.get("event_type") == "message"}
+        if user and runtime.client:
+            runtime.memory.enqueue_compaction(runtime.client, agent_context.records_from_messages(messages, for_memory=True),
+                                              events, user.generation)
+
     context.update(thread_id=thread_id, before_model=before_model, model_call=model_call,
-                   after_model=after_model, tool_call=tool_call, skip_tool_call=skip_tool_call)
+                   after_model=after_model, tool_call=tool_call, skip_tool_call=skip_tool_call,
+                   collect_pending=lambda: agent_context.pending("main"), acknowledge_pending=acknowledge,
+                   flush_memory=flush_memory, repair_messages=agent_context.repair_main_history)
     try:
         await runtime.graph.invoke_loop(runtime.agent_loop, thread_id, context)
     except asyncio.CancelledError:
@@ -271,7 +302,7 @@ async def dialog(runtime, note, *, source_seq=None, required_review=None, review
         if context["message_id"]:
             def interrupt(session):
                 store.update_visible(session, context["message_id"], text=context["text"], status="interrupted")
-                store.append_history(session, "main", "assistant", [{"type": "text", "text": context["text"]}],
+                store.stage_context(session, "main", "assistant", [{"type": "text", "text": context["text"]}],
                                      key=f"interrupted:{context['message_id']}")
             await asyncio.shield(runtime.change(interrupt))
         raise

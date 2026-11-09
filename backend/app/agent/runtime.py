@@ -779,9 +779,14 @@ class Runtime:
                 finally:
                     self.main_call = None
                 if completed and self.client and memory_generation is not None:
+                    from app.agent.context import records_from_messages
+                    async with self.graph.write_lock:
+                        thread_id = self.graph.thread_id("main:loop", parent_context="main")
+                    async with self.graph.locks.setdefault(thread_id, asyncio.Lock()):
+                        snapshot = await self.agent_loop.graph.aget_state({"configurable": {"thread_id": thread_id}})
+                    history = records_from_messages(snapshot.values.get("messages", []), for_memory=True)
                     with db.new_session() as session:
                         meta = store.get(session, "meta")
-                        history = store.records(session, "agent_context", context_id="main")
                         events = {event["id"]: event for event in store.records(session, "user_event")
                                   if event.get("event_type") == "message"}
                     if not meta.get("reset") and history:
@@ -824,7 +829,7 @@ class Runtime:
             row = store.get(session, f"input:{event['id']}")
             if not row or row["status"] != "pending":
                 return None
-            store.append_history(session, "main", "user", event["text"], key=f"input:{event['id']}")
+            store.stage_context(session, "main", "user", event["text"], key=f"input:{event['id']}")
             if event.get("attachments") and not event.get("user_text", "").strip():
                 row["status"] = "processed"
                 store.put(session, f"input:{event['id']}", row)
@@ -864,7 +869,7 @@ class Runtime:
         store.put(session, f"task:{task_id}", task)
         store.put(session, f"task-key:{identity}", {"type": "task_key", "task_id": task_id, "goal": goal,
                   "title": title, "knowledge_question": knowledge_question})
-        store.append_history(session, context_id, "user", f"任务目标：{goal}", key=f"goal:{task_id}")
+        store.stage_context(session, context_id, "user", f"任务目标：{goal}", key=f"goal:{task_id}")
         return task
 
     async def _report(self, report: dict) -> None:
@@ -890,7 +895,7 @@ class Runtime:
                 store.put(session, f"task:{current['id']}", current)
                 self._release_dependents(session, current)
                 store.add_visible(session, "assistant", row["content"], message_id=f"rag-answer:{report['id']}")
-                store.append_history(session, "main", "assistant", row["content"], key=f"rag-answer:{report['id']}")
+                store.stage_context(session, "main", "assistant", row["content"], key=f"rag-answer:{report['id']}")
                 agent_bus.processed(session, row)
                 return True
             if await self.change(show_rag):
@@ -937,7 +942,7 @@ class Runtime:
 
     def _queue_direct(self, session, blocks: list, calls: list, source_seq: int | None,
                       reply_id: str | None, task_id: str | None, report_id: str | None,
-                      decision_seq: int | None = None) -> None:
+                      decision_seq: int | None = None, *, main_step_id: str | None = None) -> None:
         row = store.get(session, f"reply:{reply_id}") if reply_id else None
         if reply_id and (not row or row["status"] != "pending"):
             return
@@ -968,15 +973,15 @@ class Runtime:
                     "name": call["name"], "input": args, "status": "pending",
                     "user_seq": source_seq, "decision_seq": decision_seq})
             executions.append(identity)
-        store.append_history(session, task["context_id"], "assistant", blocks)
+        store.stage_context(session, task["context_id"], "assistant", blocks, key=f"step:{group_id}")
         store.put(session, f"group:{group_id}", {"type": "tool_group", "id": group_id,
                   "context_id": task["context_id"], "calls": executions, "status": "pending"})
         task.update(direct_phase="executing", direct_group=group_id, steps=task["steps"] + 1)
         store.put(session, f"task:{task['id']}", task)
         results = [{"type": "tool_result", "tool_use_id": call["id"], "content": "工具已登记，结果随后送达。"}
                    for call in calls]
-        store.append_history(session, "main", "assistant", blocks)
-        store.append_history(session, "main", "user", results)
+        store.stage_context(session, "main", "assistant", blocks, key=main_step_id)
+        store.stage_context(session, "main", "user", results, key=f"result:direct:{group_id}")
         if row:
             row["status"] = "completed"
             store.put(session, f"reply:{reply_id}", row)
@@ -986,6 +991,7 @@ class Runtime:
                 store.put(session, f"input:{reply_id}", event)
         if report_id:
             agent_bus.processed(session, store.get(session, f"bus:{report_id}"))
+        return group_id
 
     async def _run_direct(self, task_id: str, group_id: str) -> None:
         from app.agent.worker import Worker
@@ -1014,7 +1020,7 @@ class Runtime:
                         results.append({"type": "tool_result", "tool_use_id": execution["call_id"],
                                         "content": execution["output"],
                                         **({"is_error": True} if execution["output"].startswith("Error:") else {})})
-                    store.append_history(session, worker.context_id, "user", results, key=f"result:{group_id}")
+                    store.stage_context(session, worker.context_id, "user", results, key=f"result:{group_id}")
                     group["status"] = "completed"
                     store.put(session, f"group:{group_id}", group)
                 await self.change(fail_group)

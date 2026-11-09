@@ -20,7 +20,7 @@ def send(db, *, source: str, target: str, task_id: str, content: str,
 
 
 def deliver(db, message: dict) -> None:
-    store.append_history(db, message["context_id"], "user", message["content"], key=f"bus:{message['id']}")
+    store.stage_context(db, message["context_id"], "user", message["content"], key=f"bus:{message['id']}")
     message["delivery"] = "delivered"
     store.put(db, f"bus:{message['id']}", message)
 

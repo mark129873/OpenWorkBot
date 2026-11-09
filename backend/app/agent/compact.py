@@ -1,7 +1,9 @@
 import asyncio
+import logging
 from copy import deepcopy
 
 _MICRO_PLACEHOLDER = "[旧工具结果已清除以节省上下文]"
+logger = logging.getLogger(__name__)
 
 
 def context_budget(settings) -> int:
@@ -131,28 +133,26 @@ async def prepare_history(client, history: list, config, *, on_summary=None) -> 
     return projected
 
 
-async def context_history(runtime, context_id: str) -> list:
-    from app import db
+async def context_history(runtime, state: dict, context: dict) -> list:
+    from app.agent.context import projected_history
     from app.config import settings
-    from app.sessions import chat_store
 
-    with db.new_session() as session:
-        rows = chat_store.records(session, "agent_context", context_id=context_id)
-        saved = chat_store.get(session, f"summary:{context_id}")
-    start = 0
-    if saved:
-        boundary = next((i for i, row in enumerate(rows) if row["id"] == saved.get("boundary_id")), None)
-        if boundary is not None:
-            start = boundary + 1
-    messages = [{"role": row["role"], "content": row["content"]} for row in rows[start:]]
-    ids = [row["id"] for row in rows[start:]]
-    if saved and start:
-        messages.insert(0, {"role": "user", "content": f"<此前对话摘要>\n{saved['summary']}\n</此前对话摘要>"})
-        ids.insert(0, saved["boundary_id"])
+    source = state.get("messages", [])
+    messages, identities = projected_history(source)
+    if summary := state.get("summary_text"):
+        messages.insert(0, {"role": "user", "content": f"<此前对话摘要>\n{summary}\n</此前对话摘要>"})
+        identities.insert(0, [])
 
     async def save_summary(cutoff: int, summary: str) -> None:
-        boundary_id = ids[cutoff - 1]
-        await runtime.change(lambda session: chat_store.put(session, f"summary:{context_id}", {
-            "type": "agent_summary", "context_id": context_id, "boundary_id": boundary_id, "summary": summary}))
+        ids = [identity for group in identities[:cutoff] for identity in group]
+        if not ids:
+            raise ValueError("上下文摘要没有可移除的消息")
+        context["compacted_context"] = {"ids": ids, "summary": summary}
+        flush = context.get("flush_memory")
+        if flush:
+            try:
+                await flush([message for message in source if message.id in ids])
+            except Exception:
+                logger.exception("压缩前长期记忆提取提交失败")
 
     return await prepare_history(runtime.client, messages, settings, on_summary=save_summary)
