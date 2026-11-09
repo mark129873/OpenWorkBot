@@ -1,0 +1,26 @@
+# 在项目根目录运行 docker compose --env-file backend/.env up -d。
+# 从 backend/.env 读取 POSTGRES_PASSWORD，可选配置 POSTGRES_USER、POSTGRES_DB 和 POSTGRES_PORT。
+# 密码须与 DATABASE_URL 一致；数据库卷在停止或重建容器后保留。
+# 已初始化的卷不会根据环境变量重新设置用户或密码。
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-openworkbot}
+      POSTGRES_DB: ${POSTGRES_DB:-openworkbot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?请通过 --env-file backend/.env 设置 POSTGRES_PASSWORD}
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+
+volumes:
+  postgres_data:

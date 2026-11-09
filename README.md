@@ -17,68 +17,7 @@ OpenWorkBot 旨在打造类 OpenAI Dots 的自主智能员工,面向个人与企
 - Shared State + Message Bus
 ![Multi-Agent 协作架构](./readme_docs/message_bus.png)
 
-### 2.2 Sandbox 沙箱隔离
-
-```text
-Agent Runtime：管理用户运行时和后台任务调度
-  │
-  ├─ 主 Agent：LangGraph create_agent
-  └─ 后台 SubAgent Worker：LangGraph create_agent
-       ├─ 权限与审批: 判断工具调用是否允许执行
-       └─ SandboxMiddleware: 获取并绑定沙箱
-            │
-            └─ 沙箱工具：bash、read_file、write_file、str_replace、ls、glob、grep
-                 │
-                 ├─ AioSandboxProvider: 沙箱租约与生命周期管理
-                 │    └─ LocalContainerBackend
-                 │         └─ 创建、检查、回收 Docker 资源
-                 │
-                 └─ AioSandbox
-                      └─ agent-sandbox SDK / HTTP
-                           └─ 代理认证中继 → AIO 沙箱容器
-```
-
-**分层架构**：
-- SandboxMiddleware：在 Agent 执行期间获取沙箱，让工具能够找到对应的执行环境。
-- SandboxProvider：按用户管理沙箱的创建、获取、释放和复用。
-- Sandbox：提供统一的命令执行、文件读写、目录访问能力。
-
-**生命周期管理**：
-- 延迟初始化(懒加载)：如果 Agent 只需要回答问题、不调用文件或命令工具，就不必启动沙箱, 避免资源浪费。
-- 用户级复用：每用户一组容器：一个 AIO 沙箱容器 + 一个代理容器, 主 Agent 和 SubAgent 共享。
-- 空闲回收: 默认空闲 600 秒后回收，容量紧张时可能提前回收。
-- Warm Pool：所有租约释放后，正常的容器进入热态，供同一用户后续复用。
-
-**沙箱通信与网络**：
-- 工具调用: Agent → 沙箱工具 → agent-sandbox SDK → 代理容器 → AIO HTTP 服务。
-- 访问公网: AIO 容器 → 代理容器 → allowlist 中的公网域名
-- AIO 容器负责执行命令和文件操作，出网规则集中交给代理控制。
-
-**文件挂载与资源**：
-- 用户工作区以可读写方式挂载，共享 Skills 以只读方式挂载；容器回收后，工作区文件仍保留在宿主机。
-- 资源限制： 1 GiB / 1 CPU / 512 PIDs
-
-### 2.3 Task System 任务系统
-
-- 任务状态与对话解耦，变成独立、可持久化的 Agent State，来管理复杂的多步骤目标 
-- 通过 Middleware 构建一个「规划 → 执行 → 检查 → 修正」的动态规划闭环, 防止任务漂移
-
-**模型自主规划**：Agent 自己规划/修正任务, 根据用户目标决定是否拆分任务, 简单任务直接处理
-**状态持久化**：保存在 GraphState 的 state.todos 中
-**上下文压缩恢复**：当聊天历史被压缩时，重新向模型展示当前 任务 状态
-
-
-### 2.3 上下文压缩
-### 2.3 短期记忆
-存储
-### 2.3 skills 加载
-### 2.3 权限与安全
-### 2.3 幂等 出错 恢复
-模型调用失败
-无法连接llm
-### langGraph 的node节点图, 预计state
-
-### 2.4 Memory 长期记忆
+### 2.2 Memory 长期记忆
 - memory.json：
   - 快速了解用户的整体背景，保存用户的工作背景、个人情况、当前关注、思考方式、近期背景、更早背景和长期背景七类摘要。
 - <事实ID>.md：(最多100条)
@@ -128,9 +67,99 @@ Agent Runtime：管理用户运行时和后台任务调度
 2. **提示模型：** 模型判断是否值得长期记住；只有错误原因明确时才填写 `sourceError`。
 3. **程序校验：** 程序校验模型给出的用户范围、长期有效性、描述性标签和置信度，才会保存
 
+### 2.3 Task System 任务系统
+
+- 任务状态与对话解耦，变成独立、可持久化的 Agent State，来管理复杂的多步骤目标 
+- 通过 Middleware 构建一个「规划 → 执行 → 检查 → 修正」的动态规划闭环, 防止任务漂移
+
+**模型自主规划**：Agent 自己规划/修正任务, 根据用户目标决定是否拆分任务, 简单任务直接处理
+**状态持久化**：保存在 GraphState 的 state.todos 中
+**上下文压缩恢复**：当聊天历史被压缩时，重新向模型展示当前 任务 状态
 
 
-## 3.权限判断
+### 2.4 上下文压缩
+
+**MicroCompact**
+- 超长 tool 结果落盘，模型收到首尾预览和对应路径，后续可分段读取
+
+**Sumary Compact**
+- 结构化压缩, 使用当前模型，将已有摘要和较早的对话、工具调用及结果生成新摘要
+- 系统提示词, Skills, 工具描述, TODO任务状态, 长期记忆等独立维护，不参与压缩。压缩前会提取长期记忆。
+- 保留最近 N 条消息(默认20条)，保持工具调用和结果配对；保留最新用户请求, 预算不足时可减少保留条数
+- 触发条件：大于0.8m tokens；消息数达到 200 条；估算输入达到模型上下文窗口的 80%。(均可配置)
+
+
+### 2.5 短期记忆
+
+- 基于 LangGraph `GraphState + Checkpoint` 保存每个 Agent 的短期上下文
+- 业务SQL表保存用户可见聊天、任务、审批和消息投递等记录
+
+```text
+短期记忆
+├─ Checkpoint: GraphState：每个 Agent 独立维护
+│  ├─ messages：用户、助手消息及工具调用和结果
+│  ├─ summary_text：历史上下文摘要
+│  └─ todos：当前 Agent 的任务清单
+│
+└─ 业务数据SQL表
+   └─ session
+      ├─ 保存用户聊天会话、版本、序号和重置状态
+      │
+      ├─ message
+      │  └─ 保存用户可见消息的正文、角色、状态和附件
+      │
+      └─ part
+         └─ 保存任务、审批、消息投递和工具执行等业务记录
+
+PostgreSQL
+├─ checkpoints：记录每次存档，以及 State 各字段使用的版本
+├─ checkpoint_blobs：保存消息、TODO 等字段的具体内容
+├─ checkpoint_writes：保存执行过程中的中间结果，用于恢复
+└─ checkpoint_migrations：记录 LangGraph 表结构版本
+```
+
+### 2.6 Sandbox 沙箱隔离
+
+```text
+Agent Runtime：管理用户运行时和后台任务调度
+  │
+  ├─ 主 Agent：LangGraph create_agent
+  └─ 后台 SubAgent Worker：LangGraph create_agent
+       ├─ 权限与审批: 判断工具调用是否允许执行
+       └─ SandboxMiddleware: 获取并绑定沙箱
+            │
+            └─ 沙箱工具：bash、read_file、write_file、str_replace、ls、glob、grep
+                 │
+                 ├─ AioSandboxProvider: 沙箱租约与生命周期管理
+                 │    └─ LocalContainerBackend
+                 │         └─ 创建、检查、回收 Docker 资源
+                 │
+                 └─ AioSandbox
+                      └─ agent-sandbox SDK / HTTP
+                           └─ 代理认证中继 → AIO 沙箱容器
+```
+
+**分层架构**：
+- SandboxMiddleware：在 Agent 执行期间获取沙箱，让工具能够找到对应的执行环境。
+- SandboxProvider：按用户管理沙箱的创建、获取、释放和复用。
+- Sandbox：提供统一的命令执行、文件读写、目录访问能力。
+
+**生命周期管理**：
+- 延迟初始化(懒加载)：如果 Agent 只需要回答问题、不调用文件或命令工具，就不必启动沙箱, 避免资源浪费。
+- 用户级复用：每用户一组容器：一个 AIO 沙箱容器 + 一个代理容器, 主 Agent 和 SubAgent 共享。
+- 空闲回收: 默认空闲 600 秒后回收，容量紧张时可能提前回收。
+- Warm Pool：所有租约释放后，正常的容器进入热态，供同一用户后续复用。
+
+**沙箱通信与网络**：
+- 工具调用: Agent → 沙箱工具 → agent-sandbox SDK → 代理容器 → AIO HTTP 服务。
+- 访问公网: AIO 容器 → 代理容器 → allowlist 中的公网域名
+- AIO 容器负责执行命令和文件操作，出网规则集中交给代理控制。
+
+**文件挂载与资源**：
+- 用户工作区以可读写方式挂载；容器回收后，工作区文件仍保留在宿主机。
+- 资源限制： 1 GiB / 1 CPU / 512 PIDs
+
+### 2.7 安全与权限
 
 | 判断结果  | 含义                      |
 | ----- | ----------------------- |
@@ -151,55 +180,10 @@ Agent Runtime：管理用户运行时和后台任务调度
 | Always allow in this conversation（在此对话中始终允许） | 批准当前调用，后续在当前会话中匹配的操作不再询问 | 只保存在内存，不写入项目规则；重启或新建会话不保留 |
 | Deny（拒绝）                                     | 不执行当前调用，拒绝原因回填模型         | 不添加永久拒绝规则                 |
 
-## 4.对话数据存储(旧)
 
-### 4.1 SQLite：会话事实
-
-| 表名 | 内容 |
-| --- | --- |
-| session表 | 会话id、project\_id、工作区完整路径、标题、时间、归档 |
-| message表 | 消息id, session\_id, 顺序sequence, 时间, 身份、模型、轮次、用量、错误等meta |
-| part表 | 部件 id, message\_id, session\_id, sequence, 时间, 正文text、工具tool或压缩信息compaction |
-| local\_setting表 | 权限模式:{"mode":"build/edit/yolo"}, 工具权限规则:{"allow":\[{"toolName":"bash","ruleContent":"git status"}],"deny":\[{"toolName":"delete\_file"}],"ask":\[{"toolName":"write\_file"}]} |
-| todo表 | 联合主键(session\_id, 顺序position), 任务内容content,  时间, 状态status |
-| turn\_usage表 | 联合主键(session\_id, turn\_id), user\_message\_id, 时间, 总耗时, 输入/输出及缓存 token, 状态status |
-
-
-### 4.2 model-io：模型调用快照
-
-实现：[modelio.py](./backend/app/modelio.py)；主/子循环共用model\_call记录每次调用，成功/失败均写入。
-
-文件
-
-- 项目根`log/model-io-<session_id>.jsonl`；每会话一个文件，一调用一行JSON追加
-
-标识
-
-- time、session\_id、turn\_id、subtask\_id、model
-
-request
-
-- system/messages全文、tool\_names（不保存工具schema）
-
-response
-
-- text、tool\_calls（id/name/input）
-
-usage
-
-- input/output tokens、cache\_read/cache\_creation tokens
-
-诊断
-
-- duration\_ms、error
-
-目录/轮转
-
-- MODELIO\_DIR可覆盖；MODELIO\_MAX\_MB默认10；追加前检查，超限以纳秒后缀归档
-
-用途/失败
-
-- 调试审计，不参与回放；写失败吞异常、记WARNING，不阻断对话
+### 2.8 幂等 出错 恢复
+模型调用失败
+无法连接llm
 
 
 ## 5. 通过 MCP 接入 LangGraph RAG 知识库
@@ -255,64 +239,14 @@ cd C:\Users\nnnnnn\Desktop\OpenWorkBot
 .\rag\.venv\Scripts\python.exe .\rag\evaluations\evaluate_generation.py --evidence .\rag\evaluations\result\retrieval_11-05-18-50.json --limit 50
 ```
 
-
-## Harness思想
-
-主链路：用户输入 → 压缩 → LLM → 权限 → 工具 → tool\_result → 再调 LLM。
-
-| 机制                 | 本项目实现                                                                                                        | 补充说明                                                                                         | 代码文件                                                                                                                                              |
-| ------------------ | ------------------------------------------------------------------------------------------------------------ | :------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 1. Agent Loop      | run\_turn 进行While True循环；无工具则结束；                                                                             | 错误也作为 `tool_result` 喂回，不抛异常打断循环                                                              | [agent/loop.py](./backend/app/agent/loop.py)、[agent/llm.py](./backend/app/agent/llm.py)、[agent/model\_call.py](./backend/app/agent/model_call.py) |
-| 2. Tool Use        | `TOOLS` 定义工具及参数 schema；`TOOL_HANDLERS` 为名字 → 函数的 dispatch map；todo\_write 和 subtask 由主循环单独处理。                | 文件操作全部先过 `safe_path` 沙箱, `execute_tool` 统一拦截 → 分发 → 兜异常                                      | [agent/tools.py](./backend/app/agent/tools.py)、[agent/loop.py](./backend/app/agent/loop.py)                                                       |
-| 3. Permission      | 主循环check\_permission根据权限模式build/edit/yolo, 返回allow/deny/ask；命中危险命令清单或越界时deny，批准后把工具结果给模型；拒绝后把拒绝原因给模型，让它决定下一步 | `permission_hook` 三道闸门：禁止清单硬拒 / 越界与 shell 删除硬拒 / 高危命令 `[y/N]` 确认；拒绝原因作为 `tool_result` 喂回模型   | [agent/permission\_service.py](./backend/app/agent/permission_service.py)、[sessions/approvals.py](./backend/app/sessions/approvals.py)            |
-| 4. Hooks           | `UserPromptSubmit / PreToolUse / PostToolUse / Stop` 四个事件点挂回调                                                | `Pre` = 权限 + 日志；`Post` = 大输出告警；`Stop` = 计数；`Submit` 暂无注册                                     | [agent/hooks.py](./backend/app/agent/hooks.py)、[agent/loop.py](./backend/app/agent/loop.py)                                                       |
-| 5. Task System     | `TodoManager`任务看板, todo\_write整板更新；持久化sqlite3；                                                               | 单 `in_progress`串行进行                                                                          | [agent/todo.py](./backend/app/agent/todo.py)                                                                                                      |
-| 6. Subagents       | 独立历史、最多30步、串行、防递归；当前7个同步工具，权限同父级，结果回填父轮                                                                      | `subtask(prompt)` 用全新 `messages` 跑 30 轮独立循环，最终文本作 `tool_result` 返回父级；同一响应里的多个 `subtask` 严格串行 | [agent/subtask.py](./backend/app/agent/subtask.py)                                                                                                |
-| 7. Context Compact | turn开始执行microcompact → LLM摘要；阈值与恢复边界见§3                                                                      | <br />                                                                                       | [agent/compact.py](./backend/app/agent/compact.py)                                                                                                |
-| 8. Skill           | 启动扫描 `skills/*/SKILL.md`，system prompt 只放“名称 + 描述”目录，`load_skill` 按需取全文                                      | frontmatter 只取 `name / description` 两字段                                                      | [agent/skills.py](./backend/app/agent/skills.py)                                                                                                  |
-| <br />             | <br />                                                                                                       | <br />                                                                                       | <br />                                                                                                                                            |
-
-<br />
-
-- 工具：bash/read\_file/write\_file/edit\_file/glob/delete\_file + todo\_write/load\_skill/subtask。
-  - 子助手仅同步工具：6个基础工具 + load\_skill；不含todo/subtask。
-  - 文件读/写/改/删经safe\_path限制于workspace
-
-
-
-
-### 上下文压缩
-
-触发
-
-- 历史token > 窗口 − 输出预留 − 安全buffer；默认预留32K + 13K
-
-microcompact
-
-- 直接将库内旧工具输出改为占位符；默认保留最近5条完整输出，重载历史后再判断预算
-
-compact
-
-- 仍超预算则LLM摘要此前历史；当前用户请求保留原文，不参与摘要
-
-### 初版最小harness实现(仅参考) `scripts_mini_harness/mini_harness.py`
-
-```text
-用户输入 -> 压缩 -> LLM -> 有 tool_use ? -> 权限 hooks -> 工具 -> 回填
-                                | 否: /goal 模式过目标闸门,否则结束
-
-Tool:
-bash / read_file / write_file / edit_file / glob /
-delete_file(移入 rubbish/) / todo_write / load_skill / subtask(子助手)
-```
-
-- Context Compact
-- 四级压缩：新结果落盘留预览 → 中间历史归档 → 旧结果缩短 → LLM 摘要重写；真实 token 计量，占窗口 80% 触发，压到 40%, 归档；重试 1 次
-
 ## 项目启动
 
 需要 Python 3.12+、uv 和 Node.js, 配置 `backend/.env`，然后启动：
 
 ```bash
 uv run --no-project start.py
+
+# 默认sqlite, 如使用postgresql数据库
+docker compose --env-file backend/.env up -d
+docker compose --env-file backend/.env ps
 ```
