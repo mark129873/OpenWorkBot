@@ -134,7 +134,7 @@ def test_reset_waits_for_tool_and_deletes_old_context(isolated):
             with pytest.raises(Conflict):
                 await runtime.accept("late", "旧页面消息", None, assistant_id=old_id)
             with db.new_session() as session:
-                assert not list(session.scalars(select(Session).where(Session.time_archived.is_not(None))))
+                assert [row.id for row in session.scalars(select(Session))] == [scoped("main")]
                 assert session.get(Message, scoped("user:old")) is None
                 assert session.get(TurnUsage, (scoped("main"), "old")) is None
                 assert store.records(session, "context_pending", context_id="main") == []
@@ -515,7 +515,7 @@ def test_deletion_failure_cannot_cancel_and_can_retry(isolated, monkeypatch):
             with pytest.raises(Conflict, match="不能取消"):
                 await runtime.cancel_reset(old_id, "archive-error")
             with db.new_session() as session:
-                assert not list(session.scalars(select(Session).where(Session.time_archived.is_not(None))))
+                assert [row.id for row in session.scalars(select(Session))] == [scoped("main")]
             monkeypatch.setattr(runtime.memory, "clear", clear)
             await runtime.reset(old_id, "archive-error")
             await wait_for(lambda: snapshot_now(runtime)["assistant_id"] != old_id)

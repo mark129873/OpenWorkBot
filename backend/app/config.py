@@ -55,6 +55,8 @@ class Settings:
     host: str = "127.0.0.1"
     port: int = 8100
     data_dir: Path = field(default=BACKEND_ROOT / "data")
+    database_backend: str = "sqlite"
+    database_url: str = field(default="", repr=False)
     workspaces_dir: Path = field(default=BACKEND_ROOT / "workspaces")
     user_skills_dir: Path = field(default=BACKEND_ROOT / "user_skills")
 
@@ -97,6 +99,8 @@ def load_settings() -> Settings:
         host=_env_str("HOST", "127.0.0.1"),
         port=_env_int("PORT", 8000),
         data_dir=data_dir,
+        database_backend=_env_str("DATABASE_BACKEND", "sqlite").lower(),
+        database_url=_env_str("DATABASE_URL"),
         log_level=_env_str("LOG_LEVEL", "INFO").upper(),
         modelio_dir=modelio_dir,
         modelio_max_bytes=_env_int("MODELIO_MAX_MB", 10) * 1024 * 1024,

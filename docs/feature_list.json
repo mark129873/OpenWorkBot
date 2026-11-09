@@ -123,6 +123,13 @@
       "description": "各 Agent 以 full 检查点保存上下文，主助手从 state 尽力提取长期记忆。",
       "status": "passing",
       "evidence": "隔离空库后端全量 249 项通过、2 项 Docker 跳过；检查点、记忆与 TODO 专项 49 项通过。未调用真实模型或模拟真实断电。"
+    },
+    {
+      "id": "Backend-13",
+      "name": "业务表整理与 PostgreSQL 支持",
+      "description": "整理 session、message、part 职责，业务表与检查点可选择 SQLite 或 PostgreSQL。",
+      "status": "passing",
+      "evidence": "隔离空库后端全量 291 项通过、2 项沙箱 Docker 跳过；SQLite 与 Docker PostgreSQL 17 专项 18 项通过，前端测试、构建和 lint 通过。"
     }
   ]
 }

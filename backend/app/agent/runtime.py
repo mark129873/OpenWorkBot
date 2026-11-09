@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from jsonschema import ValidationError, validate
-from sqlalchemy import func, or_, select
+from sqlalchemy import BigInteger, cast, func, or_, select
 
 from app import db
 from app.agent import agent_bus
@@ -46,11 +46,10 @@ def _task_summary(task: dict) -> dict:
 
 
 def _task_context(session, priority: str | None = None) -> tuple[list[dict], bool]:
-    kind = func.json_extract(Part.data, "$.type")
-    status = func.json_extract(Part.data, "$.status")
-    base = select(Part).where(Part.message_id == scoped("main:control"), kind == "task_state")
+    status = Part.data["status"].as_string()
+    base = select(Part).where(Part.session_id == scoped("main"), Part.type == "task_state")
     active = list(session.scalars(base.where(status.not_in(_TERMINAL))
-                .order_by(func.json_extract(Part.data, "$.order"), Part.id).limit(_TASK_ACTIVE_LIMIT + 1)))
+                .order_by(cast(Part.data["order"].as_string(), BigInteger), Part.id).limit(_TASK_ACTIVE_LIMIT + 1)))
     recent = list(session.scalars(base.where(status.in_(_TERMINAL))
                 .order_by(Part.time_updated.desc(), Part.id.desc()).limit(_TASK_RECENT_LIMIT + 1)))
     omitted = len(active) > _TASK_ACTIVE_LIMIT or len(recent) > _TASK_RECENT_LIMIT
@@ -1112,12 +1111,11 @@ class Runtime:
             keyword, offset = args.get("keyword"), args.get("offset", 0)
             if not isinstance(keyword, str) or len(keyword) > 100 or not _valid_offset(offset):
                 return "Error: 查询关键词或偏移量无效"
-            query = select(Part).where(Part.message_id == scoped("main:control"),
-                                       func.json_extract(Part.data, "$.type") == "task_state")
+            query = select(Part).where(Part.session_id == scoped("main"), Part.type == "task_state")
             if keyword.strip():
                 term = keyword.strip().casefold()
-                query = query.where(or_(func.lower(func.json_extract(Part.data, "$.title")).contains(term, autoescape=True),
-                                        func.lower(func.json_extract(Part.data, "$.goal")).contains(term, autoescape=True)))
+                query = query.where(or_(func.lower(Part.data["title"].as_string()).contains(term, autoescape=True),
+                                        func.lower(Part.data["goal"].as_string()).contains(term, autoescape=True)))
             rows = list(session.scalars(query.order_by(Part.time_updated.desc(), Part.id.desc()).offset(offset).limit(11)))
             matches = []
             for row in rows[:10]:
@@ -1136,9 +1134,9 @@ class Runtime:
             if not _valid_offset(offset) or not _valid_offset(report_offset):
                 return "Error: 查询偏移量无效"
             reports = list(session.scalars(select(Part).where(
-                Part.message_id == scoped("main:control"), func.json_extract(Part.data, "$.type") == "agent_message",
-                func.json_extract(Part.data, "$.task_id") == task_id,
-                func.json_extract(Part.data, "$.kind").in_(["review", "result"])
+                Part.session_id == scoped("main"), Part.type == "agent_message",
+                Part.data["task_id"].as_string() == task_id,
+                Part.data["kind"].as_string().in_(["review", "result"])
             ).order_by(Part.sequence.desc(), Part.id.desc()).offset(report_offset).limit(4)))
             detail = {**task, "reports": [{"kind": item["kind"], "content": item["content"],
                                           "run_id": item.get("run_id")} for item in map(store.read, reports[:3])],
@@ -1368,18 +1366,21 @@ class Runtime:
                                if item["id"] != task_id and item["status"] not in _TERMINAL}
             active_contexts.update(item["context_id"] for item in store.records(session, "agent_run")
                                    if item["task_id"] != task_id and item["status"] not in _TERMINAL)
-            rows = list(session.scalars(select(Part).where(Part.message_id == scoped("main:control"))))
+            rows = list(session.scalars(select(Part).where(Part.session_id == scoped("main"))))
             for row in rows:
                 value = store.read(row)
                 key = unscoped(row.id)
                 if value.get("type") == "task_key" and value.get("task_id") == task_id:
                     identity = key.removeprefix("task-key:")
-                    row.data = store.dump({"type": "task_key", "processed": True})
+                    row.data = {"processed": True}
+                    row.context_id = None
                     action = session.get(Part, scoped(f"action:{identity}"))
                     if action:
-                        action.data = store.dump({"type": "agent_action", "processed": True})
+                        action.data = {"processed": True}
+                        action.context_id = None
                 elif value.get("type") in {"publication", "coord_action"} and value.get("task_id") == task_id:
-                    row.data = store.dump({"type": value["type"], "processed": True})
+                    row.data = {"processed": True}
+                    row.context_id = None
                 elif value.get("type") == "shared_state":
                     owner = value.get("task_id")
                     if owner and (owner == task_id or not store.get(session, f"task:{owner}")) and not active_contexts.intersection(value.get("readers", [])):

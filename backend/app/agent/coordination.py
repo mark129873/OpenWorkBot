@@ -1,6 +1,6 @@
 import hashlib
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 from app.agent import agent_bus
 from app.models import Part, new_id
@@ -110,11 +110,10 @@ def call(session, name: str, args: dict, *, actor: str, task_id: str | None, req
         offset, limit = args.get("offset", 0), args.get("limit", 10)
         if type(offset) is not int or offset < 0 or type(limit) is not int or not 1 <= limit <= 50:
             raise ValueError("分页参数无效")
-        query = select(Part).where(Part.message_id == scoped("main:control"),
-                                   func.json_extract(Part.data, "$.type") == "shared_state")
+        query = select(Part).where(Part.session_id == scoped("main"), Part.type == "shared_state")
         for field in ("task_id", "kind"):
             if field in args:
-                query = query.where(func.json_extract(Part.data, f"$.{field}") == _text(args, field))
+                query = query.where(Part.data[field].as_string() == _text(args, field))
         rows = list(session.scalars(query.order_by(Part.sequence, Part.id).offset(offset).limit(limit + 1)))
         states = [store.read(row) for row in rows[:limit]]
         for state in states:

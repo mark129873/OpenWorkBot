@@ -15,6 +15,14 @@
 
 ## 下面为真实进度:
 
+### Session 021
+- 日期：2026-11-09
+- 目标：整理 session、message、part，并让业务表与检查点支持 SQLite / PostgreSQL。
+- 完成：SQLite 默认，PostgreSQL 由环境变量配置；消息与审批使用独立展示序号，重置状态保存在 session；旧库结构拒绝启动，不迁移或删除数据。
+- 验证：后端空库全量 291 项通过、2 项沙箱 Docker 跳过；SQLite 与 Docker PostgreSQL 17 专项 18 项通过，含 Gateway 重启、多 Agent 检查点、审批、并发、重置及任务清理；前端测试 2 项、构建和 lint 通过。
+- 边界：仅支持单 Gateway 进程；同步业务数据库访问在远程高延迟下可能阻塞事件循环，检查点连接断开可能需重启。长期记忆和工作区仍需持久化文件目录；未调用真实模型或模拟断电。
+- 提交：本次提交见 Git 记录；保留原有 README 改动。
+
 ### Session 020
 - 日期：2026-11-09
 - 目标：以 LangGraph full 检查点保存各 Agent 短期上下文，并从主助手 state 提取长期记忆。

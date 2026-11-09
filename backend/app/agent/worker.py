@@ -708,7 +708,7 @@ class Worker:
                       "tool_call_id": execution["call_id"], "tool": execution["name"], "input": execution["input"],
                       "scope": scope, "reason": reason, "options": approvals.build_options(
                           execution["name"], execution["input"], canonical_path=canonical_path),
-                      "status": "requested", "order": store.get(session, "meta")["revision"] + 1})
+                          "status": "requested", "order": store.next_display_order(session)})
         try:
             await self.runtime.change(request, "approval")
         except BaseException:

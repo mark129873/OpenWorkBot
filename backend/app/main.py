@@ -3,7 +3,7 @@ import ipaddress
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from app.agent.checkpoint import SqliteSaver
+from app.agent.checkpoint import open_saver
 
 from app import db
 from app.api import auth as auth_api
@@ -28,10 +28,7 @@ async def lifespan(app: FastAPI):
         from app.gateway import Gateway
 
         hooks.register_default_hooks()
-        async with SqliteSaver.from_conn_string(str(settings.data_dir / "app.db")) as saver:
-            await saver.conn.execute("PRAGMA journal_mode=WAL")
-            await saver.conn.execute("PRAGMA busy_timeout=5000")
-            await saver.setup()
+        async with open_saver(settings.data_dir) as saver:
             gateway = Gateway(saver)
             app.state.gateway = gateway
             try:

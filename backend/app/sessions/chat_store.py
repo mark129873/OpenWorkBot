@@ -1,12 +1,12 @@
 """主聊天及后台上下文的持久化操作；调用方负责事务与并发。"""
 
 import json
+from copy import deepcopy
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, select, update
 
 from app.models import Message, Part, Session, TurnUsage, new_id, now_ms
-from app.sessions.execution_state import project_directory, project_id
-from app.user_context import scoped, unscoped
+from app.user_context import require_user, scoped, unscoped
 
 
 def dump(value) -> str:
@@ -14,99 +14,94 @@ def dump(value) -> str:
 
 
 def read(row) -> dict:
-    return json.loads(row.data) if row else {}
+    if not row:
+        return {}
+    value = {**deepcopy(row.data), "type": row.type}
+    if row.context_id is not None:
+        value["context_id"] = row.context_id
+    return value
 
 
 def initialize(db, data_dir) -> None:
-    session_id, control_id = scoped("main"), scoped("main:control")
+    session_id = scoped("main")
     if db.get(Session, session_id) is None:
-        db.add(Session(id=session_id, project_id=project_id(data_dir), directory=project_directory(data_dir),
-                       title="主聊天"))
+        db.add(Session(id=session_id, user_id=require_user()))
         db.flush()
-    if db.get(Message, control_id) is None:
-        db.add(Message(id=control_id, session_id=session_id, data=dump({"role": "control"})))
-        db.flush()
-    meta = get(db, "meta") or {"type": "meta", "revision": 0, "user_seq": 0}
-    if not meta.get("assistant_id"):
-        meta["assistant_id"] = new_id()
-        put(db, "meta", meta)
     db.commit()
 
 
-def archive(db) -> str:
-    archive_id = f"archive-{new_id()}"
-    session_id, control_id, archived_id = scoped("main"), scoped("main:control"), scoped(archive_id)
-    source = db.get(Session, session_id)
-    db.add(Session(id=archived_id, project_id=source.project_id, directory=source.directory,
-                   title=source.title, time_created=source.time_created, time_updated=now_ms(),
-                   time_archived=now_ms()))
-    db.flush()
-    messages = list(db.scalars(select(Message).where(Message.session_id == session_id)))
-    for message in messages:
-        db.add(Message(id=scoped(f"{archive_id}:{unscoped(message.id)}"), session_id=archived_id,
-                       sequence=message.sequence, time_created=message.time_created,
-                       time_updated=message.time_updated, data=message.data))
-    db.flush()
-    for part in db.scalars(select(Part).where(Part.session_id == session_id)):
-        if part.message_id == control_id and read(part).get("type") in {"meta", "context_pending"}:
-            continue
-        db.add(Part(id=scoped(f"{archive_id}:{unscoped(part.id)}"),
-                    message_id=scoped(f"{archive_id}:{unscoped(part.message_id)}"),
-                    session_id=archived_id, sequence=part.sequence, time_created=part.time_created,
-                    time_updated=part.time_updated, data=part.data))
-    for row in db.scalars(select(TurnUsage).where(TurnUsage.session_id == session_id)):
-        values = {column.name: getattr(row, column.name) for column in TurnUsage.__table__.columns}
-        values["session_id"] = archived_id
-        db.add(TurnUsage(**values))
-    db.flush()
-    clear(db)
-    return archive_id
-
-
 def clear(db) -> None:
-    session_id, control_id = scoped("main"), scoped("main:control")
-    db.execute(delete(Part).where(Part.session_id == session_id, Part.id != scoped("meta")))
-    db.execute(delete(Message).where(Message.session_id == session_id, Message.id != control_id))
+    session_id = scoped("main")
+    db.execute(delete(Part).where(Part.session_id == session_id))
+    db.execute(delete(Message).where(Message.session_id == session_id))
     db.execute(delete(TurnUsage).where(TurnUsage.session_id == session_id))
 
 
 def get(db, key: str) -> dict | None:
+    if key == "meta":
+        row = db.get(Session, scoped("main"))
+        if row is None:
+            return None
+        return {**deepcopy(row.runtime_data), "type": "meta", "revision": row.revision, "user_seq": row.user_seq,
+                "assistant_id": row.assistant_id, "reset": deepcopy(row.reset_state),
+                "last_reset": deepcopy(row.last_reset)}
     row = db.get(Part, scoped(key))
     return read(row) if row else None
 
 
 def put(db, key: str, value: dict) -> None:
-    key = scoped(key)
-    row = db.get(Part, key)
-    if row is None:
-        db.add(Part(id=key, message_id=scoped("main:control"), session_id=scoped("main"), data=dump(value)))
-    else:
-        row.data = dump(value)
+    if key == "meta":
+        row = db.get(Session, scoped("main"))
+        row.revision = value["revision"]
+        row.user_seq = value["user_seq"]
+        row.assistant_id = value.get("assistant_id") or row.assistant_id
+        row.reset_state = deepcopy(value.get("reset"))
+        row.last_reset = deepcopy(value.get("last_reset"))
+        row.runtime_data = deepcopy({k: v for k, v in value.items()
+                                     if k not in {"type", "revision", "user_seq", "assistant_id", "reset", "last_reset"}})
         row.time_updated = now_ms()
+    else:
+        row = db.get(Part, scoped(key))
+        payload = deepcopy({k: v for k, v in value.items() if k not in {"type", "context_id"}})
+        if row is None:
+            row = Part(key=scoped(key), session_id=scoped("main"), sequence=_next(db, "next_part_sequence"),
+                       type=value["type"], context_id=value.get("context_id"), data=payload)
+            db.add(row)
+        else:
+            row.type = value["type"]
+            row.context_id = value.get("context_id")
+            row.data = payload
+            row.time_updated = now_ms()
     db.flush()
+
+
+def _next(db, name: str) -> int:
+    column = getattr(Session, name)
+    return db.execute(update(Session).where(Session.id == scoped("main"))
+                      .values({name: column + 1}).returning(column)
+                      .execution_options(synchronize_session=False)).scalar_one()
+
+
+def next_display_order(db) -> int:
+    return _next(db, "next_display_order")
 
 
 def records(db, kind: str, *, context_id: str | None = None,
             delivery: str | None = None) -> list[dict]:
-    query = select(Part).where(Part.message_id == scoped("main:control"),
-                               func.json_extract(Part.data, "$.type") == kind)
+    query = select(Part).where(Part.session_id == scoped("main"), Part.type == kind)
     if context_id is not None:
-        query = query.where(func.json_extract(Part.data, "$.context_id") == context_id)
+        query = query.where(Part.context_id == context_id)
     if delivery is not None:
-        query = query.where(func.json_extract(Part.data, "$.delivery") == delivery)
-    return [read(row) for row in db.scalars(query.order_by(Part.sequence, Part.id))]
+        query = query.where(Part.data["delivery"].as_string() == delivery)
+    return [read(row) for row in db.scalars(query.order_by(Part.sequence, Part.key))]
 
 
 def add_visible(db, role: str, text: str, *, message_id: str | None = None,
                 status: str = "completed", attachments: list | None = None) -> str:
     message_id = message_id or new_id()
-    db.add(Message(id=scoped(message_id), session_id=scoped("main"), data=dump({
-        "role": role, "visible": True, "status": status, "attachments": attachments or [],
-        "order": get(db, "meta")["revision"] + 1,
-    })))
-    db.flush()
-    db.add(Part(id=scoped(f"text:{message_id}"), message_id=scoped(message_id), session_id=scoped("main"),
-                data=dump({"type": "text", "text": text})))
+    db.add(Message(id=scoped(message_id), session_id=scoped("main"),
+                   sequence=_next(db, "next_message_sequence"), display_order=next_display_order(db),
+                   role=role, text=text, status=status, attachments=attachments or []))
     db.flush()
     return message_id
 
@@ -114,46 +109,36 @@ def add_visible(db, role: str, text: str, *, message_id: str | None = None,
 def update_visible(db, message_id: str, *, text: str | None = None,
                    status: str | None = None) -> None:
     message = db.get(Message, scoped(message_id))
-    part = db.get(Part, scoped(f"text:{message_id}"))
-    if message is None or part is None:
+    if message is None:
         raise ValueError("消息不存在")
-    metadata, body = read(message), read(part)
     if status is not None:
-        metadata["status"] = status
+        message.status = status
     if text is not None:
-        body["text"] = text
-    message.data, part.data = dump(metadata), dump(body)
-    message.time_updated = part.time_updated = now_ms()
+        message.text = text
+    message.time_updated = now_ms()
     db.flush()
 
 
-def _visible_query():
-    return select(Message, Part).join(Part, Part.message_id == Message.id).where(
-        Message.session_id == scoped("main"), func.json_extract(Message.data, "$.visible") == 1,
-        func.json_extract(Part.data, "$.type") == "text")
-
-
 def _visible_rows(rows) -> list[dict]:
-    return [{"id": unscoped(message.id), "role": read(message)["role"], "text": read(part)["text"],
-             "attachments": read(message).get("attachments", []),
-             "status": read(message).get("status", "completed"), "time": message.time_created,
-             "order": read(message).get("order", 0)}
-            for message, part in rows]
+    return [{"id": unscoped(message.id), "role": message.role, "text": message.text,
+             "attachments": message.attachments, "status": message.status, "time": message.time_created,
+             "order": message.display_order} for message in rows]
 
 
 def visible(db) -> list[dict]:
-    rows = db.execute(_visible_query().order_by(Message.sequence, Message.id)).all()
+    rows = db.scalars(select(Message).where(Message.session_id == scoped("main"))
+                      .order_by(Message.sequence)).all()
     return _visible_rows(rows)
 
 
 def visible_page(db, limit: int, before: int | None = None) -> tuple[list[dict], int | None]:
-    query = _visible_query()
+    query = select(Message).where(Message.session_id == scoped("main"))
     if before is not None:
         query = query.where(Message.sequence < before)
-    rows = db.execute(query.order_by(Message.sequence.desc(), Message.id.desc()).limit(limit + 1)
+    rows = db.scalars(query.order_by(Message.sequence.desc()).limit(limit + 1)
                       .execution_options(populate_existing=True)).all()
     page = list(reversed(rows[:limit]))
-    return _visible_rows(page), page[0][0].sequence if len(rows) > limit and page else None
+    return _visible_rows(page), page[0].sequence if len(rows) > limit and page else None
 
 
 def stage_context(db, context_id: str, role: str, content, *, key: str | None = None) -> str:
@@ -171,8 +156,7 @@ def stage_context(db, context_id: str, role: str, content, *, key: str | None = 
 def clear_pending(db, context_id: str, identities: list[str]) -> None:
     for identity in identities:
         row = db.get(Part, scoped(f"context-pending:{identity}"))
-        value = read(row)
-        if value.get("type") == "context_pending" and value.get("context_id") == context_id:
+        if row and row.type == "context_pending" and row.context_id == context_id:
             db.delete(row)
 
 

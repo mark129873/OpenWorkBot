@@ -1,9 +1,12 @@
 from pathlib import Path
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.engine import Engine
+from sqlalchemy.engine import make_url
+from sqlalchemy.exc import ArgumentError
 from sqlalchemy.orm import Session, sessionmaker
 
+from app.config import settings
 from app.models import Base
 
 _engine: Engine | None = None
@@ -18,6 +21,17 @@ def _enable_sqlite_pragmas(dbapi_connection, _record) -> None:
     cursor.close()
 
 
+def postgres_url(*, sqlalchemy: bool = False) -> str:
+    try:
+        url = make_url(settings.database_url)
+        if url.drivername not in {"postgresql", "postgresql+psycopg"} or not url.database:
+            raise ValueError
+    except (ArgumentError, ValueError, TypeError):
+        raise ValueError("PostgreSQL 需要有效的 DATABASE_URL") from None
+    driver = "postgresql+psycopg" if sqlalchemy else "postgresql"
+    return url.set(drivername=driver).render_as_string(hide_password=False)
+
+
 def init_db(data_dir: Path) -> Engine:
     """复用已初始化引擎，避免遗留连接池。"""
     global _engine, _session_factory
@@ -26,29 +40,30 @@ def init_db(data_dir: Path) -> Engine:
         return _engine
 
     data_dir.mkdir(parents=True, exist_ok=True)
-    db_path = data_dir / "app.db"
+    if settings.database_backend == "sqlite":
+        engine = create_engine(f"sqlite:///{data_dir / 'app.db'}", connect_args={"check_same_thread": False})
+        event.listen(engine, "connect", _enable_sqlite_pragmas)
+    elif settings.database_backend == "postgresql":
+        engine = create_engine(postgres_url(sqlalchemy=True), pool_pre_ping=True)
+    else:
+        raise ValueError("DATABASE_BACKEND 必须是 sqlite 或 postgresql")
 
-    # 请求可能跨线程使用连接，Session 仍须独立。
-    engine = create_engine(
-        f"sqlite:///{db_path}",
-        connect_args={"check_same_thread": False},
-    )
-    event.listen(engine, "connect", _enable_sqlite_pragmas)
-
-    Base.metadata.create_all(engine)
-    # 省略 sequence 时自动追加到所属范围队尾。
-    with engine.begin() as connection:
-        for table, scope in (("message", "session_id"), ("part", "message_id")):
-            connection.exec_driver_sql(f"""
-                CREATE TRIGGER IF NOT EXISTS {table}_sequence_autofill
-                AFTER INSERT ON {table} WHEN new.sequence IS NULL
-                BEGIN
-                    UPDATE {table} SET sequence = (
-                        SELECT coalesce(max(sequence), -1) + 1 FROM {table}
-                        WHERE {scope} = new.{scope}
-                    ) WHERE id = new.id;
-                END;
-            """)
+    try:
+        inspector = inspect(engine)
+        tables = set(inspector.get_table_names())
+        required = {
+            "session": {"user_id", "assistant_id", "revision", "user_seq", "reset_state", "last_reset",
+                        "next_message_sequence", "next_part_sequence", "next_display_order", "runtime_data"},
+            "message": {"session_id", "sequence", "display_order", "role", "status", "text", "attachments"},
+            "part": {"session_id", "key", "sequence", "type", "context_id", "data"},
+        }
+        for name, columns in required.items():
+            if name in tables and not columns.issubset({column["name"] for column in inspector.get_columns(name)}):
+                raise RuntimeError("检测到旧数据库结构；请使用空数据库，旧数据不会自动迁移")
+        Base.metadata.create_all(engine)
+    except BaseException:
+        engine.dispose()
+        raise
 
     _engine = engine
     _session_factory = sessionmaker(bind=engine, expire_on_commit=False)

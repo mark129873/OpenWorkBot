@@ -3,7 +3,8 @@ import os
 import threading
 from pathlib import Path
 
-from sqlalchemy.dialects.sqlite import insert
+from sqlalchemy.dialects.postgresql import insert as postgres_insert
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from app import db
 from app.models import LocalSetting, now_ms
@@ -40,6 +41,7 @@ def _write(data_dir, key: str, value: dict, scope_id: str | None = None) -> None
     values = dict(scope="project", scope_id=scope_id or project_id(data_dir), namespace="permission",
                   key=key, value=json.dumps(value, ensure_ascii=False), schema_version=1,
                   time_created=now, time_updated=now)
+    insert = postgres_insert if db.get_engine().dialect.name == "postgresql" else sqlite_insert
     statement = insert(LocalSetting).values(**values)
     # 原子更新，避免首次并发保存的主键冲突。
     statement = statement.on_conflict_do_update(
