@@ -193,18 +193,18 @@ Agent Runtime：管理用户运行时和后台任务调度
 | Always allow in this conversation（在此对话中始终允许） | 批准当前调用，后续在当前会话中匹配的操作不再询问 | 只保存在内存，不写入项目规则；重启或新建会话不保留 |
 | Deny（拒绝）                                     | 不执行当前调用，拒绝原因回填模型         | 不添加永久拒绝规则                 |
 
-## 5. 通过 MCP 接入 LangGraph RAG 知识库
+## 3. 通过 MCP 接入 LangGraph RAG 知识库
 
 RAG 作为独立 MCP 服务，由后台 Worker 调用。LangGraph 按问题规划查询，通过 Milvus 稠密向量和 BM25 混合检索、本地重排及证据评估生成回答；证据不足时并通过 Grounding 反馈加入了 Reflection/自我纠错进行补检。
 
-### 5.1 离线构建
+### 3.1 离线构建
 
 1. **结构化解析**：提取 带层级关系的 Structured Document JSON: 保留来源,名称,格式,标题层级、段落、表格、页码和顺序。
 2. **清洗**：去除重复的页眉页脚和多余空白，保留数字、日期、否定词及表格关系。
 3. **切块**：先按标题、章节和段落切分；超过上限时再拆分500/50重叠。每个 Chunk 保留标题层级关系。
 4. **建立索引**：标题与正文参与 Embedding，写入 Milvus 稠密向量和 BM25 索引。
 
-### 5.2 在线检索
+### 3.2 在线检索
 
 ![LangGraph RAG 检索流程](./readme_docs/rag_langgraph.png)
 
@@ -212,7 +212,7 @@ RAG 作为独立 MCP 服务，由后台 Worker 调用。LangGraph 按问题规�
 2. 稠密检索和 BM25 各取 20 条，经 RRF 融合后每个查询保留 10 条；
 3. 共 60 条合并去重后Top 20 条重排，聚合取 Top5 父Chunk供证据评估和回答。
 
-### 5.3 回退降级
+### 3.3 回退降级
 
 比如LLM的APIConnectionError
 
@@ -220,7 +220,7 @@ RAG 作为独立 MCP 服务，由后台 Worker 调用。LangGraph 按问题规�
 2. 查询转换全部失败或为空时使用原问题
 3. 使用规则进行降级
 
-### 5.4 RAG 测评结果
+### 3.4 RAG 测评结果
 
 | 指标                 |                                    基线结果 | 作用    |
 | ------------------ | --------------------------------------: | ----- |
@@ -232,7 +232,7 @@ RAG 作为独立 MCP 服务，由后台 Worker 调用。LangGraph 按问题规�
 
 - 生成为 gpt-6-luna；测评为 gpt-6.1-terra
 
-### 5.5 RAG 测评脚本
+### 3.5 RAG 测评脚本
 
 ```bash
 # 1.启动模型
@@ -246,7 +246,7 @@ cd C:\Users\nnnnnn\Desktop\OpenWorkBot
 .\rag\.venv\Scripts\python.exe .\rag\evaluations\evaluate_generation.py --evidence .\rag\evaluations\result\retrieval_11-05-18-50.json --limit 50
 ```
 
-## 项目启动
+## 4 项目启动
 
 需要 Python 3.12+、uv 和 Node.js, 配置 `backend/.env`，然后启动：
 
