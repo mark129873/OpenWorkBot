@@ -193,11 +193,6 @@ Agent Runtime：管理用户运行时和后台任务调度
 | Always allow in this conversation（在此对话中始终允许） | 批准当前调用，后续在当前会话中匹配的操作不再询问 | 只保存在内存，不写入项目规则；重启或新建会话不保留 |
 | Deny（拒绝）                                     | 不执行当前调用，拒绝原因回填模型         | 不添加永久拒绝规则                 |
 
-### 2.8 幂等 出错 恢复 (TODO)
-模型调用失败
-无法连接llm
-
-
 ## 5. 通过 MCP 接入 LangGraph RAG 知识库
 
 RAG 作为独立 MCP 服务，由后台 Worker 调用。LangGraph 按问题规划查询，通过 Milvus 稠密向量和 BM25 混合检索、本地重排及证据评估生成回答；证据不足时并通过 Grounding 反馈加入了 Reflection/自我纠错进行补检。
